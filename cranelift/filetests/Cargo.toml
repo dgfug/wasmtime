@@ -1,31 +1,40 @@
 [package]
 name = "cranelift-filetests"
 authors = ["The Cranelift Project Developers"]
-version = "0.73.0"
+version = "0.0.0"
 description = "Test driver and implementations of the filetest commands"
 license = "Apache-2.0 WITH LLVM-exception"
 documentation = "https://docs.rs/cranelift-filetests"
 repository = "https://github.com/bytecodealliance/wasmtime"
 publish = false
-edition = "2018"
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
-cranelift-codegen = { path = "../codegen", version = "0.77.0", features = ["testing_hooks"] }
-cranelift-frontend = { path = "../frontend", version = "0.77.0" }
-cranelift-interpreter = { path = "../interpreter", version = "0.77.0" }
-cranelift-native = { path = "../native", version = "0.77.0" }
-cranelift-reader = { path = "../reader", version = "0.77.0" }
-cranelift-preopt = { path = "../preopt", version = "0.77.0" }
-file-per-thread-logger = "0.1.2"
-filecheck = "0.5.0"
-gimli = { version = "0.25.0", default-features = false, features = ["read"] }
-log = "0.4.6"
-memmap2 = "0.2.1"
+cranelift-codegen = { workspace = true, features = ["disas"] }
+cranelift-frontend = { workspace = true }
+cranelift-interpreter = { workspace = true }
+cranelift-native = { workspace = true }
+cranelift-reader = { workspace = true }
+cranelift-jit = { workspace = true, features = ["selinux-fix"] }
+cranelift-module = { workspace = true }
+cranelift-control = { workspace = true }
+file-per-thread-logger = { workspace = true }
+filecheck = { workspace = true }
+gimli = { workspace = true, features = ['std'] }
+log = { workspace = true }
 num_cpus = "1.8.0"
-target-lexicon = "0.12"
-thiserror = "1.0.15"
-anyhow = "1.0.32"
-
-[features]
-enable-peepmatic = []
-experimental_arm32 = []
+target-lexicon = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+similar = { workspace = true }
+wat.workspace = true
+toml = { workspace = true }
+serde = { workspace = true }
+serde_derive = { workspace = true }
+cranelift.workspace = true
+smallvec = { workspace = true }
+pulley-interpreter = { workspace = true, features = ["disas", "std", "interp"] }

@@ -1,27 +1,28 @@
 //! ARM 64-bit Instruction Set Architecture.
 
-use crate::ir::condcodes::IntCC;
-use crate::ir::Function;
+use crate::dominator_tree::DominatorTree;
+use crate::ir::{Function, Type};
 use crate::isa::aarch64::settings as aarch64_settings;
-use crate::isa::Builder as IsaBuilder;
+#[cfg(feature = "unwind")]
+use crate::isa::unwind::systemv;
+use crate::isa::{Builder as IsaBuilder, FunctionAlignment, TargetIsa};
 use crate::machinst::{
-    compile, MachBackend, MachCompileResult, MachTextSectionBuilder, TargetIsaAdapter,
+    compile, CompiledCode, CompiledCodeStencil, MachInst, MachTextSectionBuilder, Reg, SigSet,
     TextSectionBuilder, VCode,
 };
 use crate::result::CodegenResult;
 use crate::settings as shared_settings;
 use alloc::{boxed::Box, vec::Vec};
-use regalloc::{PrettyPrint, RealRegUniverse};
-use target_lexicon::{Aarch64Architecture, Architecture, Triple};
+use core::fmt;
+use cranelift_control::ControlPlane;
+use target_lexicon::{Aarch64Architecture, Architecture, OperatingSystem, Triple};
 
 // New backend:
 mod abi;
-pub(crate) mod inst;
+pub mod inst;
 mod lower;
-mod lower_inst;
-mod settings;
-
-use inst::create_reg_universe;
+mod pcc;
+pub mod settings;
 
 use self::inst::EmitInfo;
 
@@ -30,7 +31,6 @@ pub struct AArch64Backend {
     triple: Triple,
     flags: shared_settings::Flags,
     isa_flags: aarch64_settings::Flags,
-    reg_universe: RealRegUniverse,
 }
 
 impl AArch64Backend {
@@ -40,12 +40,10 @@ impl AArch64Backend {
         flags: shared_settings::Flags,
         isa_flags: aarch64_settings::Flags,
     ) -> AArch64Backend {
-        let reg_universe = create_reg_universe(&flags);
         AArch64Backend {
             triple,
             flags,
             isa_flags,
-            reg_universe,
         }
     }
 
@@ -54,43 +52,46 @@ impl AArch64Backend {
     fn compile_vcode(
         &self,
         func: &Function,
-        flags: shared_settings::Flags,
-    ) -> CodegenResult<VCode<inst::Inst>> {
-        let emit_info = EmitInfo::new(flags.clone());
-        let abi = Box::new(abi::AArch64ABICallee::new(func, flags)?);
-        compile::compile::<AArch64Backend>(func, self, abi, emit_info)
+        domtree: &DominatorTree,
+        ctrl_plane: &mut ControlPlane,
+    ) -> CodegenResult<(VCode<inst::Inst>, regalloc2::Output)> {
+        let emit_info = EmitInfo::new(self.flags.clone());
+        let sigs = SigSet::new::<abi::AArch64MachineDeps>(func, &self.flags)?;
+        let abi = abi::AArch64Callee::new(func, self, &self.isa_flags, &sigs)?;
+        compile::compile::<AArch64Backend>(func, domtree, self, abi, emit_info, sigs, ctrl_plane)
     }
 }
 
-impl MachBackend for AArch64Backend {
+impl TargetIsa for AArch64Backend {
     fn compile_function(
         &self,
         func: &Function,
+        domtree: &DominatorTree,
         want_disasm: bool,
-    ) -> CodegenResult<MachCompileResult> {
-        let flags = self.flags();
-        let vcode = self.compile_vcode(func, flags.clone())?;
+        ctrl_plane: &mut ControlPlane,
+    ) -> CodegenResult<CompiledCodeStencil> {
+        let (vcode, regalloc_result) = self.compile_vcode(func, domtree, ctrl_plane)?;
 
-        let (buffer, bb_starts, bb_edges) = vcode.emit();
-        let frame_size = vcode.frame_size();
-        let stackslot_offsets = vcode.stackslot_offsets().clone();
+        let emit_result = vcode.emit(&regalloc_result, want_disasm, &self.flags, ctrl_plane);
+        let frame_size = emit_result.frame_size;
+        let value_labels_ranges = emit_result.value_labels_ranges;
+        let buffer = emit_result.buffer;
+        let sized_stackslot_offsets = emit_result.sized_stackslot_offsets;
+        let dynamic_stackslot_offsets = emit_result.dynamic_stackslot_offsets;
 
-        let disasm = if want_disasm {
-            Some(vcode.show_rru(Some(&create_reg_universe(flags))))
-        } else {
-            None
-        };
+        if let Some(disasm) = emit_result.disasm.as_ref() {
+            log::debug!("disassembly:\n{}", disasm);
+        }
 
-        let buffer = buffer.finish();
-
-        Ok(MachCompileResult {
+        Ok(CompiledCodeStencil {
             buffer,
             frame_size,
-            disasm,
-            value_labels_ranges: Default::default(),
-            stackslot_offsets,
-            bb_starts,
-            bb_edges,
+            vcode: emit_result.disasm,
+            value_labels_ranges,
+            sized_stackslot_offsets,
+            dynamic_stackslot_offsets,
+            bb_starts: emit_result.bb_offsets,
+            bb_edges: emit_result.bb_edges,
         })
     }
 
@@ -98,8 +99,8 @@ impl MachBackend for AArch64Backend {
         "aarch64"
     }
 
-    fn triple(&self) -> Triple {
-        self.triple.clone()
+    fn triple(&self) -> &Triple {
+        &self.triple
     }
 
     fn flags(&self) -> &shared_settings::Flags {
@@ -110,50 +111,137 @@ impl MachBackend for AArch64Backend {
         self.isa_flags.iter().collect()
     }
 
-    fn reg_universe(&self) -> &RealRegUniverse {
-        &self.reg_universe
+    fn is_branch_protection_enabled(&self) -> bool {
+        self.isa_flags.use_bti()
     }
 
-    fn unsigned_add_overflow_condition(&self) -> IntCC {
-        // Unsigned `>=`; this corresponds to the carry flag set on aarch64, which happens on
-        // overflow of an add.
-        IntCC::UnsignedGreaterThanOrEqual
+    fn dynamic_vector_bytes(&self, _dyn_ty: Type) -> u32 {
+        16
     }
 
     #[cfg(feature = "unwind")]
     fn emit_unwind_info(
         &self,
-        result: &MachCompileResult,
-        kind: crate::machinst::UnwindInfoKind,
+        result: &CompiledCode,
+        kind: crate::isa::unwind::UnwindInfoKind,
     ) -> CodegenResult<Option<crate::isa::unwind::UnwindInfo>> {
         use crate::isa::unwind::UnwindInfo;
-        use crate::machinst::UnwindInfoKind;
+        use crate::isa::unwind::UnwindInfoKind;
         Ok(match kind {
             UnwindInfoKind::SystemV => {
                 let mapper = self::inst::unwind::systemv::RegisterMapper;
                 Some(UnwindInfo::SystemV(
                     crate::isa::unwind::systemv::create_unwind_info_from_insts(
                         &result.buffer.unwind_info[..],
-                        result.buffer.data.len(),
+                        result.buffer.data().len(),
                         &mapper,
                     )?,
                 ))
             }
-            UnwindInfoKind::Windows => {
-                // TODO: support Windows unwind info on AArch64
-                None
-            }
+            UnwindInfoKind::Windows => Some(UnwindInfo::WindowsArm64(
+                crate::isa::unwind::winarm64::create_unwind_info_from_insts(
+                    &result.buffer.unwind_info[..],
+                )?,
+            )),
             _ => None,
         })
     }
 
     #[cfg(feature = "unwind")]
     fn create_systemv_cie(&self) -> Option<gimli::write::CommonInformationEntry> {
+        let is_apple_os = match self.triple.operating_system {
+            OperatingSystem::Darwin(_)
+            | OperatingSystem::IOS(_)
+            | OperatingSystem::MacOSX { .. }
+            | OperatingSystem::TvOS(_) => true,
+            _ => false,
+        };
+
+        if self.isa_flags.sign_return_address()
+            && self.isa_flags.sign_return_address_with_bkey()
+            && !is_apple_os
+        {
+            unimplemented!("Specifying that the B key is used with pointer authentication instructions in the CIE is not implemented.");
+        }
+
         Some(inst::unwind::systemv::create_cie())
     }
 
-    fn text_section_builder(&self, num_funcs: u32) -> Box<dyn TextSectionBuilder> {
+    fn text_section_builder(&self, num_funcs: usize) -> Box<dyn TextSectionBuilder> {
         Box::new(MachTextSectionBuilder::<inst::Inst>::new(num_funcs))
+    }
+
+    #[cfg(feature = "unwind")]
+    fn map_regalloc_reg_to_dwarf(&self, reg: Reg) -> Result<u16, systemv::RegisterMappingError> {
+        inst::unwind::systemv::map_reg(reg).map(|reg| reg.0)
+    }
+
+    fn function_alignment(&self) -> FunctionAlignment {
+        inst::Inst::function_alignment()
+    }
+
+    fn page_size_align_log2(&self) -> u8 {
+        use target_lexicon::*;
+        match self.triple().operating_system {
+            OperatingSystem::MacOSX { .. }
+            | OperatingSystem::Darwin(_)
+            | OperatingSystem::IOS(_)
+            | OperatingSystem::TvOS(_) => {
+                debug_assert_eq!(1 << 14, 0x4000);
+                14
+            }
+            _ => {
+                debug_assert_eq!(1 << 16, 0x10000);
+                16
+            }
+        }
+    }
+
+    #[cfg(feature = "disas")]
+    fn to_capstone(&self) -> Result<capstone::Capstone, capstone::Error> {
+        use capstone::prelude::*;
+        let mut cs = Capstone::new()
+            .arm64()
+            .mode(arch::arm64::ArchMode::Arm)
+            .detail(true)
+            .build()?;
+        // AArch64 uses inline constants rather than a separate constant pool right now.
+        // Without this option, Capstone will stop disassembling as soon as it sees
+        // an inline constant that is not also a valid instruction. With this option,
+        // Capstone will print a `.byte` directive with the bytes of the inline constant
+        // and continue to the next instruction.
+        cs.set_skipdata(true)?;
+        Ok(cs)
+    }
+
+    fn has_native_fma(&self) -> bool {
+        true
+    }
+
+    fn has_x86_blendv_lowering(&self, _: Type) -> bool {
+        false
+    }
+
+    fn has_x86_pshufb_lowering(&self) -> bool {
+        false
+    }
+
+    fn has_x86_pmulhrsw_lowering(&self) -> bool {
+        false
+    }
+
+    fn has_x86_pmaddubsw_lowering(&self) -> bool {
+        false
+    }
+}
+
+impl fmt::Display for AArch64Backend {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("MachBackend")
+            .field("name", &self.name())
+            .field("triple", &self.triple())
+            .field("flags", &format!("{}", self.flags()))
+            .finish()
     }
 }
 
@@ -166,126 +254,7 @@ pub fn isa_builder(triple: Triple) -> IsaBuilder {
         constructor: |triple, shared_flags, builder| {
             let isa_flags = aarch64_settings::Flags::new(&shared_flags, builder);
             let backend = AArch64Backend::new_with_flags(triple, shared_flags, isa_flags);
-            Box::new(TargetIsaAdapter::new(backend))
+            Ok(backend.wrapped())
         },
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use crate::cursor::{Cursor, FuncCursor};
-    use crate::ir::types::*;
-    use crate::ir::{AbiParam, ExternalName, Function, InstBuilder, Signature};
-    use crate::isa::CallConv;
-    use crate::settings;
-    use crate::settings::Configurable;
-    use core::str::FromStr;
-    use target_lexicon::Triple;
-
-    #[test]
-    fn test_compile_function() {
-        let name = ExternalName::testcase("test0");
-        let mut sig = Signature::new(CallConv::SystemV);
-        sig.params.push(AbiParam::new(I32));
-        sig.returns.push(AbiParam::new(I32));
-        let mut func = Function::with_name_signature(name, sig);
-
-        let bb0 = func.dfg.make_block();
-        let arg0 = func.dfg.append_block_param(bb0, I32);
-
-        let mut pos = FuncCursor::new(&mut func);
-        pos.insert_block(bb0);
-        let v0 = pos.ins().iconst(I32, 0x1234);
-        let v1 = pos.ins().iadd(arg0, v0);
-        pos.ins().return_(&[v1]);
-
-        let mut shared_flags_builder = settings::builder();
-        shared_flags_builder.set("opt_level", "none").unwrap();
-        let shared_flags = settings::Flags::new(shared_flags_builder);
-        let isa_flags = aarch64_settings::Flags::new(&shared_flags, aarch64_settings::builder());
-        let backend = AArch64Backend::new_with_flags(
-            Triple::from_str("aarch64").unwrap(),
-            shared_flags,
-            isa_flags,
-        );
-        let buffer = backend.compile_function(&mut func, false).unwrap().buffer;
-        let code = &buffer.data[..];
-
-        // mov x1, #0x1234
-        // add w0, w0, w1
-        // ret
-        let golden = vec![
-            0x81, 0x46, 0x82, 0xd2, 0x00, 0x00, 0x01, 0x0b, 0xc0, 0x03, 0x5f, 0xd6,
-        ];
-
-        assert_eq!(code, &golden[..]);
-    }
-
-    #[test]
-    fn test_branch_lowering() {
-        let name = ExternalName::testcase("test0");
-        let mut sig = Signature::new(CallConv::SystemV);
-        sig.params.push(AbiParam::new(I32));
-        sig.returns.push(AbiParam::new(I32));
-        let mut func = Function::with_name_signature(name, sig);
-
-        let bb0 = func.dfg.make_block();
-        let arg0 = func.dfg.append_block_param(bb0, I32);
-        let bb1 = func.dfg.make_block();
-        let bb2 = func.dfg.make_block();
-        let bb3 = func.dfg.make_block();
-
-        let mut pos = FuncCursor::new(&mut func);
-        pos.insert_block(bb0);
-        let v0 = pos.ins().iconst(I32, 0x1234);
-        let v1 = pos.ins().iadd(arg0, v0);
-        pos.ins().brnz(v1, bb1, &[]);
-        pos.ins().jump(bb2, &[]);
-        pos.insert_block(bb1);
-        pos.ins().brnz(v1, bb2, &[]);
-        pos.ins().jump(bb3, &[]);
-        pos.insert_block(bb2);
-        let v2 = pos.ins().iadd(v1, v0);
-        pos.ins().brnz(v2, bb2, &[]);
-        pos.ins().jump(bb1, &[]);
-        pos.insert_block(bb3);
-        let v3 = pos.ins().isub(v1, v0);
-        pos.ins().return_(&[v3]);
-
-        let mut shared_flags_builder = settings::builder();
-        shared_flags_builder.set("opt_level", "none").unwrap();
-        let shared_flags = settings::Flags::new(shared_flags_builder);
-        let isa_flags = aarch64_settings::Flags::new(&shared_flags, aarch64_settings::builder());
-        let backend = AArch64Backend::new_with_flags(
-            Triple::from_str("aarch64").unwrap(),
-            shared_flags,
-            isa_flags,
-        );
-        let result = backend
-            .compile_function(&mut func, /* want_disasm = */ false)
-            .unwrap();
-        let code = &result.buffer.data[..];
-
-        // mov	x1, #0x1234                	// #4660
-        // add	w0, w0, w1
-        // mov	w1, w0
-        // cbnz	x1, 0x28
-        // mov	x1, #0x1234                	// #4660
-        // add	w1, w0, w1
-        // mov	w1, w1
-        // cbnz	x1, 0x18
-        // mov	w1, w0
-        // cbnz	x1, 0x18
-        // mov	x1, #0x1234                	// #4660
-        // sub	w0, w0, w1
-        // ret
-        let golden = vec![
-            129, 70, 130, 210, 0, 0, 1, 11, 225, 3, 0, 42, 161, 0, 0, 181, 129, 70, 130, 210, 1, 0,
-            1, 11, 225, 3, 1, 42, 161, 255, 255, 181, 225, 3, 0, 42, 97, 255, 255, 181, 129, 70,
-            130, 210, 0, 0, 1, 75, 192, 3, 95, 214,
-        ];
-
-        assert_eq!(code, &golden[..]);
     }
 }

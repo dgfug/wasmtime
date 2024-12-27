@@ -6,9 +6,7 @@
 use crate::runone;
 use cranelift_codegen::dbg::LOG_FILENAME_PREFIX;
 use cranelift_codegen::timing;
-use file_per_thread_logger;
 use log::error;
-use num_cpus;
 use std::panic::catch_unwind;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -23,7 +21,6 @@ struct Request(usize, PathBuf);
 pub enum Reply {
     Starting {
         jobid: usize,
-        thread_num: usize,
     },
     Done {
         jobid: usize,
@@ -82,14 +79,16 @@ impl ConcurrentRunner {
 
     /// Join all the worker threads.
     /// Transfer pass timings from the worker threads to the current thread.
-    pub fn join(&mut self) {
+    pub fn join(&mut self) -> timing::PassTimes {
         assert!(self.request_tx.is_none(), "must shutdown before join");
+        let mut pass_times = timing::PassTimes::default();
         for h in self.handles.drain(..) {
             match h.join() {
-                Ok(t) => timing::add_to_current(&t),
-                Err(e) => println!("worker panicked: {:?}", e),
+                Ok(t) => pass_times.add(&t),
+                Err(e) => println!("worker panicked: {e:?}"),
             }
         }
+        pass_times
     }
 
     /// Add a new job to the queues.
@@ -133,7 +132,7 @@ fn worker_thread(
     replies: Sender<Reply>,
 ) -> thread::JoinHandle<timing::PassTimes> {
     thread::Builder::new()
-        .name(format!("worker #{}", thread_num))
+        .name(format!("worker #{thread_num}"))
         .spawn(move || {
             file_per_thread_logger::initialize(LOG_FILENAME_PREFIX);
             loop {
@@ -145,7 +144,7 @@ fn worker_thread(
 
                 // Tell them we're starting this job.
                 // The receiver should always be present for this as long as we have jobs.
-                replies.send(Reply::Starting { jobid, thread_num }).unwrap();
+                replies.send(Reply::Starting { jobid }).unwrap();
 
                 let result = catch_unwind(|| runone::run(path.as_path(), None, None))
                     .unwrap_or_else(|e| {

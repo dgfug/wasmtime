@@ -1,112 +1,104 @@
 //! Compilation backend pipeline: optimized IR to VCode / binemit.
 
+use crate::dominator_tree::DominatorTree;
+use crate::ir::pcc;
 use crate::ir::Function;
-use crate::log::DeferredDisplay;
+use crate::isa::TargetIsa;
 use crate::machinst::*;
-use crate::settings;
+use crate::settings::RegallocAlgorithm;
 use crate::timing;
+use crate::trace;
+use crate::CodegenError;
 
-use regalloc::{allocate_registers_with_opts, Algorithm, Options, PrettyPrint};
+use regalloc2::{Algorithm, RegallocOptions};
 
 /// Compile the given function down to VCode with allocated registers, ready
 /// for binary emission.
-pub fn compile<B: LowerBackend + MachBackend>(
+pub fn compile<B: LowerBackend + TargetIsa>(
     f: &Function,
+    domtree: &DominatorTree,
     b: &B,
-    abi: Box<dyn ABICallee<I = B::MInst>>,
+    abi: Callee<<<B as LowerBackend>::MInst as MachInst>::ABIMachineSpec>,
     emit_info: <B::MInst as MachInstEmit>::Info,
-) -> CodegenResult<VCode<B::MInst>>
-where
-    B::MInst: PrettyPrint,
-{
+    sigs: SigSet,
+    ctrl_plane: &mut ControlPlane,
+) -> CodegenResult<(VCode<B::MInst>, regalloc2::Output)> {
     // Compute lowered block order.
-    let block_order = BlockLoweringOrder::new(f);
+    let block_order = BlockLoweringOrder::new(f, domtree, ctrl_plane);
+
     // Build the lowering context.
-    let lower = Lower::new(f, abi, emit_info, block_order)?;
+    let lower =
+        crate::machinst::Lower::new(f, abi, emit_info, block_order, sigs, b.flags().clone())?;
+
     // Lower the IR.
-    let (mut vcode, stack_map_request_info) = {
+    let mut vcode = {
+        log::debug!(
+            "Number of CLIF instructions to lower: {}",
+            f.dfg.num_insts()
+        );
+        log::debug!("Number of CLIF blocks to lower: {}", f.dfg.num_blocks());
+
         let _tt = timing::vcode_lower();
-        lower.lower(b)?
+        lower.lower(b, ctrl_plane)?
     };
 
-    // Creating the vcode string representation may be costly for large functions, so defer its
-    // rendering.
-    log::trace!(
-        "vcode from lowering: \n{}",
-        DeferredDisplay::new(|| vcode.show_rru(Some(b.reg_universe())))
+    log::debug!(
+        "Number of lowered vcode instructions: {}",
+        vcode.num_insts()
     );
+    log::debug!("Number of lowered vcode blocks: {}", vcode.num_blocks());
+    trace!("vcode from lowering: \n{:?}", vcode);
+
+    // Perform validation of proof-carrying-code facts, if requested.
+    if b.flags().enable_pcc() {
+        pcc::check_vcode_facts(f, &mut vcode, b).map_err(CodegenError::Pcc)?;
+    }
 
     // Perform register allocation.
-    let (run_checker, algorithm) = match vcode.flags().regalloc() {
-        settings::Regalloc::Backtracking => (false, Algorithm::Backtracking(Default::default())),
-        settings::Regalloc::BacktrackingChecked => {
-            (true, Algorithm::Backtracking(Default::default()))
-        }
-        settings::Regalloc::ExperimentalLinearScan => {
-            (false, Algorithm::LinearScan(Default::default()))
-        }
-        settings::Regalloc::ExperimentalLinearScanChecked => {
-            (true, Algorithm::LinearScan(Default::default()))
-        }
-    };
-
-    #[cfg(feature = "regalloc-snapshot")]
-    {
-        use std::fs;
-        use std::path::Path;
-        if let Some(path) = std::env::var("SERIALIZE_REGALLOC").ok() {
-            let snapshot = regalloc::IRSnapshot::from_function(&vcode, b.reg_universe());
-            let serialized = bincode::serialize(&snapshot).expect("couldn't serialize snapshot");
-
-            let file_path = Path::new(&path).join(Path::new(&format!("ir{}.bin", f.name)));
-            fs::write(file_path, &serialized).expect("couldn't write IR snapshot file");
-        }
-    }
-
-    // If either there are no reference-typed values, or else there are
-    // but there are no safepoints at which we need to know about them,
-    // then we don't need stack maps.
-    let sri = if stack_map_request_info.reftyped_vregs.len() > 0
-        && stack_map_request_info.safepoint_insns.len() > 0
-    {
-        Some(&stack_map_request_info)
-    } else {
-        None
-    };
-
-    let result = {
+    let regalloc_result = {
         let _tt = timing::regalloc();
-        allocate_registers_with_opts(
-            &mut vcode,
-            b.reg_universe(),
-            sri,
-            Options {
-                run_checker,
-                algorithm,
-            },
-        )
-        .map_err(|err| {
-            log::error!(
-                "Register allocation error for vcode\n{}\nError: {:?}",
-                vcode.show_rru(Some(b.reg_universe())),
+        let mut options = RegallocOptions::default();
+        options.verbose_log = b.flags().regalloc_verbose_logs();
+
+        if cfg!(debug_assertions) {
+            options.validate_ssa = true;
+        }
+
+        options.algorithm = match b.flags().regalloc_algorithm() {
+            RegallocAlgorithm::Backtracking => Algorithm::Ion,
+            RegallocAlgorithm::SinglePass => Algorithm::Fastalloc,
+        };
+
+        regalloc2::run(&vcode, vcode.machine_env(), &options)
+            .map_err(|err| {
+                log::error!(
+                    "Register allocation error for vcode\n{:?}\nError: {:?}\nCLIF for error:\n{:?}",
+                    vcode,
+                    err,
+                    f,
+                );
                 err
-            );
-            err
-        })
-        .expect("register allocation")
+            })
+            .expect("register allocation")
     };
 
-    // Reorder vcode into final order and copy out final instruction sequence
-    // all at once. This also inserts prologues/epilogues.
-    {
-        let _tt = timing::vcode_post_ra();
-        vcode.replace_insns_from_regalloc(result);
+    // Run the regalloc checker, if requested.
+    if b.flags().regalloc_checker() {
+        let _tt = timing::regalloc_checker();
+        let mut checker = regalloc2::checker::Checker::new(&vcode, vcode.machine_env());
+        checker.prepare(&regalloc_result);
+        checker
+            .run()
+            .map_err(|err| {
+                log::error!(
+                    "Register allocation checker errors:\n{:?}\nfor vcode:\n{:?}",
+                    err,
+                    vcode
+                );
+                err
+            })
+            .expect("register allocation checker");
     }
 
-    log::trace!(
-        "vcode after regalloc: final version:\n{}",
-        DeferredDisplay::new(|| vcode.show_rru(Some(b.reg_universe())))
-    );
-
-    Ok(vcode)
+    Ok((vcode, regalloc_result))
 }

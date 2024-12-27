@@ -6,7 +6,7 @@ use core::marker::PhantomData;
 use core::mem;
 
 #[cfg(feature = "enable-serde")]
-use serde::{Deserialize, Serialize};
+use serde_derive::{Deserialize, Serialize};
 
 /// A small list of entity references allocated from a pool.
 ///
@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 /// The `EntityList` itself is designed to have the smallest possible footprint. This is important
 /// because it is used inside very compact data structures like `InstructionData`. The list
 /// contains only a 32-bit index into the pool's memory vector, pointing to the first element of
-/// the list.
+/// the list. A zero value represents the empty list, which is returned by `EntityList::default`.
 ///
 /// The pool is just a single `Vec<T>` containing all of the allocated lists. Each list is
 /// represented as three contiguous parts:
@@ -62,8 +62,9 @@ use serde::{Deserialize, Serialize};
 ///
 /// The index stored in an `EntityList` points to part 2, the list elements. The value 0 is
 /// reserved for the empty list which isn't allocated in the vector.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+#[repr(C)]
 pub struct EntityList<T: EntityRef + ReservedValue> {
     index: u32,
     unused: PhantomData<T>,
@@ -88,6 +89,26 @@ pub struct ListPool<T: EntityRef + ReservedValue> {
 
     // Heads of the free lists, one for each size class.
     free: Vec<usize>,
+}
+
+impl<T: EntityRef + ReservedValue> PartialEq for ListPool<T> {
+    fn eq(&self, other: &Self) -> bool {
+        // ignore the free list
+        self.data == other.data
+    }
+}
+
+impl<T: core::hash::Hash + EntityRef + ReservedValue> core::hash::Hash for ListPool<T> {
+    fn hash<H: __core::hash::Hasher>(&self, state: &mut H) {
+        // ignore the free list
+        self.data.hash(state);
+    }
+}
+
+impl<T: EntityRef + ReservedValue> Default for ListPool<T> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Lists are allocated in sizes that are powers of two, starting from 4.
@@ -121,6 +142,24 @@ impl<T: EntityRef + ReservedValue> ListPool<T> {
             data: Vec::new(),
             free: Vec::new(),
         }
+    }
+
+    /// Create a new list pool with the given capacity for data pre-allocated.
+    pub fn with_capacity(len: usize) -> Self {
+        Self {
+            data: Vec::with_capacity(len),
+            free: Vec::new(),
+        }
+    }
+
+    /// Get the capacity of this pool. This will be somewhat higher
+    /// than the total length of lists that can be stored without
+    /// reallocating, because of internal metadata overheads. It is
+    /// mostly useful to allow another pool to be allocated that is
+    /// likely to hold data transferred from this one without the need
+    /// to grow.
+    pub fn capacity(&self) -> usize {
+        self.data.capacity()
     }
 
     /// Clear the pool, forgetting about all lists that use it.
@@ -271,7 +310,7 @@ impl<T: EntityRef + ReservedValue> EntityList<T> {
     }
 
     /// Get the list as a slice.
-    pub fn as_slice<'a>(&'a self, pool: &'a ListPool<T>) -> &'a [T] {
+    pub fn as_slice<'a>(&self, pool: &'a ListPool<T>) -> &'a [T] {
         let idx = self.index as usize;
         match pool.len_of(self) {
             None => &[],
@@ -444,6 +483,48 @@ impl<T: EntityRef + ReservedValue> EntityList<T> {
         }
     }
 
+    /// Copies a slice from an entity list in the same pool to a position in this one.
+    ///
+    /// Will panic if `self` is the same list as `other`.
+    pub fn copy_from(
+        &mut self,
+        other: &Self,
+        slice: impl core::ops::RangeBounds<usize>,
+        index: usize,
+        pool: &mut ListPool<T>,
+    ) {
+        assert!(
+            index <= self.len(pool),
+            "attempted to copy a slice out of bounds of `self`"
+        );
+        assert_ne!(
+            self.index, other.index,
+            "cannot copy within one `EntityList`"
+        );
+
+        let (other_index, other_len) = (other.index, other.len(pool));
+
+        let start = match slice.start_bound() {
+            core::ops::Bound::Included(&x) => x,
+            core::ops::Bound::Excluded(&x) => x + 1,
+            core::ops::Bound::Unbounded => 0,
+        } + other_index as usize;
+        let end = match slice.end_bound() {
+            core::ops::Bound::Included(&x) => x + 1,
+            core::ops::Bound::Excluded(&x) => x,
+            core::ops::Bound::Unbounded => other_len,
+        } + other_index as usize;
+        let count = end - start;
+        assert!(
+            count <= other_len,
+            "attempted to copy a slice from out of bounds of `other`"
+        );
+
+        self.grow_at(index, count, pool);
+        pool.data
+            .copy_within(start..end, index + self.index as usize);
+    }
+
     /// Inserts an element as position `index` in the list, shifting all elements after it to the
     /// right.
     pub fn insert(&mut self, index: usize, element: T, pool: &mut ListPool<T>) {
@@ -562,8 +643,6 @@ impl<T: EntityRef + ReservedValue> EntityList<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::{sclass_for_length, sclass_size};
-    use crate::EntityRef;
 
     /// An opaque reference to an instruction in a function.
     #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -826,5 +905,50 @@ mod tests {
         assert_eq!(list.as_slice(pool), &[i1, i2]);
         list.truncate(0, pool);
         assert!(list.is_empty());
+    }
+
+    #[test]
+    fn copy_from() {
+        let pool = &mut ListPool::<Inst>::new();
+
+        let i1 = Inst::new(1);
+        let i2 = Inst::new(2);
+        let i3 = Inst::new(3);
+        let i4 = Inst::new(4);
+
+        let mut list = EntityList::from_slice(&[i1, i2, i3, i4], pool);
+        assert_eq!(list.as_slice(pool), &[i1, i2, i3, i4]);
+        let list2 = EntityList::from_slice(&[i4, i3, i2, i1], pool);
+        assert_eq!(list2.as_slice(pool), &[i4, i3, i2, i1]);
+        list.copy_from(&list2, 0..0, 0, pool);
+        assert_eq!(list.as_slice(pool), &[i1, i2, i3, i4]);
+        list.copy_from(&list2, 0..4, 0, pool);
+        assert_eq!(list.as_slice(pool), &[i4, i3, i2, i1, i1, i2, i3, i4]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn copy_from_self() {
+        let pool = &mut ListPool::<Inst>::new();
+
+        let i1 = Inst::new(1);
+        let i2 = Inst::new(2);
+        let i3 = Inst::new(3);
+        let i4 = Inst::new(4);
+
+        let mut list = EntityList::from_slice(&[i4, i3, i2, i1, i1, i2, i3, i4], pool);
+        let list_again = list;
+        assert_eq!(list.as_slice(pool), &[i4, i3, i2, i1, i1, i2, i3, i4]);
+        // Panic should occur on the line below because `list.index == other.index`
+        list.copy_from(&list_again, 0..=1, 8, pool);
+        assert_eq!(
+            list.as_slice(pool),
+            &[i4, i3, i2, i1, i1, i2, i3, i4, i4, i3]
+        );
+        list.copy_from(&list_again, .., 7, pool);
+        assert_eq!(
+            list.as_slice(pool),
+            &[i4, i3, i2, i1, i1, i2, i4, i3, i2, i1, i1, i2, i3, i4, i4, i3, i3, i4, i4, i3]
+        )
     }
 }

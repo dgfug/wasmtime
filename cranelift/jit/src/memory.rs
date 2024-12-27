@@ -1,16 +1,19 @@
-#[cfg(feature = "selinux-fix")]
+use cranelift_module::{ModuleError, ModuleResult};
+
+#[cfg(all(not(target_os = "windows"), feature = "selinux-fix"))]
 use memmap2::MmapMut;
 
 #[cfg(not(any(feature = "selinux-fix", windows)))]
 use std::alloc;
-use std::convert::TryFrom;
+use std::ffi::c_void;
 use std::io;
 use std::mem;
 use std::ptr;
+use wasmtime_jit_icache_coherence as icache_coherence;
 
 /// A simple struct consisting of a pointer and length.
 struct PtrLen {
-    #[cfg(feature = "selinux-fix")]
+    #[cfg(all(not(target_os = "windows"), feature = "selinux-fix"))]
     map: Option<MmapMut>,
 
     ptr: *mut u8,
@@ -21,7 +24,7 @@ impl PtrLen {
     /// Create a new empty `PtrLen`.
     fn new() -> Self {
         Self {
-            #[cfg(feature = "selinux-fix")]
+            #[cfg(all(not(target_os = "windows"), feature = "selinux-fix"))]
             map: None,
 
             ptr: ptr::null_mut(),
@@ -33,15 +36,15 @@ impl PtrLen {
     /// suitably sized and aligned for memory protection.
     #[cfg(all(not(target_os = "windows"), feature = "selinux-fix"))]
     fn with_size(size: usize) -> io::Result<Self> {
-        let alloc_size = region::page::ceil(size);
+        let alloc_size = region::page::ceil(size as *const ()) as usize;
         MmapMut::map_anon(alloc_size).map(|mut mmap| {
             // The order here is important; we assign the pointer first to get
             // around compile time borrow errors.
-            Ok(Self {
+            Self {
                 ptr: mmap.as_mut_ptr(),
                 map: Some(mmap),
                 len: alloc_size,
-            })
+            }
         })
     }
 
@@ -49,21 +52,26 @@ impl PtrLen {
     fn with_size(size: usize) -> io::Result<Self> {
         assert_ne!(size, 0);
         let page_size = region::page::size();
-        let alloc_size = region::page::ceil(size);
+        let alloc_size = region::page::ceil(size as *const ()) as usize;
         let layout = alloc::Layout::from_size_align(alloc_size, page_size).unwrap();
         // Safety: We assert that the size is non-zero above.
         let ptr = unsafe { alloc::alloc(layout) };
 
-        Ok(Self {
-            ptr,
-            len: alloc_size,
-        })
+        if !ptr.is_null() {
+            Ok(Self {
+                ptr,
+                len: alloc_size,
+            })
+        } else {
+            Err(io::Error::from(io::ErrorKind::OutOfMemory))
+        }
     }
 
     #[cfg(target_os = "windows")]
     fn with_size(size: usize) -> io::Result<Self> {
-        use winapi::um::memoryapi::VirtualAlloc;
-        use winapi::um::winnt::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
+        use windows_sys::Win32::System::Memory::{
+            VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE,
+        };
 
         // VirtualAlloc always rounds up to the next multiple of the page size
         let ptr = unsafe {
@@ -77,7 +85,7 @@ impl PtrLen {
         if !ptr.is_null() {
             Ok(Self {
                 ptr: ptr as *mut u8,
-                len: region::page::ceil(size),
+                len: region::page::ceil(size as *const ()) as usize,
             })
         } else {
             Err(io::Error::last_os_error())
@@ -103,24 +111,37 @@ impl Drop for PtrLen {
 
 // TODO: add a `Drop` impl for `cfg(target_os = "windows")`
 
+/// Type of branch protection to apply to executable memory.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum BranchProtection {
+    /// No protection.
+    None,
+    /// Use the Branch Target Identification extension of the Arm architecture.
+    BTI,
+}
+
 /// JIT memory manager. This manages pages of suitably aligned and
 /// accessible memory. Memory will be leaked by default to have
 /// function pointers remain valid for the remainder of the
 /// program's life.
 pub(crate) struct Memory {
     allocations: Vec<PtrLen>,
-    executable: usize,
+    already_protected: usize,
     current: PtrLen,
     position: usize,
+    branch_protection: BranchProtection,
 }
 
+unsafe impl Send for Memory {}
+
 impl Memory {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(branch_protection: BranchProtection) -> Self {
         Self {
             allocations: Vec::new(),
-            executable: 0,
+            already_protected: 0,
             current: PtrLen::new(),
             position: 0,
+            branch_protection,
         }
     }
 
@@ -149,71 +170,99 @@ impl Memory {
         // TODO: Allocate more at a time.
         self.current = PtrLen::with_size(size)?;
         self.position = size;
+
         Ok(self.current.ptr)
     }
 
     /// Set all memory allocated in this `Memory` up to now as readable and executable.
-    pub(crate) fn set_readable_and_executable(&mut self) {
+    pub(crate) fn set_readable_and_executable(&mut self) -> ModuleResult<()> {
         self.finish_current();
 
-        #[cfg(feature = "selinux-fix")]
-        {
-            for &PtrLen { ref map, ptr, len } in &self.allocations[self.executable..] {
-                if len != 0 && map.is_some() {
-                    unsafe {
-                        region::protect(ptr, len, region::Protection::READ_EXECUTE)
-                            .expect("unable to make memory readable+executable");
-                    }
-                }
-            }
+        // Clear all the newly allocated code from cache if the processor requires it
+        //
+        // Do this before marking the memory as R+X, technically we should be able to do it after
+        // but there are some CPU's that have had errata about doing this with read only memory.
+        for &PtrLen { ptr, len, .. } in self.non_protected_allocations_iter() {
+            unsafe {
+                icache_coherence::clear_cache(ptr as *const c_void, len)
+                    .expect("Failed cache clear")
+            };
         }
 
-        #[cfg(not(feature = "selinux-fix"))]
-        {
-            for &PtrLen { ptr, len } in &self.allocations[self.executable..] {
-                if len != 0 {
+        let set_region_readable_and_executable = |ptr, len| -> ModuleResult<()> {
+            if self.branch_protection == BranchProtection::BTI {
+                #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+                if std::arch::is_aarch64_feature_detected!("bti") {
+                    let prot = libc::PROT_EXEC | libc::PROT_READ | /* PROT_BTI */ 0x10;
+
                     unsafe {
-                        region::protect(ptr, len, region::Protection::READ_EXECUTE)
-                            .expect("unable to make memory readable+executable");
+                        if libc::mprotect(ptr as *mut libc::c_void, len, prot) < 0 {
+                            return Err(ModuleError::Backend(
+                                anyhow::Error::new(io::Error::last_os_error())
+                                    .context("unable to make memory readable+executable"),
+                            ));
+                        }
                     }
+
+                    return Ok(());
                 }
             }
+
+            unsafe {
+                region::protect(ptr, len, region::Protection::READ_EXECUTE).map_err(|e| {
+                    ModuleError::Backend(
+                        anyhow::Error::new(e).context("unable to make memory readable+executable"),
+                    )
+                })?;
+            }
+            Ok(())
+        };
+
+        for &PtrLen { ptr, len, .. } in self.non_protected_allocations_iter() {
+            set_region_readable_and_executable(ptr, len)?;
         }
+
+        // Flush any in-flight instructions from the pipeline
+        icache_coherence::pipeline_flush_mt().expect("Failed pipeline flush");
+
+        self.already_protected = self.allocations.len();
+        Ok(())
     }
 
     /// Set all memory allocated in this `Memory` up to now as readonly.
-    pub(crate) fn set_readonly(&mut self) {
+    pub(crate) fn set_readonly(&mut self) -> ModuleResult<()> {
         self.finish_current();
 
-        #[cfg(feature = "selinux-fix")]
-        {
-            for &PtrLen { ref map, ptr, len } in &self.allocations[self.executable..] {
-                if len != 0 && map.is_some() {
-                    unsafe {
-                        region::protect(ptr, len, region::Protection::READ)
-                            .expect("unable to make memory readonly");
-                    }
-                }
+        for &PtrLen { ptr, len, .. } in self.non_protected_allocations_iter() {
+            unsafe {
+                region::protect(ptr, len, region::Protection::READ).map_err(|e| {
+                    ModuleError::Backend(
+                        anyhow::Error::new(e).context("unable to make memory readonly"),
+                    )
+                })?;
             }
         }
 
-        #[cfg(not(feature = "selinux-fix"))]
-        {
-            for &PtrLen { ptr, len } in &self.allocations[self.executable..] {
-                if len != 0 {
-                    unsafe {
-                        region::protect(ptr, len, region::Protection::READ)
-                            .expect("unable to make memory readonly");
-                    }
-                }
-            }
-        }
+        self.already_protected = self.allocations.len();
+        Ok(())
+    }
+
+    /// Iterates non protected memory allocations that are of not zero bytes in size.
+    fn non_protected_allocations_iter(&self) -> impl Iterator<Item = &PtrLen> {
+        let iter = self.allocations[self.already_protected..].iter();
+
+        #[cfg(all(not(target_os = "windows"), feature = "selinux-fix"))]
+        return iter.filter(|&PtrLen { ref map, len, .. }| *len != 0 && map.is_some());
+
+        #[cfg(any(target_os = "windows", not(feature = "selinux-fix")))]
+        return iter.filter(|&PtrLen { len, .. }| *len != 0);
     }
 
     /// Frees all allocated memory regions that would be leaked otherwise.
     /// Likely to invalidate existing function pointers, causing unsafety.
     pub(crate) unsafe fn free_memory(&mut self) {
         self.allocations.clear();
+        self.already_protected = 0;
     }
 }
 

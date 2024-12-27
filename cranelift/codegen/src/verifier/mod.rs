@@ -27,6 +27,7 @@
 //! - All predecessors in the CFG must be branches to the block.
 //! - All branches to a block must be present in the CFG.
 //! - A recomputed dominator tree is identical to the existing one.
+//! - The entry block must not be a cold block.
 //!
 //! Type checking
 //!
@@ -46,6 +47,12 @@
 //! - Detect cycles in global values.
 //! - Detect use of 'vmctx' global value when no corresponding parameter is defined.
 //!
+//! Memory types
+//!
+//! - Ensure that struct fields are in offset order.
+//! - Ensure that struct fields are completely within the overall
+//!   struct size, and do not overlap.
+//!
 //! TODO:
 //! Ad hoc checking
 //!
@@ -56,17 +63,17 @@
 //! - Swizzle and shuffle instructions take a variable number of lane arguments. The number
 //!   of arguments must match the destination type, and the lane indexes must be in range.
 
-use self::flags::verify_flags;
 use crate::dbg::DisplayList;
 use crate::dominator_tree::DominatorTree;
 use crate::entity::SparseSet;
 use crate::flowgraph::{BlockPredecessor, ControlFlowGraph};
-use crate::ir;
 use crate::ir::entities::AnyEntity;
-use crate::ir::instructions::{BranchInfo, CallInfo, InstructionFormat, ResolvedConstraint};
+use crate::ir::instructions::{CallInfo, InstructionFormat, ResolvedConstraint};
+use crate::ir::{self, ArgumentExtension};
 use crate::ir::{
-    types, ArgumentPurpose, Block, Constant, FuncRef, Function, GlobalValue, Inst, InstructionData,
-    JumpTable, Opcode, SigRef, StackSlot, Type, Value, ValueDef, ValueList,
+    types, ArgumentPurpose, Block, Constant, DynamicStackSlot, FuncRef, Function, GlobalValue,
+    Inst, JumpTable, MemFlags, MemoryTypeData, Opcode, SigRef, StackSlot, Type, Value, ValueDef,
+    ValueList,
 };
 use crate::isa::TargetIsa;
 use crate::iterators::IteratorExtras;
@@ -78,8 +85,6 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 use core::fmt::{self, Display, Formatter};
-
-mod flags;
 
 /// A verifier error.
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -152,7 +157,7 @@ where
 
 /// Result of a step in the verification process.
 ///
-/// Functions that return `VerifierStepResult<()>` should also take a
+/// Functions that return `VerifierStepResult` should also take a
 /// mutable reference to `VerifierErrors` as argument in order to report
 /// errors.
 ///
@@ -160,11 +165,11 @@ where
 /// meaning that the verification process may continue. However, other (non-fatal)
 /// errors might have been reported through the previously mentioned `VerifierErrors`
 /// argument.
-pub type VerifierStepResult<T> = Result<T, ()>;
+pub type VerifierStepResult = Result<(), ()>;
 
 /// Result of a verification operation.
 ///
-/// Unlike `VerifierStepResult<()>` which may be `Ok` while still having reported
+/// Unlike `VerifierStepResult` which may be `Ok` while still having reported
 /// errors, this type always returns `Err` if an error (fatal or not) was reported.
 pub type VerifierResult<T> = Result<T, VerifierErrors>;
 
@@ -198,7 +203,7 @@ impl VerifierErrors {
     /// Return a `VerifierStepResult` that is fatal if at least one error was reported,
     /// and non-fatal otherwise.
     #[inline]
-    pub fn as_result(&self) -> VerifierStepResult<()> {
+    pub fn as_result(&self) -> VerifierStepResult {
         if self.is_empty() {
             Ok(())
         } else {
@@ -212,13 +217,13 @@ impl VerifierErrors {
     }
 
     /// Report a fatal error and return `Err`.
-    pub fn fatal(&mut self, error: impl Into<VerifierError>) -> VerifierStepResult<()> {
+    pub fn fatal(&mut self, error: impl Into<VerifierError>) -> VerifierStepResult {
         self.report(error);
         Err(())
     }
 
     /// Report a non-fatal error and return `Ok`.
-    pub fn nonfatal(&mut self, error: impl Into<VerifierError>) -> VerifierStepResult<()> {
+    pub fn nonfatal(&mut self, error: impl Into<VerifierError>) -> VerifierStepResult {
         self.report(error);
         Ok(())
     }
@@ -249,7 +254,7 @@ impl Into<VerifierResult<()>> for VerifierErrors {
 impl Display for VerifierErrors {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         for err in &self.0 {
-            writeln!(f, "- {}", err)?;
+            writeln!(f, "- {err}")?;
         }
         Ok(())
     }
@@ -280,7 +285,7 @@ pub fn verify_context<'a, FOI: Into<FlagsOrIsa<'a>>>(
     domtree: &DominatorTree,
     fisa: FOI,
     errors: &mut VerifierErrors,
-) -> VerifierStepResult<()> {
+) -> VerifierStepResult {
     let _tt = timing::verifier();
     let verifier = Verifier::new(func, fisa.into());
     if cfg.is_valid() {
@@ -320,7 +325,7 @@ impl<'a> Verifier<'a> {
     // Check for:
     //  - cycles in the global value declarations.
     //  - use of 'vmctx' when no special parameter declares it.
-    fn verify_global_values(&self, errors: &mut VerifierErrors) -> VerifierStepResult<()> {
+    fn verify_global_values(&self, errors: &mut VerifierErrors) -> VerifierStepResult {
         let mut cycle_seen = false;
         let mut seen = SparseSet::new();
 
@@ -358,7 +363,7 @@ impl<'a> Verifier<'a> {
                         .special_param(ir::ArgumentPurpose::VMContext)
                         .is_none()
                     {
-                        errors.report((gv, format!("undeclared vmctx reference {}", gv)));
+                        errors.report((gv, format!("undeclared vmctx reference {gv}")));
                     }
                 }
                 ir::GlobalValueData::IAddImm {
@@ -367,7 +372,7 @@ impl<'a> Verifier<'a> {
                     if !global_type.is_int() {
                         errors.report((
                             gv,
-                            format!("iadd_imm global value with non-int type {}", global_type),
+                            format!("iadd_imm global value with non-int type {global_type}"),
                         ));
                     } else if let Some(isa) = self.isa {
                         let base_type = self.func.global_values[base].global_type(isa);
@@ -375,8 +380,7 @@ impl<'a> Verifier<'a> {
                             errors.report((
                                 gv,
                                 format!(
-                                    "iadd_imm type {} differs from operand type {}",
-                                    global_type, base_type
+                                    "iadd_imm type {global_type} differs from operand type {base_type}"
                                 ),
                             ));
                         }
@@ -390,8 +394,7 @@ impl<'a> Verifier<'a> {
                             errors.report((
                                 gv,
                                 format!(
-                                    "base {} has type {}, which is not the pointer type {}",
-                                    base, base_type, pointer_type
+                                    "base {base} has type {base_type}, which is not the pointer type {pointer_type}"
                                 ),
                             ));
                         }
@@ -405,104 +408,56 @@ impl<'a> Verifier<'a> {
         Ok(())
     }
 
-    fn verify_heaps(&self, errors: &mut VerifierErrors) -> VerifierStepResult<()> {
-        if let Some(isa) = self.isa {
-            for (heap, heap_data) in &self.func.heaps {
-                let base = heap_data.base;
-                if !self.func.global_values.is_valid(base) {
-                    return errors.nonfatal((heap, format!("invalid base global value {}", base)));
-                }
+    fn verify_memory_types(&self, errors: &mut VerifierErrors) -> VerifierStepResult {
+        // Verify that all fields are statically-sized and lie within
+        // the struct, do not overlap, and are in offset order
+        for (mt, mt_data) in &self.func.memory_types {
+            match mt_data {
+                MemoryTypeData::Struct { size, fields } => {
+                    let mut last_offset = 0;
+                    for field in fields {
+                        if field.offset < last_offset {
+                            errors.report((
+                                mt,
+                                format!(
+                                    "memory type {} has a field at offset {}, which is out-of-order",
+                                    mt, field.offset
+                                ),
+                            ));
+                        }
+                        last_offset = match field.offset.checked_add(u64::from(field.ty.bytes())) {
+                            Some(o) => o,
+                            None => {
+                                errors.report((
+                                        mt,
+                                        format!(
+                                            "memory type {} has a field at offset {} of size {}; offset plus size overflows a u64",
+                                            mt, field.offset, field.ty.bytes()),
+                                ));
+                                break;
+                            }
+                        };
 
-                let pointer_type = isa.pointer_type();
-                let base_type = self.func.global_values[base].global_type(isa);
-                if base_type != pointer_type {
-                    errors.report((
-                        heap,
-                        format!(
-                            "heap base has type {}, which is not the pointer type {}",
-                            base_type, pointer_type
-                        ),
-                    ));
-                }
-
-                if let ir::HeapStyle::Dynamic { bound_gv, .. } = heap_data.style {
-                    if !self.func.global_values.is_valid(bound_gv) {
-                        return errors
-                            .nonfatal((heap, format!("invalid bound global value {}", bound_gv)));
+                        if last_offset > *size {
+                            errors.report((
+                                        mt,
+                                        format!(
+                                            "memory type {} has a field at offset {} of size {} that overflows the struct size {}",
+                                            mt, field.offset, field.ty.bytes(), *size),
+                                          ));
+                        }
                     }
-
-                    let bound_type = self.func.global_values[bound_gv].global_type(isa);
-                    if pointer_type != bound_type {
-                        errors.report((
-                            heap,
-                            format!(
-                                "heap pointer type {} differs from the type of its bound, {}",
-                                pointer_type, bound_type
-                            ),
-                        ));
-                    }
                 }
+                _ => {}
             }
         }
 
-        Ok(())
-    }
-
-    fn verify_tables(&self, errors: &mut VerifierErrors) -> VerifierStepResult<()> {
-        if let Some(isa) = self.isa {
-            for (table, table_data) in &self.func.tables {
-                let base = table_data.base_gv;
-                if !self.func.global_values.is_valid(base) {
-                    return errors.nonfatal((table, format!("invalid base global value {}", base)));
-                }
-
-                let pointer_type = isa.pointer_type();
-                let base_type = self.func.global_values[base].global_type(isa);
-                if base_type != pointer_type {
-                    errors.report((
-                        table,
-                        format!(
-                            "table base has type {}, which is not the pointer type {}",
-                            base_type, pointer_type
-                        ),
-                    ));
-                }
-
-                let bound_gv = table_data.bound_gv;
-                if !self.func.global_values.is_valid(bound_gv) {
-                    return errors
-                        .nonfatal((table, format!("invalid bound global value {}", bound_gv)));
-                }
-
-                let index_type = table_data.index_type;
-                let bound_type = self.func.global_values[bound_gv].global_type(isa);
-                if index_type != bound_type {
-                    errors.report((
-                        table,
-                        format!(
-                            "table index type {} differs from the type of its bound, {}",
-                            index_type, bound_type
-                        ),
-                    ));
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn verify_jump_tables(&self, errors: &mut VerifierErrors) -> VerifierStepResult<()> {
-        for (jt, jt_data) in &self.func.jump_tables {
-            for &block in jt_data.iter() {
-                self.verify_block(jt, block, errors)?;
-            }
-        }
         Ok(())
     }
 
     /// Check that the given block can be encoded as a BB, by checking that only
     /// branching instructions are ending the block.
-    fn encodable_as_bb(&self, block: Block, errors: &mut VerifierErrors) -> VerifierStepResult<()> {
+    fn encodable_as_bb(&self, block: Block, errors: &mut VerifierErrors) -> VerifierStepResult {
         match self.func.is_block_basic(block) {
             Ok(()) => Ok(()),
             Err((inst, message)) => errors.fatal((inst, self.context(inst), message)),
@@ -514,8 +469,8 @@ impl<'a> Verifier<'a> {
         block: Block,
         inst: Inst,
         errors: &mut VerifierErrors,
-    ) -> VerifierStepResult<()> {
-        let is_terminator = self.func.dfg[inst].opcode().is_terminator();
+    ) -> VerifierStepResult {
+        let is_terminator = self.func.dfg.insts[inst].opcode().is_terminator();
         let is_last_inst = self.func.layout.last_inst(block) == Some(inst);
 
         if is_terminator && !is_last_inst {
@@ -523,10 +478,7 @@ impl<'a> Verifier<'a> {
             return errors.fatal((
                 inst,
                 self.context(inst),
-                format!(
-                    "a terminator instruction was encountered before the end of {}",
-                    block
-                ),
+                format!("a terminator instruction was encountered before the end of {block}"),
             ));
         }
         if is_last_inst && !is_terminator {
@@ -539,7 +491,7 @@ impl<'a> Verifier<'a> {
             return errors.fatal((
                 inst,
                 self.context(inst),
-                format!("should belong to {} not {:?}", block, inst_block),
+                format!("should belong to {block} not {inst_block:?}"),
             ));
         }
 
@@ -548,7 +500,7 @@ impl<'a> Verifier<'a> {
             match self.func.dfg.value_def(arg) {
                 ValueDef::Param(arg_block, _) => {
                     if block != arg_block {
-                        return errors.fatal((arg, format!("does not belong to {}", block)));
+                        return errors.fatal((arg, format!("does not belong to {block}")));
                     }
                 }
                 _ => {
@@ -560,12 +512,8 @@ impl<'a> Verifier<'a> {
         Ok(())
     }
 
-    fn instruction_integrity(
-        &self,
-        inst: Inst,
-        errors: &mut VerifierErrors,
-    ) -> VerifierStepResult<()> {
-        let inst_data = &self.func.dfg[inst];
+    fn instruction_integrity(&self, inst: Inst, errors: &mut VerifierErrors) -> VerifierStepResult {
+        let inst_data = &self.func.dfg.insts[inst];
         let dfg = &self.func.dfg;
 
         // The instruction format matches the opcode
@@ -577,23 +525,15 @@ impl<'a> Verifier<'a> {
             ));
         }
 
-        let num_fixed_results = inst_data.opcode().constraints().num_fixed_results();
-        // var_results is 0 if we aren't a call instruction
-        let var_results = dfg
-            .call_signature(inst)
-            .map_or(0, |sig| dfg.signatures[sig].returns.len());
-        let total_results = num_fixed_results + var_results;
+        let expected_num_results = dfg.num_expected_results_for_verifier(inst);
 
         // All result values for multi-valued instructions are created
         let got_results = dfg.inst_results(inst).len();
-        if got_results != total_results {
+        if got_results != expected_num_results {
             return errors.fatal((
                 inst,
                 self.context(inst),
-                format!(
-                    "expected {} result values, found {}",
-                    total_results, got_results,
-                ),
+                format!("expected {expected_num_results} result values, found {got_results}"),
             ));
         }
 
@@ -604,10 +544,10 @@ impl<'a> Verifier<'a> {
         &self,
         inst: Inst,
         errors: &mut VerifierErrors,
-    ) -> VerifierStepResult<()> {
+    ) -> VerifierStepResult {
         use crate::ir::instructions::InstructionData::*;
 
-        for &arg in self.func.dfg.inst_args(inst) {
+        for arg in self.func.dfg.inst_values(inst) {
             self.verify_inst_arg(inst, arg, errors)?;
 
             // All used values must be attached to something.
@@ -616,7 +556,7 @@ impl<'a> Verifier<'a> {
                 errors.report((
                     inst,
                     self.context(inst),
-                    format!("argument {} -> {} is not attached", arg, original),
+                    format!("argument {arg} -> {original} is not attached"),
                 ));
             }
         }
@@ -625,47 +565,23 @@ impl<'a> Verifier<'a> {
             self.verify_inst_result(inst, res, errors)?;
         }
 
-        match self.func.dfg[inst] {
+        match self.func.dfg.insts[inst] {
             MultiAry { ref args, .. } => {
                 self.verify_value_list(inst, args, errors)?;
             }
-            Jump {
-                destination,
-                ref args,
-                ..
+            Jump { destination, .. } => {
+                self.verify_block(inst, destination.block(&self.func.dfg.value_lists), errors)?;
             }
-            | Branch {
-                destination,
-                ref args,
-                ..
-            }
-            | BranchInt {
-                destination,
-                ref args,
-                ..
-            }
-            | BranchFloat {
-                destination,
-                ref args,
-                ..
-            }
-            | BranchIcmp {
-                destination,
-                ref args,
+            Brif {
+                arg,
+                blocks: [block_then, block_else],
                 ..
             } => {
-                self.verify_block(inst, destination, errors)?;
-                self.verify_value_list(inst, args, errors)?;
+                self.verify_value(inst, arg, errors)?;
+                self.verify_block(inst, block_then.block(&self.func.dfg.value_lists), errors)?;
+                self.verify_block(inst, block_else.block(&self.func.dfg.value_lists), errors)?;
             }
-            BranchTable {
-                table, destination, ..
-            } => {
-                self.verify_block(inst, destination, errors)?;
-                self.verify_jump_table(inst, table, errors)?;
-            }
-            BranchTableBase { table, .. }
-            | BranchTableEntry { table, .. }
-            | IndirectJump { table, .. } => {
+            BranchTable { table, .. } => {
                 self.verify_jump_table(inst, table, errors)?;
             }
             Call {
@@ -686,22 +602,17 @@ impl<'a> Verifier<'a> {
             StackLoad { stack_slot, .. } | StackStore { stack_slot, .. } => {
                 self.verify_stack_slot(inst, stack_slot, errors)?;
             }
+            DynamicStackLoad {
+                dynamic_stack_slot, ..
+            }
+            | DynamicStackStore {
+                dynamic_stack_slot, ..
+            } => {
+                self.verify_dynamic_stack_slot(inst, dynamic_stack_slot, errors)?;
+            }
             UnaryGlobalValue { global_value, .. } => {
                 self.verify_global_value(inst, global_value, errors)?;
             }
-            HeapAddr { heap, .. } => {
-                self.verify_heap(inst, heap, errors)?;
-            }
-            TableAddr { table, .. } => {
-                self.verify_table(inst, table, errors)?;
-            }
-            LoadComplex { ref args, .. } => {
-                self.verify_value_list(inst, args, errors)?;
-            }
-            StoreComplex { ref args, .. } => {
-                self.verify_value_list(inst, args, errors)?;
-            }
-
             NullAry {
                 opcode: Opcode::GetPinnedReg,
             }
@@ -725,18 +636,41 @@ impl<'a> Verifier<'a> {
                     ));
                 }
             }
-            Unary {
+            NullAry {
+                opcode: Opcode::GetFramePointer | Opcode::GetReturnAddress,
+            } => {
+                if let Some(isa) = &self.isa {
+                    // Backends may already rely on this check implicitly, so do
+                    // not relax it without verifying that it is safe to do so.
+                    if !isa.flags().preserve_frame_pointers() {
+                        return errors.fatal((
+                            inst,
+                            self.context(inst),
+                            "`get_frame_pointer`/`get_return_address` cannot be used without \
+                             enabling `preserve_frame_pointers`",
+                        ));
+                    }
+                } else {
+                    return errors.fatal((
+                        inst,
+                        self.context(inst),
+                        "`get_frame_pointer`/`get_return_address` require an ISA!",
+                    ));
+                }
+            }
+            LoadNoOffset {
                 opcode: Opcode::Bitcast,
+                flags,
                 arg,
             } => {
-                self.verify_bitcast(inst, arg, errors)?;
+                self.verify_bitcast(inst, flags, arg, errors)?;
             }
             UnaryConst {
-                opcode: Opcode::Vconst,
+                opcode: opcode @ (Opcode::Vconst | Opcode::F128const),
                 constant_handle,
                 ..
             } => {
-                self.verify_constant_size(inst, constant_handle, errors)?;
+                self.verify_constant_size(inst, opcode, constant_handle, errors)?;
             }
 
             // Exhaustive list so we can't forget to add new formats
@@ -747,27 +681,23 @@ impl<'a> Verifier<'a> {
             | Unary { .. }
             | UnaryConst { .. }
             | UnaryImm { .. }
+            | UnaryIeee16 { .. }
             | UnaryIeee32 { .. }
             | UnaryIeee64 { .. }
-            | UnaryBool { .. }
             | Binary { .. }
             | BinaryImm8 { .. }
             | BinaryImm64 { .. }
             | Ternary { .. }
             | TernaryImm8 { .. }
             | Shuffle { .. }
+            | IntAddTrap { .. }
             | IntCompare { .. }
             | IntCompareImm { .. }
-            | IntCond { .. }
             | FloatCompare { .. }
-            | FloatCond { .. }
-            | IntSelect { .. }
             | Load { .. }
             | Store { .. }
             | Trap { .. }
             | CondTrap { .. }
-            | IntCondTrap { .. }
-            | FloatCondTrap { .. }
             | NullAry { .. } => {}
         }
 
@@ -779,13 +709,13 @@ impl<'a> Verifier<'a> {
         loc: impl Into<AnyEntity>,
         e: Block,
         errors: &mut VerifierErrors,
-    ) -> VerifierStepResult<()> {
+    ) -> VerifierStepResult {
         if !self.func.dfg.block_is_valid(e) || !self.func.layout.is_block_inserted(e) {
-            return errors.fatal((loc, format!("invalid block reference {}", e)));
+            return errors.fatal((loc, format!("invalid block reference {e}")));
         }
         if let Some(entry_block) = self.func.layout.entry_block() {
             if e == entry_block {
-                return errors.fatal((loc, format!("invalid reference to entry block {}", e)));
+                return errors.fatal((loc, format!("invalid reference to entry block {e}")));
             }
         }
         Ok(())
@@ -796,12 +726,12 @@ impl<'a> Verifier<'a> {
         inst: Inst,
         s: SigRef,
         errors: &mut VerifierErrors,
-    ) -> VerifierStepResult<()> {
+    ) -> VerifierStepResult {
         if !self.func.dfg.signatures.is_valid(s) {
             errors.fatal((
                 inst,
                 self.context(inst),
-                format!("invalid signature reference {}", s),
+                format!("invalid signature reference {s}"),
             ))
         } else {
             Ok(())
@@ -813,12 +743,12 @@ impl<'a> Verifier<'a> {
         inst: Inst,
         f: FuncRef,
         errors: &mut VerifierErrors,
-    ) -> VerifierStepResult<()> {
+    ) -> VerifierStepResult {
         if !self.func.dfg.ext_funcs.is_valid(f) {
             errors.nonfatal((
                 inst,
                 self.context(inst),
-                format!("invalid function reference {}", f),
+                format!("invalid function reference {f}"),
             ))
         } else {
             Ok(())
@@ -830,12 +760,25 @@ impl<'a> Verifier<'a> {
         inst: Inst,
         ss: StackSlot,
         errors: &mut VerifierErrors,
-    ) -> VerifierStepResult<()> {
-        if !self.func.stack_slots.is_valid(ss) {
+    ) -> VerifierStepResult {
+        if !self.func.sized_stack_slots.is_valid(ss) {
+            errors.nonfatal((inst, self.context(inst), format!("invalid stack slot {ss}")))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn verify_dynamic_stack_slot(
+        &self,
+        inst: Inst,
+        ss: DynamicStackSlot,
+        errors: &mut VerifierErrors,
+    ) -> VerifierStepResult {
+        if !self.func.dynamic_stack_slots.is_valid(ss) {
             errors.nonfatal((
                 inst,
                 self.context(inst),
-                format!("invalid stack slot {}", ss),
+                format!("invalid dynamic stack slot {ss}"),
             ))
         } else {
             Ok(())
@@ -847,39 +790,13 @@ impl<'a> Verifier<'a> {
         inst: Inst,
         gv: GlobalValue,
         errors: &mut VerifierErrors,
-    ) -> VerifierStepResult<()> {
+    ) -> VerifierStepResult {
         if !self.func.global_values.is_valid(gv) {
             errors.nonfatal((
                 inst,
                 self.context(inst),
-                format!("invalid global value {}", gv),
+                format!("invalid global value {gv}"),
             ))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn verify_heap(
-        &self,
-        inst: Inst,
-        heap: ir::Heap,
-        errors: &mut VerifierErrors,
-    ) -> VerifierStepResult<()> {
-        if !self.func.heaps.is_valid(heap) {
-            errors.nonfatal((inst, self.context(inst), format!("invalid heap {}", heap)))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn verify_table(
-        &self,
-        inst: Inst,
-        table: ir::Table,
-        errors: &mut VerifierErrors,
-    ) -> VerifierStepResult<()> {
-        if !self.func.tables.is_valid(table) {
-            errors.nonfatal((inst, self.context(inst), format!("invalid table {}", table)))
         } else {
             Ok(())
         }
@@ -890,12 +807,12 @@ impl<'a> Verifier<'a> {
         inst: Inst,
         l: &ValueList,
         errors: &mut VerifierErrors,
-    ) -> VerifierStepResult<()> {
+    ) -> VerifierStepResult {
         if !l.is_valid(&self.func.dfg.value_lists) {
             errors.nonfatal((
                 inst,
                 self.context(inst),
-                format!("invalid value list reference {:?}", l),
+                format!("invalid value list reference {l:?}"),
             ))
         } else {
             Ok(())
@@ -907,14 +824,18 @@ impl<'a> Verifier<'a> {
         inst: Inst,
         j: JumpTable,
         errors: &mut VerifierErrors,
-    ) -> VerifierStepResult<()> {
-        if !self.func.jump_tables.is_valid(j) {
+    ) -> VerifierStepResult {
+        if !self.func.stencil.dfg.jump_tables.is_valid(j) {
             errors.nonfatal((
                 inst,
                 self.context(inst),
-                format!("invalid jump table reference {}", j),
+                format!("invalid jump table reference {j}"),
             ))
         } else {
+            let pool = &self.func.stencil.dfg.value_lists;
+            for block in self.func.stencil.dfg.jump_tables[j].all_branches() {
+                self.verify_block(inst, block.block(pool), errors)?;
+            }
             Ok(())
         }
     }
@@ -924,13 +845,13 @@ impl<'a> Verifier<'a> {
         loc_inst: Inst,
         v: Value,
         errors: &mut VerifierErrors,
-    ) -> VerifierStepResult<()> {
+    ) -> VerifierStepResult {
         let dfg = &self.func.dfg;
         if !dfg.value_is_valid(v) {
             errors.nonfatal((
                 loc_inst,
                 self.context(loc_inst),
-                format!("invalid value reference {}", v),
+                format!("invalid value reference {v}"),
             ))
         } else {
             Ok(())
@@ -942,11 +863,15 @@ impl<'a> Verifier<'a> {
         loc_inst: Inst,
         v: Value,
         errors: &mut VerifierErrors,
-    ) -> VerifierStepResult<()> {
+    ) -> VerifierStepResult {
         self.verify_value(loc_inst, v, errors)?;
 
         let dfg = &self.func.dfg;
-        let loc_block = self.func.layout.pp_block(loc_inst);
+        let loc_block = self
+            .func
+            .layout
+            .inst_block(loc_inst)
+            .expect("Instruction not in layout.");
         let is_reachable = self.expected_domtree.is_reachable(loc_block);
 
         // SSA form
@@ -957,7 +882,7 @@ impl<'a> Verifier<'a> {
                     return errors.fatal((
                         loc_inst,
                         self.context(loc_inst),
-                        format!("{} is defined by invalid instruction {}", v, def_inst),
+                        format!("{v} is defined by invalid instruction {def_inst}"),
                     ));
                 }
                 // Defining instruction is inserted in a block.
@@ -965,7 +890,7 @@ impl<'a> Verifier<'a> {
                     return errors.fatal((
                         loc_inst,
                         self.context(loc_inst),
-                        format!("{} is defined by {} which has no block", v, def_inst),
+                        format!("{v} is defined by {def_inst} which has no block"),
                     ));
                 }
                 // Defining instruction dominates the instruction that uses the value.
@@ -977,14 +902,14 @@ impl<'a> Verifier<'a> {
                         return errors.fatal((
                             loc_inst,
                             self.context(loc_inst),
-                            format!("uses value {} from non-dominating {}", v, def_inst),
+                            format!("uses value {v} from non-dominating {def_inst}"),
                         ));
                     }
                     if def_inst == loc_inst {
                         return errors.fatal((
                             loc_inst,
                             self.context(loc_inst),
-                            format!("uses value {} from itself", v),
+                            format!("uses value {v} from itself"),
                         ));
                     }
                 }
@@ -995,7 +920,7 @@ impl<'a> Verifier<'a> {
                     return errors.fatal((
                         loc_inst,
                         self.context(loc_inst),
-                        format!("{} is defined by invalid block {}", v, block),
+                        format!("{v} is defined by invalid block {block}"),
                     ));
                 }
                 // Defining block is inserted in the layout
@@ -1003,7 +928,7 @@ impl<'a> Verifier<'a> {
                     return errors.fatal((
                         loc_inst,
                         self.context(loc_inst),
-                        format!("{} is defined by {} which is not in the layout", v, block),
+                        format!("{v} is defined by {block} which is not in the layout"),
                     ));
                 }
                 // The defining block dominates the instruction using this value.
@@ -1015,9 +940,13 @@ impl<'a> Verifier<'a> {
                     return errors.fatal((
                         loc_inst,
                         self.context(loc_inst),
-                        format!("uses value arg from non-dominating {}", block),
+                        format!("uses value arg from non-dominating {block}"),
                     ));
                 }
+            }
+            ValueDef::Union(_, _) => {
+                // Nothing: union nodes themselves have no location,
+                // so we cannot check any dominance properties.
             }
         }
         Ok(())
@@ -1028,7 +957,7 @@ impl<'a> Verifier<'a> {
         loc_inst: Inst,
         v: Value,
         errors: &mut VerifierErrors,
-    ) -> VerifierStepResult<()> {
+    ) -> VerifierStepResult {
         self.verify_value(loc_inst, v, errors)?;
 
         match self.func.dfg.value_def(v) {
@@ -1037,7 +966,7 @@ impl<'a> Verifier<'a> {
                     errors.fatal((
                         loc_inst,
                         self.context(loc_inst),
-                        format!("instruction result {} is not defined by the instruction", v),
+                        format!("instruction result {v} is not defined by the instruction"),
                     ))
                 } else {
                     Ok(())
@@ -1046,7 +975,12 @@ impl<'a> Verifier<'a> {
             ValueDef::Param(_, _) => errors.fatal((
                 loc_inst,
                 self.context(loc_inst),
-                format!("instruction result {} is not defined by the instruction", v),
+                format!("instruction result {v} is not defined by the instruction"),
+            )),
+            ValueDef::Union(_, _) => errors.fatal((
+                loc_inst,
+                self.context(loc_inst),
+                format!("instruction result {v} is a union node"),
             )),
         }
     }
@@ -1054,20 +988,35 @@ impl<'a> Verifier<'a> {
     fn verify_bitcast(
         &self,
         inst: Inst,
+        flags: MemFlags,
         arg: Value,
         errors: &mut VerifierErrors,
-    ) -> VerifierStepResult<()> {
+    ) -> VerifierStepResult {
         let typ = self.func.dfg.ctrl_typevar(inst);
         let value_type = self.func.dfg.value_type(arg);
 
-        if typ.lane_bits() < value_type.lane_bits() {
+        if typ.bits() != value_type.bits() {
             errors.fatal((
                 inst,
                 format!(
-                    "The bitcast argument {} doesn't fit in a type of {} bits",
+                    "The bitcast argument {} has a type of {} bits, which doesn't match an expected type of {} bits",
                     arg,
-                    typ.lane_bits()
+                    value_type.bits(),
+                    typ.bits()
                 ),
+            ))
+        } else if flags != MemFlags::new()
+            && flags != MemFlags::new().with_endianness(ir::Endianness::Little)
+            && flags != MemFlags::new().with_endianness(ir::Endianness::Big)
+        {
+            errors.fatal((
+                inst,
+                "The bitcast instruction only accepts the `big` or `little` memory flags",
+            ))
+        } else if flags == MemFlags::new() && typ.lane_count() != value_type.lane_count() {
+            errors.fatal((
+                inst,
+                "Byte order specifier required for bitcast instruction changing lane count",
             ))
         } else {
             Ok(())
@@ -1077,17 +1026,21 @@ impl<'a> Verifier<'a> {
     fn verify_constant_size(
         &self,
         inst: Inst,
+        opcode: Opcode,
         constant: Constant,
         errors: &mut VerifierErrors,
-    ) -> VerifierStepResult<()> {
-        let type_size = self.func.dfg.ctrl_typevar(inst).bytes() as usize;
+    ) -> VerifierStepResult {
+        let type_size = match opcode {
+            Opcode::F128const => types::F128.bytes(),
+            Opcode::Vconst => self.func.dfg.ctrl_typevar(inst).bytes(),
+            _ => unreachable!("unexpected opcode {opcode:?}"),
+        } as usize;
         let constant_size = self.func.dfg.constants.get(constant).len();
         if type_size != constant_size {
             errors.fatal((
                 inst,
                 format!(
-                    "The instruction expects {} to have a size of {} bytes but it has {}",
-                    constant, type_size, constant_size
+                    "The instruction expects {constant} to have a size of {type_size} bytes but it has {constant_size}"
                 ),
             ))
         } else {
@@ -1099,7 +1052,7 @@ impl<'a> Verifier<'a> {
         &self,
         domtree: &DominatorTree,
         errors: &mut VerifierErrors,
-    ) -> VerifierStepResult<()> {
+    ) -> VerifierStepResult {
         // We consider two `DominatorTree`s to be equal if they return the same immediate
         // dominator for each block. Therefore the current domtree is valid if it matches the freshly
         // computed one.
@@ -1109,10 +1062,7 @@ impl<'a> Verifier<'a> {
             if got != expected {
                 return errors.fatal((
                     block,
-                    format!(
-                        "invalid domtree, expected idom({}) = {:?}, got {:?}",
-                        block, expected, got
-                    ),
+                    format!("invalid domtree, expected idom({block}) = {expected:?}, got {got:?}"),
                 ));
             }
         }
@@ -1133,24 +1083,19 @@ impl<'a> Verifier<'a> {
                 return errors.fatal((
                     test_block,
                     format!(
-                        "invalid domtree, postorder block number {} should be {}, got {}",
-                        index, true_block, test_block
+                        "invalid domtree, postorder block number {index} should be {true_block}, got {test_block}"
                     ),
                 ));
             }
         }
-        // We verify rpo_cmp on pairs of adjacent blocks in the postorder
+        // We verify rpo_cmp_block on pairs of adjacent blocks in the postorder
         for (&prev_block, &next_block) in domtree.cfg_postorder().iter().adjacent_pairs() {
-            if self
-                .expected_domtree
-                .rpo_cmp(prev_block, next_block, &self.func.layout)
-                != Ordering::Greater
-            {
+            if self.expected_domtree.rpo_cmp_block(prev_block, next_block) != Ordering::Greater {
                 return errors.fatal((
                     next_block,
                     format!(
-                        "invalid domtree, rpo_cmp does not says {} is greater than {}",
-                        prev_block, next_block
+                        "invalid domtree, rpo_cmp_block does not say {} is greater than {}; rpo = {:#?}",
+                        prev_block, next_block, domtree.cfg_postorder()
                     ),
                 ));
             }
@@ -1158,7 +1103,7 @@ impl<'a> Verifier<'a> {
         Ok(())
     }
 
-    fn typecheck_entry_block_params(&self, errors: &mut VerifierErrors) -> VerifierStepResult<()> {
+    fn typecheck_entry_block_params(&self, errors: &mut VerifierErrors) -> VerifierStepResult {
         if let Some(block) = self.func.layout.entry_block() {
             let expected_types = &self.func.signature.params;
             let block_param_count = self.func.dfg.num_block_params(block);
@@ -1191,8 +1136,18 @@ impl<'a> Verifier<'a> {
         errors.as_result()
     }
 
-    fn typecheck(&self, inst: Inst, errors: &mut VerifierErrors) -> VerifierStepResult<()> {
-        let inst_data = &self.func.dfg[inst];
+    fn check_entry_not_cold(&self, errors: &mut VerifierErrors) -> VerifierStepResult {
+        if let Some(entry_block) = self.func.layout.entry_block() {
+            if self.func.layout.is_cold(entry_block) {
+                return errors
+                    .fatal((entry_block, format!("entry block cannot be marked as cold")));
+            }
+        }
+        errors.as_result()
+    }
+
+    fn typecheck(&self, inst: Inst, errors: &mut VerifierErrors) -> VerifierStepResult {
+        let inst_data = &self.func.dfg.insts[inst];
         let constraints = inst_data.opcode().constraints();
 
         let ctrl_type = if let Some(value_typeset) = constraints.ctrl_typeset() {
@@ -1203,7 +1158,9 @@ impl<'a> Verifier<'a> {
                 errors.report((
                     inst,
                     self.context(inst),
-                    format!("has an invalid controlling type {}", ctrl_type),
+                    format!(
+                        "has an invalid controlling type {ctrl_type} (allowed set is {value_typeset:?})"
+                    ),
                 ));
             }
 
@@ -1219,10 +1176,7 @@ impl<'a> Verifier<'a> {
         let _ = self.typecheck_fixed_args(inst, ctrl_type, errors);
         let _ = self.typecheck_variable_args(inst, errors);
         let _ = self.typecheck_return(inst, errors);
-        let _ = self.typecheck_special(inst, ctrl_type, errors);
-
-        // Misuses of copy_nop instructions are fatal
-        self.typecheck_copy_nop(inst, errors)?;
+        let _ = self.typecheck_special(inst, errors);
 
         Ok(())
     }
@@ -1232,7 +1186,7 @@ impl<'a> Verifier<'a> {
         inst: Inst,
         ctrl_type: Type,
         errors: &mut VerifierErrors,
-    ) -> VerifierStepResult<()> {
+    ) -> VerifierStepResult {
         let mut i = 0;
         for &result in self.func.dfg.inst_results(inst) {
             let result_type = self.func.dfg.value_type(result);
@@ -1243,8 +1197,7 @@ impl<'a> Verifier<'a> {
                         inst,
                         self.context(inst),
                         format!(
-                            "expected result {} ({}) to have type {}, found {}",
-                            i, result, expected_type, result_type
+                            "expected result {i} ({result}) to have type {expected_type}, found {result_type}"
                         ),
                     ));
                 }
@@ -1274,8 +1227,8 @@ impl<'a> Verifier<'a> {
         inst: Inst,
         ctrl_type: Type,
         errors: &mut VerifierErrors,
-    ) -> VerifierStepResult<()> {
-        let constraints = self.func.dfg[inst].opcode().constraints();
+    ) -> VerifierStepResult {
+        let constraints = self.func.dfg.insts[inst].opcode().constraints();
 
         for (i, &arg) in self.func.dfg.inst_fixed_args(inst).iter().enumerate() {
             let arg_type = self.func.dfg.value_type(arg);
@@ -1286,8 +1239,7 @@ impl<'a> Verifier<'a> {
                             inst,
                             self.context(inst),
                             format!(
-                                "arg {} ({}) has type {}, expected {}",
-                                i, arg, arg_type, expected_type
+                                "arg {i} ({arg}) has type {arg_type}, expected {expected_type}"
                             ),
                         ));
                     }
@@ -1298,8 +1250,7 @@ impl<'a> Verifier<'a> {
                             inst,
                             self.context(inst),
                             format!(
-                                "arg {} ({}) with type {} failed to satisfy type set {:?}",
-                                i, arg, arg_type, type_set
+                                "arg {i} ({arg}) with type {arg_type} failed to satisfy type set {type_set:?}"
                             ),
                         ));
                     }
@@ -1309,80 +1260,77 @@ impl<'a> Verifier<'a> {
         Ok(())
     }
 
+    /// Typecheck both instructions that contain variable arguments like calls, and those that
+    /// include references to basic blocks with their arguments.
     fn typecheck_variable_args(
         &self,
         inst: Inst,
         errors: &mut VerifierErrors,
-    ) -> VerifierStepResult<()> {
-        match self.func.dfg.analyze_branch(inst) {
-            BranchInfo::SingleDest(block, _) => {
-                let iter = self
-                    .func
-                    .dfg
-                    .block_params(block)
-                    .iter()
-                    .map(|&v| self.func.dfg.value_type(v));
-                self.typecheck_variable_args_iterator(inst, iter, errors)?;
+    ) -> VerifierStepResult {
+        match &self.func.dfg.insts[inst] {
+            ir::InstructionData::Jump { destination, .. } => {
+                self.typecheck_block_call(inst, destination, errors)?;
             }
-            BranchInfo::Table(table, block) => {
-                if let Some(block) = block {
-                    let arg_count = self.func.dfg.num_block_params(block);
-                    if arg_count != 0 {
-                        return errors.nonfatal((
-                            inst,
-                            self.context(inst),
-                            format!(
-                                "takes no arguments, but had target {} with {} arguments",
-                                block, arg_count,
-                            ),
-                        ));
-                    }
-                }
-                for block in self.func.jump_tables[table].iter() {
-                    let arg_count = self.func.dfg.num_block_params(*block);
-                    if arg_count != 0 {
-                        return errors.nonfatal((
-                            inst,
-                            self.context(inst),
-                            format!(
-                                "takes no arguments, but had target {} with {} arguments",
-                                block, arg_count,
-                            ),
-                        ));
-                    }
+            ir::InstructionData::Brif {
+                blocks: [block_then, block_else],
+                ..
+            } => {
+                self.typecheck_block_call(inst, block_then, errors)?;
+                self.typecheck_block_call(inst, block_else, errors)?;
+            }
+            ir::InstructionData::BranchTable { table, .. } => {
+                for block in self.func.stencil.dfg.jump_tables[*table].all_branches() {
+                    self.typecheck_block_call(inst, block, errors)?;
                 }
             }
-            BranchInfo::NotABranch => {}
+            inst => debug_assert!(!inst.opcode().is_branch()),
         }
 
-        match self.func.dfg[inst].analyze_call(&self.func.dfg.value_lists) {
-            CallInfo::Direct(func_ref, _) => {
+        match self.func.dfg.insts[inst].analyze_call(&self.func.dfg.value_lists) {
+            CallInfo::Direct(func_ref, args) => {
                 let sig_ref = self.func.dfg.ext_funcs[func_ref].signature;
                 let arg_types = self.func.dfg.signatures[sig_ref]
                     .params
                     .iter()
                     .map(|a| a.value_type);
-                self.typecheck_variable_args_iterator(inst, arg_types, errors)?;
+                self.typecheck_variable_args_iterator(inst, arg_types, args, errors)?;
             }
-            CallInfo::Indirect(sig_ref, _) => {
+            CallInfo::Indirect(sig_ref, args) => {
                 let arg_types = self.func.dfg.signatures[sig_ref]
                     .params
                     .iter()
                     .map(|a| a.value_type);
-                self.typecheck_variable_args_iterator(inst, arg_types, errors)?;
+                self.typecheck_variable_args_iterator(inst, arg_types, args, errors)?;
             }
             CallInfo::NotACall => {}
         }
         Ok(())
     }
 
+    fn typecheck_block_call(
+        &self,
+        inst: Inst,
+        block: &ir::BlockCall,
+        errors: &mut VerifierErrors,
+    ) -> VerifierStepResult {
+        let pool = &self.func.dfg.value_lists;
+        let iter = self
+            .func
+            .dfg
+            .block_params(block.block(pool))
+            .iter()
+            .map(|&v| self.func.dfg.value_type(v));
+        let args = block.args_slice(pool);
+        self.typecheck_variable_args_iterator(inst, iter, args, errors)
+    }
+
     fn typecheck_variable_args_iterator<I: Iterator<Item = Type>>(
         &self,
         inst: Inst,
         iter: I,
+        variable_args: &[Value],
         errors: &mut VerifierErrors,
-    ) -> VerifierStepResult<()> {
-        let variable_args = self.func.dfg.inst_variable_args(inst);
+    ) -> VerifierStepResult {
         let mut i = 0;
 
         for expected_type in iter {
@@ -1420,29 +1368,91 @@ impl<'a> Verifier<'a> {
         Ok(())
     }
 
-    fn typecheck_return(&self, inst: Inst, errors: &mut VerifierErrors) -> VerifierStepResult<()> {
-        if self.func.dfg[inst].opcode().is_return() {
-            let args = self.func.dfg.inst_variable_args(inst);
-            let expected_types = &self.func.signature.returns;
-            if args.len() != expected_types.len() {
-                return errors.nonfatal((
+    fn typecheck_return(&self, inst: Inst, errors: &mut VerifierErrors) -> VerifierStepResult {
+        match self.func.dfg.insts[inst] {
+            ir::InstructionData::MultiAry {
+                opcode: Opcode::Return,
+                args,
+            } => {
+                let types = args
+                    .as_slice(&self.func.dfg.value_lists)
+                    .iter()
+                    .map(|v| self.func.dfg.value_type(*v));
+                self.typecheck_return_types(
+                    inst,
+                    types,
+                    errors,
+                    "arguments of return must match function signature",
+                )?;
+            }
+            ir::InstructionData::Call {
+                opcode: Opcode::ReturnCall,
+                func_ref,
+                ..
+            } => {
+                let sig_ref = self.func.dfg.ext_funcs[func_ref].signature;
+                self.typecheck_tail_call(inst, sig_ref, errors)?;
+            }
+            ir::InstructionData::CallIndirect {
+                opcode: Opcode::ReturnCallIndirect,
+                sig_ref,
+                ..
+            } => {
+                self.typecheck_tail_call(inst, sig_ref, errors)?;
+            }
+            inst => debug_assert!(!inst.opcode().is_return()),
+        }
+        Ok(())
+    }
+
+    fn typecheck_tail_call(
+        &self,
+        inst: Inst,
+        sig_ref: SigRef,
+        errors: &mut VerifierErrors,
+    ) -> VerifierStepResult {
+        let signature = &self.func.dfg.signatures[sig_ref];
+        let cc = signature.call_conv;
+        if !cc.supports_tail_calls() {
+            errors.report((
+                inst,
+                self.context(inst),
+                format!("calling convention `{cc}` does not support tail calls"),
+            ));
+        }
+        if cc != self.func.signature.call_conv {
+            errors.report((
+                inst,
+                self.context(inst),
+                "callee's calling convention must match caller",
+            ));
+        }
+        let types = signature.returns.iter().map(|param| param.value_type);
+        self.typecheck_return_types(inst, types, errors, "results of callee must match caller")?;
+        Ok(())
+    }
+
+    fn typecheck_return_types(
+        &self,
+        inst: Inst,
+        actual_types: impl ExactSizeIterator<Item = Type>,
+        errors: &mut VerifierErrors,
+        message: &str,
+    ) -> VerifierStepResult {
+        let expected_types = &self.func.signature.returns;
+        if actual_types.len() != expected_types.len() {
+            return errors.nonfatal((inst, self.context(inst), message));
+        }
+        for (i, (actual_type, &expected_type)) in actual_types.zip(expected_types).enumerate() {
+            if actual_type != expected_type.value_type {
+                errors.report((
                     inst,
                     self.context(inst),
-                    "arguments of return must match function signature",
+                    format!(
+                        "result {i} has type {actual_type}, must match function signature of \
+                         {expected_type}"
+                    ),
                 ));
-            }
-            for (i, (&arg, &expected_type)) in args.iter().zip(expected_types).enumerate() {
-                let arg_type = self.func.dfg.value_type(arg);
-                if arg_type != expected_type.value_type {
-                    errors.report((
-                        inst,
-                        self.context(inst),
-                        format!(
-                            "arg {} ({}) has type {}, must match function signature of {}",
-                            i, arg, arg_type, expected_type
-                        ),
-                    ));
-                }
             }
         }
         Ok(())
@@ -1450,91 +1460,8 @@ impl<'a> Verifier<'a> {
 
     // Check special-purpose type constraints that can't be expressed in the normal opcode
     // constraints.
-    fn typecheck_special(
-        &self,
-        inst: Inst,
-        ctrl_type: Type,
-        errors: &mut VerifierErrors,
-    ) -> VerifierStepResult<()> {
-        match self.func.dfg[inst] {
-            ir::InstructionData::Unary { opcode, arg } => {
-                let arg_type = self.func.dfg.value_type(arg);
-                match opcode {
-                    Opcode::Bextend | Opcode::Uextend | Opcode::Sextend | Opcode::Fpromote => {
-                        if arg_type.lane_count() != ctrl_type.lane_count() {
-                            return errors.nonfatal((
-                                inst,
-                                self.context(inst),
-                                format!(
-                                    "input {} and output {} must have same number of lanes",
-                                    arg_type, ctrl_type,
-                                ),
-                            ));
-                        }
-                        if arg_type.lane_bits() >= ctrl_type.lane_bits() {
-                            return errors.nonfatal((
-                                inst,
-                                self.context(inst),
-                                format!(
-                                    "input {} must be smaller than output {}",
-                                    arg_type, ctrl_type,
-                                ),
-                            ));
-                        }
-                    }
-                    Opcode::Breduce | Opcode::Ireduce | Opcode::Fdemote => {
-                        if arg_type.lane_count() != ctrl_type.lane_count() {
-                            return errors.nonfatal((
-                                inst,
-                                self.context(inst),
-                                format!(
-                                    "input {} and output {} must have same number of lanes",
-                                    arg_type, ctrl_type,
-                                ),
-                            ));
-                        }
-                        if arg_type.lane_bits() <= ctrl_type.lane_bits() {
-                            return errors.nonfatal((
-                                inst,
-                                self.context(inst),
-                                format!(
-                                    "input {} must be larger than output {}",
-                                    arg_type, ctrl_type,
-                                ),
-                            ));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            ir::InstructionData::HeapAddr { heap, arg, .. } => {
-                let index_type = self.func.dfg.value_type(arg);
-                let heap_index_type = self.func.heaps[heap].index_type;
-                if index_type != heap_index_type {
-                    return errors.nonfatal((
-                        inst,
-                        self.context(inst),
-                        format!(
-                            "index type {} differs from heap index type {}",
-                            index_type, heap_index_type,
-                        ),
-                    ));
-                }
-            }
-            ir::InstructionData::TableAddr { table, arg, .. } => {
-                let index_type = self.func.dfg.value_type(arg);
-                let table_index_type = self.func.tables[table].index_type;
-                if index_type != table_index_type {
-                    return errors.nonfatal((
-                        inst,
-                        self.context(inst),
-                        format!(
-                            "index type {} differs from table index type {}",
-                            index_type, table_index_type,
-                        ),
-                    ));
-                }
-            }
+    fn typecheck_special(&self, inst: Inst, errors: &mut VerifierErrors) -> VerifierStepResult {
+        match self.func.dfg.insts[inst] {
             ir::InstructionData::UnaryGlobalValue { global_value, .. } => {
                 if let Some(isa) = self.isa {
                     let inst_type = self.func.dfg.value_type(self.func.dfg.first_result(inst));
@@ -1543,8 +1470,7 @@ impl<'a> Verifier<'a> {
                         return errors.nonfatal((
                             inst, self.context(inst),
                             format!(
-                                "global_value instruction with type {} references global value with type {}",
-                                inst_type, global_type
+                                "global_value instruction with type {inst_type} references global value with type {global_type}"
                             )),
                         );
                     }
@@ -1555,41 +1481,11 @@ impl<'a> Verifier<'a> {
         Ok(())
     }
 
-    fn typecheck_copy_nop(
-        &self,
-        inst: Inst,
-        errors: &mut VerifierErrors,
-    ) -> VerifierStepResult<()> {
-        if let InstructionData::Unary {
-            opcode: Opcode::CopyNop,
-            arg,
-        } = self.func.dfg[inst]
-        {
-            let dst_vals = self.func.dfg.inst_results(inst);
-            if dst_vals.len() != 1 {
-                return errors.fatal((
-                    inst,
-                    self.context(inst),
-                    "copy_nop must produce exactly one result",
-                ));
-            }
-            let dst_val = dst_vals[0];
-            if self.func.dfg.value_type(dst_val) != self.func.dfg.value_type(arg) {
-                return errors.fatal((
-                    inst,
-                    self.context(inst),
-                    "copy_nop src and dst types must be the same",
-                ));
-            }
-        }
-        Ok(())
-    }
-
     fn cfg_integrity(
         &self,
         cfg: &ControlFlowGraph,
         errors: &mut VerifierErrors,
-    ) -> VerifierStepResult<()> {
+    ) -> VerifierStepResult {
         let mut expected_succs = BTreeSet::<Block>::new();
         let mut got_succs = BTreeSet::<Block>::new();
         let mut expected_preds = BTreeSet::<Inst>::new();
@@ -1604,7 +1500,7 @@ impl<'a> Verifier<'a> {
             if !missing_succs.is_empty() {
                 errors.report((
                     block,
-                    format!("cfg lacked the following successor(s) {:?}", missing_succs),
+                    format!("cfg lacked the following successor(s) {missing_succs:?}"),
                 ));
                 continue;
             }
@@ -1613,7 +1509,7 @@ impl<'a> Verifier<'a> {
             if !excess_succs.is_empty() {
                 errors.report((
                     block,
-                    format!("cfg had unexpected successor(s) {:?}", excess_succs),
+                    format!("cfg had unexpected successor(s) {excess_succs:?}"),
                 ));
                 continue;
             }
@@ -1632,10 +1528,7 @@ impl<'a> Verifier<'a> {
             if !missing_preds.is_empty() {
                 errors.report((
                     block,
-                    format!(
-                        "cfg lacked the following predecessor(s) {:?}",
-                        missing_preds
-                    ),
+                    format!("cfg lacked the following predecessor(s) {missing_preds:?}"),
                 ));
                 continue;
             }
@@ -1644,7 +1537,7 @@ impl<'a> Verifier<'a> {
             if !excess_preds.is_empty() {
                 errors.report((
                     block,
-                    format!("cfg had unexpected predecessor(s) {:?}", excess_preds),
+                    format!("cfg had unexpected predecessor(s) {excess_preds:?}"),
                 ));
                 continue;
             }
@@ -1657,16 +1550,11 @@ impl<'a> Verifier<'a> {
         errors.as_result()
     }
 
-    fn immediate_constraints(
-        &self,
-        inst: Inst,
-        errors: &mut VerifierErrors,
-    ) -> VerifierStepResult<()> {
-        let inst_data = &self.func.dfg[inst];
+    fn immediate_constraints(&self, inst: Inst, errors: &mut VerifierErrors) -> VerifierStepResult {
+        let inst_data = &self.func.dfg.insts[inst];
 
         match *inst_data {
-            ir::InstructionData::Store { flags, .. }
-            | ir::InstructionData::StoreComplex { flags, .. } => {
+            ir::InstructionData::Store { flags, .. } => {
                 if flags.readonly() {
                     errors.fatal((
                         inst,
@@ -1692,11 +1580,33 @@ impl<'a> Verifier<'a> {
                 // We must be specific about the opcodes above because other instructions are using
                 // the same formats.
                 let ty = self.func.dfg.value_type(arg);
-                if u16::from(lane) >= ty.lane_count() {
+                if lane as u32 >= ty.lane_count() {
                     errors.fatal((
                         inst,
                         self.context(inst),
-                        format!("The lane {} does not index into the type {}", lane, ty,),
+                        format!("The lane {lane} does not index into the type {ty}",),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            ir::InstructionData::Shuffle {
+                opcode: ir::instructions::Opcode::Shuffle,
+                imm,
+                ..
+            } => {
+                let imm = self.func.dfg.immediates.get(imm).unwrap().as_slice();
+                if imm.len() != 16 {
+                    errors.fatal((
+                        inst,
+                        self.context(inst),
+                        format!("the shuffle immediate wasn't 16-bytes long"),
+                    ))
+                } else if let Some(i) = imm.iter().find(|i| **i >= 32) {
+                    errors.fatal((
+                        inst,
+                        self.context(inst),
+                        format!("shuffle immediate index {i} is larger than the maximum 31"),
                     ))
                 } else {
                     Ok(())
@@ -1706,64 +1616,91 @@ impl<'a> Verifier<'a> {
         }
     }
 
-    fn verify_safepoint_unused(
-        &self,
-        inst: Inst,
-        errors: &mut VerifierErrors,
-    ) -> VerifierStepResult<()> {
-        if let Some(isa) = self.isa {
-            if !isa.flags().enable_safepoints() && self.func.dfg[inst].opcode() == Opcode::Safepoint
-            {
-                return errors.fatal((
+    fn iconst_bounds(&self, inst: Inst, errors: &mut VerifierErrors) -> VerifierStepResult {
+        use crate::ir::instructions::InstructionData::UnaryImm;
+
+        let inst_data = &self.func.dfg.insts[inst];
+        if let UnaryImm {
+            opcode: Opcode::Iconst,
+            imm,
+        } = inst_data
+        {
+            let ctrl_typevar = self.func.dfg.ctrl_typevar(inst);
+            let bounds_mask = match ctrl_typevar {
+                types::I8 => u8::MAX.into(),
+                types::I16 => u16::MAX.into(),
+                types::I32 => u32::MAX.into(),
+                types::I64 => u64::MAX,
+                _ => unreachable!(),
+            };
+
+            let value = imm.bits() as u64;
+            if value & bounds_mask != value {
+                errors.fatal((
                     inst,
                     self.context(inst),
-                    "safepoint instruction cannot be used when it is not enabled.",
-                ));
+                    "constant immediate is out of bounds",
+                ))
+            } else {
+                Ok(())
             }
+        } else {
+            Ok(())
         }
-        Ok(())
     }
 
-    fn typecheck_function_signature(&self, errors: &mut VerifierErrors) -> VerifierStepResult<()> {
-        self.func
+    fn typecheck_function_signature(&self, errors: &mut VerifierErrors) -> VerifierStepResult {
+        let params = self
+            .func
             .signature
             .params
             .iter()
             .enumerate()
-            .filter(|(_, &param)| param.value_type == types::INVALID)
-            .for_each(|(i, _)| {
+            .map(|p| (true, p));
+        let returns = self
+            .func
+            .signature
+            .returns
+            .iter()
+            .enumerate()
+            .map(|p| (false, p));
+
+        for (is_argument, (i, param)) in params.chain(returns) {
+            let is_return = !is_argument;
+            let item = if is_argument {
+                "Parameter"
+            } else {
+                "Return value"
+            };
+
+            if param.value_type == types::INVALID {
                 errors.report((
                     AnyEntity::Function,
-                    format!("Parameter at position {} has an invalid type", i),
+                    format!("{item} at position {i} has an invalid type"),
                 ));
-            });
+            }
 
-        self.func
-            .signature
-            .returns
-            .iter()
-            .enumerate()
-            .filter(|(_, &ret)| ret.value_type == types::INVALID)
-            .for_each(|(i, _)| {
-                errors.report((
-                    AnyEntity::Function,
-                    format!("Return value at position {} has an invalid type", i),
-                ))
-            });
-
-        self.func
-            .signature
-            .returns
-            .iter()
-            .enumerate()
-            .for_each(|(i, ret)| {
-                if let ArgumentPurpose::StructArgument(_) = ret.purpose {
+            if let ArgumentPurpose::StructArgument(_) = param.purpose {
+                if is_return {
                     errors.report((
                         AnyEntity::Function,
-                        format!("Return value at position {} can't be an struct argument", i),
+                        format!("{item} at position {i} can't be an struct argument"),
                     ))
                 }
-            });
+            }
+
+            let ty_allows_extension = param.value_type.is_int();
+            let has_extension = param.extension != ArgumentExtension::None;
+            if !ty_allows_extension && has_extension {
+                errors.report((
+                    AnyEntity::Function,
+                    format!(
+                        "{} at position {} has invalid extension {:?}",
+                        item, i, param.extension
+                    ),
+                ));
+            }
+        }
 
         if errors.has_error() {
             Err(())
@@ -1772,30 +1709,27 @@ impl<'a> Verifier<'a> {
         }
     }
 
-    pub fn run(&self, errors: &mut VerifierErrors) -> VerifierStepResult<()> {
+    pub fn run(&self, errors: &mut VerifierErrors) -> VerifierStepResult {
         self.verify_global_values(errors)?;
-        self.verify_heaps(errors)?;
-        self.verify_tables(errors)?;
-        self.verify_jump_tables(errors)?;
+        self.verify_memory_types(errors)?;
         self.typecheck_entry_block_params(errors)?;
+        self.check_entry_not_cold(errors)?;
         self.typecheck_function_signature(errors)?;
 
         for block in self.func.layout.blocks() {
             if self.func.layout.first_inst(block).is_none() {
-                return errors.fatal((block, format!("{} cannot be empty", block)));
+                return errors.fatal((block, format!("{block} cannot be empty")));
             }
             for inst in self.func.layout.block_insts(block) {
                 self.block_integrity(block, inst, errors)?;
                 self.instruction_integrity(inst, errors)?;
-                self.verify_safepoint_unused(inst, errors)?;
                 self.typecheck(inst, errors)?;
                 self.immediate_constraints(inst, errors)?;
+                self.iconst_bounds(inst, errors)?;
             }
 
             self.encodable_as_bb(block, errors)?;
         }
-
-        verify_flags(self.func, &self.expected_cfg, errors)?;
 
         if !errors.is_empty() {
             log::warn!(
@@ -1811,9 +1745,8 @@ impl<'a> Verifier<'a> {
 #[cfg(test)]
 mod tests {
     use super::{Verifier, VerifierError, VerifierErrors};
-    use crate::entity::EntityList;
     use crate::ir::instructions::{InstructionData, Opcode};
-    use crate::ir::{types, AbiParam, Function};
+    use crate::ir::{types, AbiParam, Function, Type};
     use crate::settings;
 
     macro_rules! assert_err_with_msg {
@@ -1853,11 +1786,11 @@ mod tests {
             imm: 0.into(),
         });
         func.layout.append_inst(nullary_with_bad_opcode, block0);
-        func.layout.append_inst(
-            func.dfg.make_inst(InstructionData::Jump {
+        let destination = func.dfg.block_call(block0, &[]);
+        func.stencil.layout.append_inst(
+            func.stencil.dfg.make_inst(InstructionData::Jump {
                 opcode: Opcode::Jump,
-                destination: block0,
-                args: EntityList::default(),
+                destination,
             }),
             block0,
         );
@@ -1868,6 +1801,74 @@ mod tests {
         let _ = verifier.run(&mut errors);
 
         assert_err_with_msg!(errors, "instruction format");
+    }
+
+    fn test_iconst_bounds(immediate: i64, ctrl_typevar: Type) -> VerifierErrors {
+        let mut func = Function::new();
+        let block0 = func.dfg.make_block();
+        func.layout.append_block(block0);
+
+        let test_inst = func.dfg.make_inst(InstructionData::UnaryImm {
+            opcode: Opcode::Iconst,
+            imm: immediate.into(),
+        });
+
+        let end_inst = func.dfg.make_inst(InstructionData::MultiAry {
+            opcode: Opcode::Return,
+            args: Default::default(),
+        });
+
+        func.dfg.make_inst_results(test_inst, ctrl_typevar);
+        func.layout.append_inst(test_inst, block0);
+        func.layout.append_inst(end_inst, block0);
+
+        let flags = &settings::Flags::new(settings::builder());
+        let verifier = Verifier::new(&func, flags.into());
+        let mut errors = VerifierErrors::default();
+
+        let _ = verifier.run(&mut errors);
+        errors
+    }
+
+    fn test_iconst_bounds_err(immediate: i64, ctrl_typevar: Type) {
+        assert_err_with_msg!(
+            test_iconst_bounds(immediate, ctrl_typevar),
+            "constant immediate is out of bounds"
+        );
+    }
+
+    fn test_iconst_bounds_ok(immediate: i64, ctrl_typevar: Type) {
+        assert!(test_iconst_bounds(immediate, ctrl_typevar).is_empty());
+    }
+
+    #[test]
+    fn negative_iconst_8() {
+        test_iconst_bounds_err(-10, types::I8);
+    }
+
+    #[test]
+    fn negative_iconst_32() {
+        test_iconst_bounds_err(-1, types::I32);
+    }
+
+    #[test]
+    fn large_iconst_8() {
+        test_iconst_bounds_err(1 + u8::MAX as i64, types::I8);
+    }
+
+    #[test]
+    fn large_iconst_16() {
+        test_iconst_bounds_err(10 + u16::MAX as i64, types::I16);
+    }
+
+    #[test]
+    fn valid_iconst_8() {
+        test_iconst_bounds_ok(10, types::I8);
+    }
+
+    #[test]
+    fn valid_iconst_32() {
+        test_iconst_bounds_ok(u32::MAX as i64, types::I32);
     }
 
     #[test]
@@ -1903,13 +1904,11 @@ mod tests {
         let block0 = func.dfg.make_block();
         func.layout.append_block(block0);
 
-        // Build instruction: v0, v1 = iconst 42
-        let inst = func.dfg.make_inst(InstructionData::UnaryImm {
-            opcode: Opcode::Iconst,
-            imm: 42.into(),
+        // Build instruction "f64const 0.0" (missing one required result)
+        let inst = func.dfg.make_inst(InstructionData::UnaryIeee64 {
+            opcode: Opcode::F64const,
+            imm: 0.0.into(),
         });
-        func.dfg.append_result(inst, types::I32);
-        func.dfg.append_result(inst, types::I32);
         func.layout.append_inst(inst, block0);
 
         // Setup verifier.
@@ -1918,11 +1917,11 @@ mod tests {
         let verifier = Verifier::new(&func, flags.into());
 
         // Now the error message, when printed, should contain the instruction sequence causing the
-        // error (i.e. v0, v1 = iconst.i32 42) and not only its entity value (i.e. inst0)
+        // error (i.e. f64const 0.0) and not only its entity value (i.e. inst0)
         let _ = verifier.typecheck_results(inst, types::I32, &mut errors);
         assert_eq!(
             format!("{}", errors.0[0]),
-            "inst0 (v0, v1 = iconst.i32 42): has more result values than expected"
+            "inst0 (f64const 0.0): has fewer result values than expected"
         )
     }
 

@@ -15,51 +15,6 @@ extern "C" {
 #endif
 
 /**
- * \brief An opaque object representing the type of a module.
- */
-typedef struct wasmtime_moduletype wasmtime_moduletype_t;
-
-/**
- * \brief Deletes a module type.
- */
-WASM_API_EXTERN void wasmtime_moduletype_delete(wasmtime_moduletype_t *ty);
-
-/**
- * \brief Returns the list of imports that this module type requires.
- *
- * This function does not take ownership of the provided module type but
- * ownership of `out` is passed to the caller. Note that `out` is treated as
- * uninitialized when passed to this function.
- */
-WASM_API_EXTERN void wasmtime_moduletype_imports(const wasmtime_moduletype_t*, wasm_importtype_vec_t* out);
-
-/**
- * \brief Returns the list of exports that this module type provides.
- *
- * This function does not take ownership of the provided module type but
- * ownership of `out` is passed to the caller. Note that `out` is treated as
- * uninitialized when passed to this function.
- */
-WASM_API_EXTERN void wasmtime_moduletype_exports(const wasmtime_moduletype_t*, wasm_exporttype_vec_t* out);
-
-/**
- * \brief Converts a #wasmtime_moduletype_t to a #wasm_externtype_t
- *
- * The returned value is owned by the #wasmtime_moduletype_t argument and should not
- * be deleted.
- */
-WASM_API_EXTERN wasm_externtype_t* wasmtime_moduletype_as_externtype(wasmtime_moduletype_t*);
-
-/**
- * \brief Attempts to convert a #wasm_externtype_t to a #wasmtime_moduletype_t
- *
- * The returned value is owned by the #wasmtime_moduletype_t argument and
- * should not be deleted. Returns `NULL` if the provided argument is not a
- * #wasmtime_moduletype_t.
- */
-WASM_API_EXTERN wasmtime_moduletype_t* wasmtime_externtype_as_moduletype(wasm_externtype_t*);
-
-/**
  * \typedef wasmtime_module_t
  * \brief Convenience alias for #wasmtime_module
  *
@@ -71,6 +26,8 @@ WASM_API_EXTERN wasmtime_moduletype_t* wasmtime_externtype_as_moduletype(wasm_ex
  * to use a module across multiple threads simultaneously.
  */
 typedef struct wasmtime_module wasmtime_module_t;
+
+#ifdef WASMTIME_FEATURE_COMPILER
 
 /**
  * \brief Compiles a WebAssembly binary into a #wasmtime_module_t
@@ -86,12 +43,12 @@ typedef struct wasmtime_module wasmtime_module_t;
  * This function does not take ownership of any of its arguments, but the
  * returned error and module are owned by the caller.
  */
-WASM_API_EXTERN wasmtime_error_t *wasmtime_module_new(
-    wasm_engine_t *engine,
-    const uint8_t *wasm,
-    size_t wasm_len,
-    wasmtime_module_t **ret
-);
+WASM_API_EXTERN wasmtime_error_t *wasmtime_module_new(wasm_engine_t *engine,
+                                                      const uint8_t *wasm,
+                                                      size_t wasm_len,
+                                                      wasmtime_module_t **ret);
+
+#endif // WASMTIME_FEATURE_COMPILER
 
 /**
  * \brief Deletes a module.
@@ -105,6 +62,20 @@ WASM_API_EXTERN void wasmtime_module_delete(wasmtime_module_t *m);
 WASM_API_EXTERN wasmtime_module_t *wasmtime_module_clone(wasmtime_module_t *m);
 
 /**
+ * \brief Same as #wasm_module_imports, but for #wasmtime_module_t.
+ */
+WASM_API_EXTERN void wasmtime_module_imports(const wasmtime_module_t *module,
+                                             wasm_importtype_vec_t *out);
+
+/**
+ * \brief Same as #wasm_module_exports, but for #wasmtime_module_t.
+ */
+WASM_API_EXTERN void wasmtime_module_exports(const wasmtime_module_t *module,
+                                             wasm_exporttype_vec_t *out);
+
+#ifdef WASMTIME_FEATURE_COMPILER
+
+/**
  * \brief Validate a WebAssembly binary.
  *
  * This function will validate the provided byte sequence to determine if it is
@@ -116,26 +87,16 @@ WASM_API_EXTERN wasmtime_module_t *wasmtime_module_clone(wasmtime_module_t *m);
  * If the binary validates then `NULL` is returned, otherwise the error returned
  * describes why the binary did not validate.
  */
-WASM_API_EXTERN wasmtime_error_t *wasmtime_module_validate(
-    wasm_engine_t *engine,
-    const uint8_t *wasm,
-    size_t wasm_len
-);
-
-/**
- * \brief Returns the type of this module.
- *
- * The returned #wasmtime_moduletype_t is expected to be deallocated by the
- * caller.
- */
-WASM_API_EXTERN wasmtime_moduletype_t* wasmtime_module_type(const wasmtime_module_t*);
+WASM_API_EXTERN wasmtime_error_t *
+wasmtime_module_validate(wasm_engine_t *engine, const uint8_t *wasm,
+                         size_t wasm_len);
 
 /**
  * \brief This function serializes compiled module artifacts as blob data.
  *
  * \param module the module
- * \param ret if the conversion is successful, this byte vector is filled in with
- *   the serialized compiled module.
+ * \param ret if the conversion is successful, this byte vector is filled in
+ * with the serialized compiled module.
  *
  * \return a non-null error if parsing fails, or returns `NULL`. If parsing
  * fails then `ret` isn't touched.
@@ -143,10 +104,10 @@ WASM_API_EXTERN wasmtime_moduletype_t* wasmtime_module_type(const wasmtime_modul
  * This function does not take ownership of `module`, and the caller is
  * expected to deallocate the returned #wasmtime_error_t and #wasm_byte_vec_t.
  */
-WASM_API_EXTERN wasmtime_error_t* wasmtime_module_serialize(
-    wasmtime_module_t* module,
-    wasm_byte_vec_t *ret
-);
+WASM_API_EXTERN wasmtime_error_t *
+wasmtime_module_serialize(wasmtime_module_t *module, wasm_byte_vec_t *ret);
+
+#endif // WASMTIME_FEATURE_COMPILER
 
 /**
  * \brief Build a module from serialized data.
@@ -156,14 +117,11 @@ WASM_API_EXTERN wasmtime_error_t* wasmtime_module_serialize(
  *
  * This function is not safe to receive arbitrary user input. See the Rust
  * documentation for more information on what inputs are safe to pass in here
- * (e.g. only that of #wasmtime_module_serialize)
+ * (e.g. only that of `wasmtime_module_serialize`)
  */
-WASM_API_EXTERN wasmtime_error_t *wasmtime_module_deserialize(
-    wasm_engine_t *engine,
-    const uint8_t *bytes,
-    size_t bytes_len,
-    wasmtime_module_t **ret
-);
+WASM_API_EXTERN wasmtime_error_t *
+wasmtime_module_deserialize(wasm_engine_t *engine, const uint8_t *bytes,
+                            size_t bytes_len, wasmtime_module_t **ret);
 
 /**
  * \brief Deserialize a module from an on-disk file.
@@ -177,16 +135,29 @@ WASM_API_EXTERN wasmtime_error_t *wasmtime_module_deserialize(
  *
  * This function is not safe to receive arbitrary user input. See the Rust
  * documentation for more information on what inputs are safe to pass in here
- * (e.g. only that of #wasmtime_module_serialize)
+ * (e.g. only that of `wasmtime_module_serialize`)
  */
-WASM_API_EXTERN wasmtime_error_t *wasmtime_module_deserialize_file(
-    wasm_engine_t *engine,
-    const char *path,
-    wasmtime_module_t **ret
-);
+WASM_API_EXTERN wasmtime_error_t *
+wasmtime_module_deserialize_file(wasm_engine_t *engine, const char *path,
+                                 wasmtime_module_t **ret);
+
+/**
+ * \brief Returns the range of bytes in memory where this module’s compilation
+ * image resides.
+ *
+ * The compilation image for a module contains executable code, data, debug
+ * information, etc. This is roughly the same as the wasmtime_module_serialize
+ * but not the exact same.
+ *
+ * For more details see:
+ * https://docs.wasmtime.dev/api/wasmtime/struct.Module.html#method.image_range
+ */
+WASM_API_EXTERN void
+wasmtime_module_image_range(const wasmtime_module_t *module, void **start,
+                            void **end);
 
 #ifdef __cplusplus
-}  // extern "C"
+} // extern "C"
 #endif
 
 #endif // WASMTIME_MODULE_H

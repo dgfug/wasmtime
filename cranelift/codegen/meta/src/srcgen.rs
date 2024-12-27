@@ -9,7 +9,6 @@ use std::cmp;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
-use std::path;
 
 use crate::error;
 
@@ -91,15 +90,11 @@ impl Formatter {
     /// Write `self.lines` to a file.
     pub fn update_file(
         &self,
-        filename: impl AsRef<str>,
-        directory: &str,
+        filename: impl AsRef<std::path::Path>,
+        directory: &std::path::Path,
     ) -> Result<(), error::Error> {
-        #[cfg(target_family = "windows")]
-        let path_str = format!("{}\\{}", directory, filename.as_ref());
-        #[cfg(not(target_family = "windows"))]
-        let path_str = format!("{}/{}", directory, filename.as_ref());
-
-        let path = path::Path::new(&path_str);
+        let path = directory.join(&filename);
+        eprintln!("Writing generated file: {}", path.display());
         let mut f = fs::File::create(path)?;
 
         for l in self.lines.iter().map(|l| l.as_bytes()) {
@@ -127,7 +122,7 @@ impl Formatter {
                 if l.is_empty() {
                     "///".into()
                 } else {
-                    format!("/// {}", l)
+                    format!("/// {l}")
                 }
             })
             .for_each(|s| self.line(s.as_str()));
@@ -188,7 +183,7 @@ fn _indent(s: &str) -> Option<usize> {
 fn parse_multiline(s: &str) -> Vec<String> {
     // Convert tabs into spaces.
     let expanded_tab = format!("{:-1$}", " ", SHIFTWIDTH);
-    let lines: Vec<String> = s.lines().map(|l| l.replace("\t", &expanded_tab)).collect();
+    let lines: Vec<String> = s.lines().map(|l| l.replace('\t', &expanded_tab)).collect();
 
     // Determine minimum indentation, ignoring the first line and empty lines.
     let indent = lines
@@ -313,7 +308,7 @@ mod srcgen_tests {
             .trim()
             .split("\n")
             .into_iter()
-            .map(|x| format!("{}\n", x))
+            .map(|x| format!("{x}\n"))
             .collect()
     }
 

@@ -8,7 +8,8 @@
 //! 32-bits, and right now object files aren't supported larger than 4gb anyway
 //! so we would need a lot of other support necessary to exercise that.
 
-use anyhow::Result;
+#![cfg(not(miri))]
+
 use wasmtime::*;
 
 const MB: usize = 1 << 20;
@@ -21,7 +22,7 @@ fn store_with_padding(padding: usize) -> Result<Store<()>> {
         config.cranelift_flag_set(
             "wasmtime_linkopt_padding_between_functions",
             &padding.to_string(),
-        )?;
+        );
     }
     let engine = Engine::new(&config)?;
     Ok(Store::new(&engine, ()))
@@ -43,7 +44,7 @@ fn forward_call_works() -> Result<()> {
     )?;
 
     let i = Instance::new(&mut store, &module, &[])?;
-    let foo = i.get_typed_func::<(), i32, _>(&mut store, "foo")?;
+    let foo = i.get_typed_func::<(), i32>(&mut store, "foo")?;
     assert_eq!(foo.call(&mut store, ())?, 4);
     Ok(())
 }
@@ -64,7 +65,7 @@ fn backwards_call_works() -> Result<()> {
     )?;
 
     let i = Instance::new(&mut store, &module, &[])?;
-    let foo = i.get_typed_func::<(), i32, _>(&mut store, "foo")?;
+    let foo = i.get_typed_func::<(), i32>(&mut store, "foo")?;
     assert_eq!(foo.call(&mut store, ())?, 4);
     Ok(())
 }
@@ -78,7 +79,7 @@ fn mixed() -> Result<()> {
 fn mixed_forced() -> Result<()> {
     let mut config = Config::new();
     unsafe {
-        config.cranelift_flag_set("wasmtime_linkopt_force_jump_veneer", "true")?;
+        config.cranelift_flag_set("wasmtime_linkopt_force_jump_veneer", "true");
     }
     let engine = Engine::new(&config)?;
     test_many_call_module(Store::new(&engine, ()))
@@ -91,12 +92,12 @@ fn test_many_call_module(mut store: Store<()>) -> Result<()> {
     wat.push_str("(module\n");
     wat.push_str("(func $first (result i32) (i32.const 1))\n");
     for i in 0..N {
-        wat.push_str(&format!("(func (export \"{}\") (result i32 i32)\n", i));
+        wat.push_str(&format!("(func (export \"{i}\") (result i32 i32)\n"));
         wat.push_str("call $first\n");
-        wat.push_str(&format!("i32.const {}\n", i));
+        wat.push_str(&format!("i32.const {i}\n"));
         wat.push_str("i32.add\n");
         wat.push_str("call $last\n");
-        wat.push_str(&format!("i32.const {}\n", i));
+        wat.push_str(&format!("i32.const {i}\n"));
         wat.push_str("i32.add)\n");
     }
     wat.push_str("(func $last (result i32) (i32.const 2))\n");
@@ -108,7 +109,7 @@ fn test_many_call_module(mut store: Store<()>) -> Result<()> {
 
     for i in 0..N {
         let name = i.to_string();
-        let func = instance.get_typed_func::<(), (i32, i32), _>(&mut store, &name)?;
+        let func = instance.get_typed_func::<(), (i32, i32)>(&mut store, &name)?;
         let (a, b) = func.call(&mut store, ())?;
         assert_eq!(a, i + 1);
         assert_eq!(b, i + 2);

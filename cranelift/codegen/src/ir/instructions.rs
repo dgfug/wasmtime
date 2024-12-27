@@ -6,24 +6,22 @@
 //! A large part of this module is auto-generated from the instruction descriptions in the meta
 //! directory.
 
+use crate::constant_hash::Table;
 use alloc::vec::Vec;
-use core::convert::{TryFrom, TryInto};
 use core::fmt::{self, Display, Formatter};
-use core::num::NonZeroU32;
 use core::ops::{Deref, DerefMut};
 use core::str::FromStr;
 
 #[cfg(feature = "enable-serde")]
-use serde::{Deserialize, Serialize};
+use serde_derive::{Deserialize, Serialize};
 
-use crate::bitset::BitSet;
-use crate::data_value::DataValue;
+use crate::bitset::ScalarBitSet;
 use crate::entity;
 use crate::ir::{
     self,
     condcodes::{FloatCC, IntCC},
     trapcode::TrapCode,
-    types, Block, FuncRef, JumpTable, MemFlags, SigRef, StackSlot, Type, Value,
+    types, Block, FuncRef, MemFlags, SigRef, StackSlot, Type, Value,
 };
 
 /// Some instructions use an external list of argument values because there is not enough space in
@@ -33,6 +31,133 @@ pub type ValueList = entity::EntityList<Value>;
 
 /// Memory pool for holding value lists. See `ValueList`.
 pub type ValueListPool = entity::ListPool<Value>;
+
+/// A pair of a Block and its arguments, stored in a single EntityList internally.
+///
+/// NOTE: We don't expose either value_to_block or block_to_value outside of this module because
+/// this operation is not generally safe. However, as the two share the same underlying layout,
+/// they can be stored in the same value pool.
+///
+/// BlockCall makes use of this shared layout by storing all of its contents (a block and its
+/// argument) in a single EntityList. This is a bit better than introducing a new entity type for
+/// the pair of a block name and the arguments entity list, as we don't pay any indirection penalty
+/// to get to the argument values -- they're stored in-line with the block in the same list.
+///
+/// The BlockCall::new function guarantees this layout by requiring a block argument that's written
+/// in as the first element of the EntityList. Any subsequent entries are always assumed to be real
+/// Values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+pub struct BlockCall {
+    /// The underlying storage for the BlockCall. The first element of the values EntityList is
+    /// guaranteed to always be a Block encoded as a Value via BlockCall::block_to_value.
+    /// Consequently, the values entity list is never empty.
+    values: entity::EntityList<Value>,
+}
+
+impl BlockCall {
+    // NOTE: the only uses of this function should be internal to BlockCall. See the block comment
+    // on BlockCall for more context.
+    fn value_to_block(val: Value) -> Block {
+        Block::from_u32(val.as_u32())
+    }
+
+    // NOTE: the only uses of this function should be internal to BlockCall. See the block comment
+    // on BlockCall for more context.
+    fn block_to_value(block: Block) -> Value {
+        Value::from_u32(block.as_u32())
+    }
+
+    /// Construct a BlockCall with the given block and arguments.
+    pub fn new(block: Block, args: &[Value], pool: &mut ValueListPool) -> Self {
+        let mut values = ValueList::default();
+        values.push(Self::block_to_value(block), pool);
+        values.extend(args.iter().copied(), pool);
+        Self { values }
+    }
+
+    /// Return the block for this BlockCall.
+    pub fn block(&self, pool: &ValueListPool) -> Block {
+        let val = self.values.first(pool).unwrap();
+        Self::value_to_block(val)
+    }
+
+    /// Replace the block for this BlockCall.
+    pub fn set_block(&mut self, block: Block, pool: &mut ValueListPool) {
+        *self.values.get_mut(0, pool).unwrap() = Self::block_to_value(block);
+    }
+
+    /// Append an argument to the block args.
+    pub fn append_argument(&mut self, arg: Value, pool: &mut ValueListPool) {
+        self.values.push(arg, pool);
+    }
+
+    /// Return a slice for the arguments of this block.
+    pub fn args_slice<'a>(&self, pool: &'a ValueListPool) -> &'a [Value] {
+        &self.values.as_slice(pool)[1..]
+    }
+
+    /// Return a slice for the arguments of this block.
+    pub fn args_slice_mut<'a>(&'a mut self, pool: &'a mut ValueListPool) -> &'a mut [Value] {
+        &mut self.values.as_mut_slice(pool)[1..]
+    }
+
+    /// Remove the argument at ix from the argument list.
+    pub fn remove(&mut self, ix: usize, pool: &mut ValueListPool) {
+        self.values.remove(1 + ix, pool)
+    }
+
+    /// Clear out the arguments list.
+    pub fn clear(&mut self, pool: &mut ValueListPool) {
+        self.values.truncate(1, pool)
+    }
+
+    /// Appends multiple elements to the arguments.
+    pub fn extend<I>(&mut self, elements: I, pool: &mut ValueListPool)
+    where
+        I: IntoIterator<Item = Value>,
+    {
+        self.values.extend(elements, pool)
+    }
+
+    /// Return a value that can display this block call.
+    pub fn display<'a>(&self, pool: &'a ValueListPool) -> DisplayBlockCall<'a> {
+        DisplayBlockCall { block: *self, pool }
+    }
+
+    /// Deep-clone the underlying list in the same pool. The returned
+    /// list will have identical contents but changes to this list
+    /// will not change its contents or vice-versa.
+    pub fn deep_clone(&self, pool: &mut ValueListPool) -> Self {
+        Self {
+            values: self.values.deep_clone(pool),
+        }
+    }
+}
+
+/// Wrapper for the context needed to display a [BlockCall] value.
+pub struct DisplayBlockCall<'a> {
+    block: BlockCall,
+    pool: &'a ValueListPool,
+}
+
+impl<'a> Display for DisplayBlockCall<'a> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.block.block(&self.pool))?;
+        let args = self.block.args_slice(&self.pool);
+        if !args.is_empty() {
+            write!(f, "(")?;
+            for (ix, arg) in args.iter().enumerate() {
+                if ix > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{arg}")?;
+            }
+            write!(f, ")")?;
+        }
+        Ok(())
+    }
+}
 
 // Include code generated by `cranelift-codegen/meta/src/gen_inst.rs`. This file contains:
 //
@@ -69,30 +194,12 @@ impl Opcode {
         OPCODE_CONSTRAINTS[self as usize - 1]
     }
 
-    /// Returns true if the instruction is a resumable trap.
-    pub fn is_resumable_trap(&self) -> bool {
-        match self {
-            Opcode::ResumableTrap | Opcode::ResumableTrapnz => true,
-            _ => false,
-        }
-    }
-}
-
-impl TryFrom<NonZeroU32> for Opcode {
-    type Error = ();
-
+    /// Is this instruction a GC safepoint?
+    ///
+    /// Safepoints are all kinds of calls, except for tail calls.
     #[inline]
-    fn try_from(x: NonZeroU32) -> Result<Self, ()> {
-        let x: u16 = x.get().try_into().map_err(|_| ())?;
-        Self::try_from(x)
-    }
-}
-
-impl From<Opcode> for NonZeroU32 {
-    #[inline]
-    fn from(op: Opcode) -> NonZeroU32 {
-        let x = op as u8;
-        NonZeroU32::new(x as u32).unwrap()
+    pub fn is_safepoint(self) -> bool {
+        self.is_call() && !self.is_return()
     }
 }
 
@@ -105,17 +212,7 @@ impl FromStr for Opcode {
 
     /// Parse an Opcode name from a string.
     fn from_str(s: &str) -> Result<Self, &'static str> {
-        use crate::constant_hash::{probe, simple_hash, Table};
-
-        impl<'a> Table<&'a str> for [Option<Opcode>] {
-            fn len(&self) -> usize {
-                self.len()
-            }
-
-            fn key(&self, idx: usize) -> Option<&'a str> {
-                self[idx].map(opcode_name)
-            }
-        }
+        use crate::constant_hash::{probe, simple_hash};
 
         match probe::<&str, [Option<Self>]>(&OPCODE_HASH_TABLE, s, simple_hash(s)) {
             Err(_) => Err("Unknown opcode"),
@@ -123,6 +220,16 @@ impl FromStr for Opcode {
             // at this index is not None.
             Ok(i) => Ok(OPCODE_HASH_TABLE[i].unwrap()),
         }
+    }
+}
+
+impl<'a> Table<&'a str> for [Option<Opcode>] {
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn key(&self, idx: usize) -> Option<&'a str> {
+        self[idx].map(opcode_name)
     }
 }
 
@@ -175,9 +282,9 @@ impl Display for VariableArgs {
     fn fmt(&self, fmt: &mut Formatter) -> fmt::Result {
         for (i, val) in self.0.iter().enumerate() {
             if i == 0 {
-                write!(fmt, "{}", val)?;
+                write!(fmt, "{val}")?;
             } else {
-                write!(fmt, ", {}", val)?;
+                write!(fmt, ", {val}")?;
             }
         }
         Ok(())
@@ -195,134 +302,62 @@ impl Default for VariableArgs {
 /// Avoid large matches on instruction formats by using the methods defined here to examine
 /// instructions.
 impl InstructionData {
-    /// Return information about the destination of a branch or jump instruction.
+    /// Get the destinations of this instruction, if it's a branch.
     ///
-    /// Any instruction that can transfer control to another block reveals its possible destinations
-    /// here.
-    pub fn analyze_branch<'a>(&'a self, pool: &'a ValueListPool) -> BranchInfo<'a> {
-        match *self {
-            Self::Jump {
-                destination,
-                ref args,
-                ..
-            } => BranchInfo::SingleDest(destination, args.as_slice(pool)),
-            Self::BranchInt {
-                destination,
-                ref args,
-                ..
-            }
-            | Self::BranchFloat {
-                destination,
-                ref args,
-                ..
-            }
-            | Self::Branch {
-                destination,
-                ref args,
-                ..
-            } => BranchInfo::SingleDest(destination, &args.as_slice(pool)[1..]),
-            Self::BranchIcmp {
-                destination,
-                ref args,
-                ..
-            } => BranchInfo::SingleDest(destination, &args.as_slice(pool)[2..]),
-            Self::BranchTable {
-                table, destination, ..
-            } => BranchInfo::Table(table, Some(destination)),
-            Self::IndirectJump { table, .. } => BranchInfo::Table(table, None),
-            _ => {
-                debug_assert!(!self.opcode().is_branch());
-                BranchInfo::NotABranch
-            }
-        }
-    }
-
-    /// Get the single destination of this branch instruction, if it is a single destination
-    /// branch or jump.
-    ///
-    /// Multi-destination branches like `br_table` return `None`.
-    pub fn branch_destination(&self) -> Option<Block> {
-        match *self {
-            Self::Jump { destination, .. }
-            | Self::Branch { destination, .. }
-            | Self::BranchInt { destination, .. }
-            | Self::BranchFloat { destination, .. }
-            | Self::BranchIcmp { destination, .. } => Some(destination),
-            Self::BranchTable { .. } | Self::IndirectJump { .. } => None,
-            _ => {
-                debug_assert!(!self.opcode().is_branch());
-                None
-            }
-        }
-    }
-
-    /// Get a mutable reference to the single destination of this branch instruction, if it is a
-    /// single destination branch or jump.
-    ///
-    /// Multi-destination branches like `br_table` return `None`.
-    pub fn branch_destination_mut(&mut self) -> Option<&mut Block> {
-        match *self {
-            Self::Jump {
-                ref mut destination,
-                ..
-            }
-            | Self::Branch {
-                ref mut destination,
-                ..
-            }
-            | Self::BranchInt {
-                ref mut destination,
-                ..
-            }
-            | Self::BranchFloat {
-                ref mut destination,
-                ..
-            }
-            | Self::BranchIcmp {
-                ref mut destination,
-                ..
-            } => Some(destination),
-            Self::BranchTable { .. } | Self::IndirectJump { .. } => None,
-            _ => {
-                debug_assert!(!self.opcode().is_branch());
-                None
-            }
-        }
-    }
-
-    /// Return the value of an immediate if the instruction has one or `None` otherwise. Only
-    /// immediate values are considered, not global values, constant handles, condition codes, etc.
-    pub fn imm_value(&self) -> Option<DataValue> {
+    /// `br_table` returns the empty slice.
+    pub fn branch_destination<'a>(&'a self, jump_tables: &'a ir::JumpTables) -> &'a [BlockCall] {
         match self {
-            &InstructionData::UnaryBool { imm, .. } => Some(DataValue::from(imm)),
-            // 8-bit.
-            &InstructionData::BinaryImm8 { imm, .. }
-            | &InstructionData::TernaryImm8 { imm, .. }
-            | &InstructionData::BranchTableEntry { imm, .. } => Some(DataValue::from(imm as i8)), // Note the switch from unsigned to signed.
-            // 32-bit
-            &InstructionData::UnaryIeee32 { imm, .. } => Some(DataValue::from(imm)),
-            &InstructionData::HeapAddr { imm, .. } => {
-                let imm: u32 = imm.into();
-                Some(DataValue::from(imm as i32)) // Note the switch from unsigned to signed.
+            Self::Jump {
+                ref destination, ..
+            } => std::slice::from_ref(destination),
+            Self::Brif { blocks, .. } => blocks.as_slice(),
+            Self::BranchTable { table, .. } => jump_tables.get(*table).unwrap().all_branches(),
+            _ => {
+                debug_assert!(!self.opcode().is_branch());
+                &[]
             }
-            &InstructionData::Load { offset, .. }
-            | &InstructionData::LoadComplex { offset, .. }
-            | &InstructionData::Store { offset, .. }
-            | &InstructionData::StoreComplex { offset, .. }
-            | &InstructionData::StackLoad { offset, .. }
-            | &InstructionData::StackStore { offset, .. }
-            | &InstructionData::TableAddr { offset, .. } => Some(DataValue::from(offset)),
-            // 64-bit.
-            &InstructionData::UnaryImm { imm, .. }
-            | &InstructionData::BinaryImm64 { imm, .. }
-            | &InstructionData::IntCompareImm { imm, .. } => Some(DataValue::from(imm.bits())),
-            &InstructionData::UnaryIeee64 { imm, .. } => Some(DataValue::from(imm)),
-            // 128-bit; though these immediates are present logically in the IR they are not
-            // included in the `InstructionData` for memory-size reasons. This case, returning
-            // `None`, is left here to alert users of this method that they should retrieve the
-            // value using the `DataFlowGraph`.
-            &InstructionData::Shuffle { mask: _, .. } => None,
-            _ => None,
+        }
+    }
+
+    /// Get a mutable slice of the destinations of this instruction, if it's a branch.
+    ///
+    /// `br_table` returns the empty slice.
+    pub fn branch_destination_mut<'a>(
+        &'a mut self,
+        jump_tables: &'a mut ir::JumpTables,
+    ) -> &'a mut [BlockCall] {
+        match self {
+            Self::Jump {
+                ref mut destination,
+                ..
+            } => std::slice::from_mut(destination),
+            Self::Brif { blocks, .. } => blocks.as_mut_slice(),
+            Self::BranchTable { table, .. } => {
+                jump_tables.get_mut(*table).unwrap().all_branches_mut()
+            }
+            _ => {
+                debug_assert!(!self.opcode().is_branch());
+                &mut []
+            }
+        }
+    }
+
+    /// Replace the values used in this instruction according to the given
+    /// function.
+    pub fn map_values(
+        &mut self,
+        pool: &mut ValueListPool,
+        jump_tables: &mut ir::JumpTables,
+        mut f: impl FnMut(Value) -> Value,
+    ) {
+        for arg in self.arguments_mut(pool) {
+            *arg = f(*arg);
+        }
+
+        for block in self.branch_destination_mut(jump_tables) {
+            for arg in block.args_slice_mut(pool) {
+                *arg = f(*arg);
+            }
         }
     }
 
@@ -330,10 +365,7 @@ impl InstructionData {
     /// `None`.
     pub fn trap_code(&self) -> Option<TrapCode> {
         match *self {
-            Self::CondTrap { code, .. }
-            | Self::FloatCondTrap { code, .. }
-            | Self::IntCondTrap { code, .. }
-            | Self::Trap { code, .. } => Some(code),
+            Self::CondTrap { code, .. } | Self::Trap { code, .. } => Some(code),
             _ => None,
         }
     }
@@ -342,12 +374,7 @@ impl InstructionData {
     /// condition.  Otherwise, return `None`.
     pub fn cond_code(&self) -> Option<IntCC> {
         match self {
-            &InstructionData::IntCond { cond, .. }
-            | &InstructionData::BranchIcmp { cond, .. }
-            | &InstructionData::IntCompare { cond, .. }
-            | &InstructionData::IntCondTrap { cond, .. }
-            | &InstructionData::BranchInt { cond, .. }
-            | &InstructionData::IntSelect { cond, .. }
+            &InstructionData::IntCompare { cond, .. }
             | &InstructionData::IntCompareImm { cond, .. } => Some(cond),
             _ => None,
         }
@@ -357,10 +384,7 @@ impl InstructionData {
     /// condition.  Otherwise, return `None`.
     pub fn fp_cond_code(&self) -> Option<FloatCC> {
         match self {
-            &InstructionData::BranchFloat { cond, .. }
-            | &InstructionData::FloatCompare { cond, .. }
-            | &InstructionData::FloatCond { cond, .. }
-            | &InstructionData::FloatCondTrap { cond, .. } => Some(cond),
+            &InstructionData::FloatCompare { cond, .. } => Some(cond),
             _ => None,
         }
     }
@@ -369,10 +393,7 @@ impl InstructionData {
     /// trap code. Otherwise, return `None`.
     pub fn trap_code_mut(&mut self) -> Option<&mut TrapCode> {
         match self {
-            Self::CondTrap { code, .. }
-            | Self::FloatCondTrap { code, .. }
-            | Self::IntCondTrap { code, .. }
-            | Self::Trap { code, .. } => Some(code),
+            Self::CondTrap { code, .. } | Self::Trap { code, .. } => Some(code),
             _ => None,
         }
     }
@@ -390,10 +411,8 @@ impl InstructionData {
         match self {
             &InstructionData::Load { offset, .. }
             | &InstructionData::StackLoad { offset, .. }
-            | &InstructionData::LoadComplex { offset, .. }
             | &InstructionData::Store { offset, .. }
-            | &InstructionData::StackStore { offset, .. }
-            | &InstructionData::StoreComplex { offset, .. } => Some(offset.into()),
+            | &InstructionData::StackStore { offset, .. } => Some(offset.into()),
             _ => None,
         }
     }
@@ -402,11 +421,11 @@ impl InstructionData {
     pub fn memflags(&self) -> Option<MemFlags> {
         match self {
             &InstructionData::Load { flags, .. }
-            | &InstructionData::LoadComplex { flags, .. }
             | &InstructionData::LoadNoOffset { flags, .. }
             | &InstructionData::Store { flags, .. }
-            | &InstructionData::StoreComplex { flags, .. }
-            | &InstructionData::StoreNoOffset { flags, .. } => Some(flags),
+            | &InstructionData::StoreNoOffset { flags, .. }
+            | &InstructionData::AtomicCas { flags, .. }
+            | &InstructionData::AtomicRmw { flags, .. } => Some(flags),
             _ => None,
         }
     }
@@ -431,6 +450,14 @@ impl InstructionData {
             Self::CallIndirect {
                 sig_ref, ref args, ..
             } => CallInfo::Indirect(sig_ref, &args.as_slice(pool)[1..]),
+            Self::Ternary {
+                opcode: Opcode::StackSwitch,
+                ..
+            } => {
+                // `StackSwitch` is not actually a call, but has the .call() side
+                // effect as it continues execution elsewhere.
+                CallInfo::NotACall
+            }
             _ => {
                 debug_assert!(!self.opcode().is_call());
                 CallInfo::NotACall
@@ -439,7 +466,7 @@ impl InstructionData {
     }
 
     #[inline]
-    pub(crate) fn sign_extend_immediates(&mut self, ctrl_typevar: Type) {
+    pub(crate) fn mask_immediates(&mut self, ctrl_typevar: Type) {
         if ctrl_typevar.is_invalid() {
             return;
         }
@@ -447,13 +474,16 @@ impl InstructionData {
         let bit_width = ctrl_typevar.bits();
 
         match self {
+            Self::UnaryImm { opcode: _, imm } => {
+                *imm = imm.mask_to_width(bit_width);
+            }
             Self::BinaryImm64 {
                 opcode,
                 arg: _,
                 imm,
             } => {
                 if *opcode == Opcode::SdivImm || *opcode == Opcode::SremImm {
-                    imm.sign_extend_from_width(bit_width);
+                    *imm = imm.mask_to_width(bit_width);
                 }
             }
             Self::IntCompareImm {
@@ -464,26 +494,12 @@ impl InstructionData {
             } => {
                 debug_assert_eq!(*opcode, Opcode::IcmpImm);
                 if cond.unsigned() != *cond {
-                    imm.sign_extend_from_width(bit_width);
+                    *imm = imm.mask_to_width(bit_width);
                 }
             }
             _ => {}
         }
     }
-}
-
-/// Information about branch and jump instructions.
-pub enum BranchInfo<'a> {
-    /// This is not a branch or jump instruction.
-    /// This instruction will not transfer control to another block in the function, but it may still
-    /// affect control flow by returning or trapping.
-    NotABranch,
-
-    /// This is a branch or jump to a single destination block, possibly taking value arguments.
-    SingleDest(Block, &'a [Value]),
-
-    /// This is a jump table branch which can have many destination blocks and maybe one default block.
-    Table(JumpTable, Option<Block>),
 }
 
 /// Information about call instructions.
@@ -590,12 +606,9 @@ impl OpcodeConstraints {
     /// `ctrl_type`.
     pub fn result_type(self, n: usize, ctrl_type: Type) -> Type {
         debug_assert!(n < self.num_fixed_results(), "Invalid result index");
-        if let ResolvedConstraint::Bound(t) =
-            OPERAND_CONSTRAINTS[self.constraint_offset() + n].resolve(ctrl_type)
-        {
-            t
-        } else {
-            panic!("Result constraints can't be free");
+        match OPERAND_CONSTRAINTS[self.constraint_offset() + n].resolve(ctrl_type) {
+            ResolvedConstraint::Bound(t) => t,
+            ResolvedConstraint::Free(ts) => panic!("Result constraints can't be free: {ts:?}"),
         }
     }
 
@@ -625,11 +638,11 @@ impl OpcodeConstraints {
     }
 }
 
-type BitSet8 = BitSet<u8>;
-type BitSet16 = BitSet<u16>;
+type BitSet8 = ScalarBitSet<u8>;
+type BitSet16 = ScalarBitSet<u16>;
 
 /// A value type set describes the permitted set of types for a type variable.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ValueTypeSet {
     /// Allowed lane sizes
     pub lanes: BitSet16,
@@ -637,10 +650,8 @@ pub struct ValueTypeSet {
     pub ints: BitSet8,
     /// Allowed float widths
     pub floats: BitSet8,
-    /// Allowed bool widths
-    pub bools: BitSet8,
-    /// Allowed ref widths
-    pub refs: BitSet8,
+    /// Allowed dynamic vectors minimum lane sizes
+    pub dynamic_lanes: BitSet16,
 }
 
 impl ValueTypeSet {
@@ -648,15 +659,11 @@ impl ValueTypeSet {
     ///
     /// Note that the base type set does not have to be included in the type set proper.
     fn is_base_type(self, scalar: Type) -> bool {
-        let l2b = scalar.log2_lane_bits();
+        let l2b = u8::try_from(scalar.log2_lane_bits()).unwrap();
         if scalar.is_int() {
             self.ints.contains(l2b)
         } else if scalar.is_float() {
             self.floats.contains(l2b)
-        } else if scalar.is_bool() {
-            self.bools.contains(l2b)
-        } else if scalar.is_ref() {
-            self.refs.contains(l2b)
         } else {
             false
         }
@@ -664,8 +671,13 @@ impl ValueTypeSet {
 
     /// Does `typ` belong to this set?
     pub fn contains(self, typ: Type) -> bool {
-        let l2l = typ.log2_lane_count();
-        self.lanes.contains(l2l) && self.is_base_type(typ.lane_type())
+        if typ.is_dynamic_vector() {
+            let l2l = u8::try_from(typ.log2_min_lane_count()).unwrap();
+            self.dynamic_lanes.contains(l2l) && self.is_base_type(typ.lane_type())
+        } else {
+            let l2l = u8::try_from(typ.log2_lane_count()).unwrap();
+            self.lanes.contains(l2l) && self.is_base_type(typ.lane_type())
+        }
     }
 
     /// Get an example member of this type set.
@@ -676,10 +688,8 @@ impl ValueTypeSet {
             types::I32
         } else if self.floats.max().unwrap_or(0) > 5 {
             types::F32
-        } else if self.bools.max().unwrap_or(0) > 5 {
-            types::B32
         } else {
-            types::B1
+            types::I8
         };
         t.by(1 << self.lanes.min().unwrap()).unwrap()
     }
@@ -700,8 +710,8 @@ enum OperandConstraint {
     /// This operand is `ctrlType.lane_of()`.
     LaneOf,
 
-    /// This operand is `ctrlType.as_bool()`.
-    AsBool,
+    /// This operand is `ctrlType.as_truthy()`.
+    AsTruthy,
 
     /// This operand is `ctrlType.half_width()`.
     HalfWidth,
@@ -709,17 +719,20 @@ enum OperandConstraint {
     /// This operand is `ctrlType.double_width()`.
     DoubleWidth,
 
-    /// This operand is `ctrlType.half_vector()`.
-    HalfVector,
-
-    /// This operand is `ctrlType.double_vector()`.
-    DoubleVector,
-
     /// This operand is `ctrlType.split_lanes()`.
     SplitLanes,
 
     /// This operand is `ctrlType.merge_lanes()`.
     MergeLanes,
+
+    /// This operands is `ctrlType.dynamic_to_vector()`.
+    DynamicToVector,
+
+    /// This operand is `ctrlType.narrower()`.
+    Narrower,
+
+    /// This operand is `ctrlType.wider()`.
+    Wider,
 }
 
 impl OperandConstraint {
@@ -733,29 +746,108 @@ impl OperandConstraint {
             Free(vts) => ResolvedConstraint::Free(TYPE_SETS[vts as usize]),
             Same => Bound(ctrl_type),
             LaneOf => Bound(ctrl_type.lane_of()),
-            AsBool => Bound(ctrl_type.as_bool()),
+            AsTruthy => Bound(ctrl_type.as_truthy()),
             HalfWidth => Bound(ctrl_type.half_width().expect("invalid type for half_width")),
             DoubleWidth => Bound(
                 ctrl_type
                     .double_width()
                     .expect("invalid type for double_width"),
             ),
-            HalfVector => Bound(
+            SplitLanes => {
+                if ctrl_type.is_dynamic_vector() {
+                    Bound(
+                        ctrl_type
+                            .dynamic_to_vector()
+                            .expect("invalid type for dynamic_to_vector")
+                            .split_lanes()
+                            .expect("invalid type for split_lanes")
+                            .vector_to_dynamic()
+                            .expect("invalid dynamic type"),
+                    )
+                } else {
+                    Bound(
+                        ctrl_type
+                            .split_lanes()
+                            .expect("invalid type for split_lanes"),
+                    )
+                }
+            }
+            MergeLanes => {
+                if ctrl_type.is_dynamic_vector() {
+                    Bound(
+                        ctrl_type
+                            .dynamic_to_vector()
+                            .expect("invalid type for dynamic_to_vector")
+                            .merge_lanes()
+                            .expect("invalid type for merge_lanes")
+                            .vector_to_dynamic()
+                            .expect("invalid dynamic type"),
+                    )
+                } else {
+                    Bound(
+                        ctrl_type
+                            .merge_lanes()
+                            .expect("invalid type for merge_lanes"),
+                    )
+                }
+            }
+            DynamicToVector => Bound(
                 ctrl_type
-                    .half_vector()
-                    .expect("invalid type for half_vector"),
+                    .dynamic_to_vector()
+                    .expect("invalid type for dynamic_to_vector"),
             ),
-            DoubleVector => Bound(ctrl_type.by(2).expect("invalid type for double_vector")),
-            SplitLanes => Bound(
-                ctrl_type
-                    .split_lanes()
-                    .expect("invalid type for split_lanes"),
-            ),
-            MergeLanes => Bound(
-                ctrl_type
-                    .merge_lanes()
-                    .expect("invalid type for merge_lanes"),
-            ),
+            Narrower => {
+                let ctrl_type_bits = ctrl_type.log2_lane_bits();
+                let mut tys = ValueTypeSet::default();
+
+                // We're testing scalar values, only.
+                tys.lanes = ScalarBitSet::from_range(0, 1);
+
+                if ctrl_type.is_int() {
+                    // The upper bound in from_range is exclusive, and we want to exclude the
+                    // control type to construct the interval of [I8, ctrl_type).
+                    tys.ints = BitSet8::from_range(3, ctrl_type_bits as u8);
+                } else if ctrl_type.is_float() {
+                    // The upper bound in from_range is exclusive, and we want to exclude the
+                    // control type to construct the interval of [F16, ctrl_type).
+                    tys.floats = BitSet8::from_range(4, ctrl_type_bits as u8);
+                } else {
+                    panic!("The Narrower constraint only operates on floats or ints");
+                }
+                ResolvedConstraint::Free(tys)
+            }
+            Wider => {
+                let ctrl_type_bits = ctrl_type.log2_lane_bits();
+                let mut tys = ValueTypeSet::default();
+
+                // We're testing scalar values, only.
+                tys.lanes = ScalarBitSet::from_range(0, 1);
+
+                if ctrl_type.is_int() {
+                    let lower_bound = ctrl_type_bits as u8 + 1;
+                    // The largest integer type we can represent in `BitSet8` is I128, which is
+                    // represented by bit 7 in the bit set. Adding one to exclude I128 from the
+                    // lower bound would overflow as 2^8 doesn't fit in a u8, but this would
+                    // already describe the empty set so instead we leave `ints` in its default
+                    // empty state.
+                    if lower_bound < BitSet8::capacity() {
+                        // The interval should include all types wider than `ctrl_type`, so we use
+                        // `2^8` as the upper bound, and add one to the bits of `ctrl_type` to define
+                        // the interval `(ctrl_type, I128]`.
+                        tys.ints = BitSet8::from_range(lower_bound, 8);
+                    }
+                } else if ctrl_type.is_float() {
+                    // Same as above but for `tys.floats`, as the largest float type is F128.
+                    let lower_bound = ctrl_type_bits as u8 + 1;
+                    if lower_bound < BitSet8::capacity() {
+                        tys.floats = BitSet8::from_range(lower_bound, 8);
+                    }
+                } else {
+                    panic!("The Wider constraint only operates on floats or ints");
+                }
+
+                ResolvedConstraint::Free(tys)
+            }
         }
     }
 }
@@ -773,6 +865,19 @@ pub enum ResolvedConstraint {
 mod tests {
     use super::*;
     use alloc::string::ToString;
+
+    #[test]
+    fn inst_data_is_copy() {
+        fn is_copy<T: Copy>() {}
+        is_copy::<InstructionData>();
+    }
+
+    #[test]
+    fn inst_data_size() {
+        // The size of `InstructionData` is performance sensitive, so make sure
+        // we don't regress it unintentionally.
+        assert_eq!(std::mem::size_of::<InstructionData>(), 16);
+    }
 
     #[test]
     fn opcodes() {
@@ -856,6 +961,7 @@ mod tests {
         assert!(cmp.requires_typevar_operand());
         assert_eq!(cmp.num_fixed_results(), 1);
         assert_eq!(cmp.num_fixed_value_arguments(), 2);
+        assert_eq!(cmp.result_type(0, types::I64), types::I8);
     }
 
     #[test]
@@ -866,27 +972,23 @@ mod tests {
             lanes: BitSet16::from_range(0, 8),
             ints: BitSet8::from_range(4, 7),
             floats: BitSet8::from_range(0, 0),
-            bools: BitSet8::from_range(3, 7),
-            refs: BitSet8::from_range(5, 7),
+            dynamic_lanes: BitSet16::from_range(0, 4),
         };
         assert!(!vts.contains(I8));
         assert!(vts.contains(I32));
         assert!(vts.contains(I64));
         assert!(vts.contains(I32X4));
+        assert!(vts.contains(I32X4XN));
+        assert!(!vts.contains(F16));
         assert!(!vts.contains(F32));
-        assert!(!vts.contains(B1));
-        assert!(vts.contains(B8));
-        assert!(vts.contains(B64));
-        assert!(vts.contains(R32));
-        assert!(vts.contains(R64));
+        assert!(!vts.contains(F128));
         assert_eq!(vts.example().to_string(), "i32");
 
         let vts = ValueTypeSet {
             lanes: BitSet16::from_range(0, 8),
             ints: BitSet8::from_range(0, 0),
             floats: BitSet8::from_range(5, 7),
-            bools: BitSet8::from_range(3, 7),
-            refs: BitSet8::from_range(0, 0),
+            dynamic_lanes: BitSet16::from_range(0, 8),
         };
         assert_eq!(vts.example().to_string(), "f32");
 
@@ -894,33 +996,26 @@ mod tests {
             lanes: BitSet16::from_range(1, 8),
             ints: BitSet8::from_range(0, 0),
             floats: BitSet8::from_range(5, 7),
-            bools: BitSet8::from_range(3, 7),
-            refs: BitSet8::from_range(0, 0),
+            dynamic_lanes: BitSet16::from_range(0, 8),
         };
         assert_eq!(vts.example().to_string(), "f32x2");
 
         let vts = ValueTypeSet {
             lanes: BitSet16::from_range(2, 8),
-            ints: BitSet8::from_range(0, 0),
+            ints: BitSet8::from_range(3, 7),
             floats: BitSet8::from_range(0, 0),
-            bools: BitSet8::from_range(3, 7),
-            refs: BitSet8::from_range(0, 0),
+            dynamic_lanes: BitSet16::from_range(0, 8),
         };
-        assert!(!vts.contains(B32X2));
-        assert!(vts.contains(B32X4));
-        assert_eq!(vts.example().to_string(), "b32x4");
+        assert_eq!(vts.example().to_string(), "i32x4");
 
         let vts = ValueTypeSet {
             // TypeSet(lanes=(1, 256), ints=(8, 64))
             lanes: BitSet16::from_range(0, 9),
             ints: BitSet8::from_range(3, 7),
             floats: BitSet8::from_range(0, 0),
-            bools: BitSet8::from_range(0, 0),
-            refs: BitSet8::from_range(0, 0),
+            dynamic_lanes: BitSet16::from_range(0, 8),
         };
         assert!(vts.contains(I32));
         assert!(vts.contains(I32X4));
-        assert!(!vts.contains(R32));
-        assert!(!vts.contains(R64));
     }
 }

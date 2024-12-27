@@ -1,32 +1,49 @@
 [package]
 name = "wasmtime-fuzz"
 version = "0.0.0"
-authors = ["The Wasmtime Project Developers"]
-edition = "2018"
+edition.workspace = true
+rust-version.workspace = true
 publish = false
+
+[lints]
+workspace = true
 
 [package.metadata]
 cargo-fuzz = true
 
 [dependencies]
-cranelift-codegen = { path = "../cranelift/codegen" }
-cranelift-reader = { path = "../cranelift/reader" }
-cranelift-wasm = { path = "../cranelift/wasm" }
-cranelift-filetests = { path = "../cranelift/filetests" }
-cranelift-interpreter = { path = "../cranelift/interpreter" }
-cranelift-fuzzgen = { path = "../cranelift/fuzzgen" }
-libfuzzer-sys = "0.4.0"
-target-lexicon = "0.12"
-peepmatic-fuzzing = { path = "../cranelift/peepmatic/crates/fuzzing", optional = true }
-wasmtime = { path = "../crates/wasmtime" }
-wasmtime-fuzzing = { path = "../crates/fuzzing" }
-wasm-smith = "0.7.0"
+anyhow = { workspace = true }
+env_logger = { workspace = true }
+cranelift-codegen = { workspace = true, features = ["incremental-cache", "x86", "arm64", "s390x", "riscv64"] }
+cranelift-reader = { workspace = true }
+cranelift-filetests = { workspace = true }
+cranelift-interpreter = { workspace = true }
+cranelift-fuzzgen = { workspace = true }
+cranelift-native = { workspace = true }
+cranelift-control = { workspace = true }
+libfuzzer-sys = { workspace = true, features = ["arbitrary-derive"] }
+target-lexicon = { workspace = true }
+pulley-interpreter-fuzz = { workspace = true }
+smallvec = { workspace = true }
+wasmparser = { workspace = true }
+wasmtime = { workspace = true, features = ["winch"] }
+wasmtime-fuzzing = { workspace = true }
+component-test-util = { workspace = true }
+component-fuzz-util = { workspace = true }
+log = { workspace = true }
+
+[build-dependencies]
+anyhow = { workspace = true }
+proc-macro2 = "1.0"
+arbitrary = { workspace = true, features = ["derive"] }
+rand = { version = "0.8.0" }
+quote = "1.0"
+component-fuzz-util = { workspace = true }
 
 [features]
-# Leave a stub feature with no side-effects in place for now: the OSS-Fuzz
-# config builds fuzz targets with this feature enabled and we don't want to
-# break the build.
-experimental_x64 = []
+default = ['fuzz-spec-interpreter']
+fuzz-spec-interpreter = ['wasmtime-fuzzing/fuzz-spec-interpreter']
+chaos = ["cranelift-control/chaos"]
 
 [[bin]]
 name = "compile"
@@ -53,20 +70,8 @@ test = false
 doc = false
 
 [[bin]]
-name = "differential_wasmi"
-path = "fuzz_targets/differential_wasmi.rs"
-test = false
-doc = false
-
-[[bin]]
-name = "differential_v8"
-path = "fuzz_targets/differential_v8.rs"
-test = false
-doc = false
-
-[[bin]]
-name = "spectests"
-path = "fuzz_targets/spectests.rs"
+name = "wast_tests"
+path = "fuzz_targets/wast_tests.rs"
 test = false
 doc = false
 
@@ -77,20 +82,8 @@ test = false
 doc = false
 
 [[bin]]
-name = "instantiate-wasm-smith"
-path = "fuzz_targets/instantiate-wasm-smith.rs"
-test = false
-doc = false
-
-[[bin]]
-name = "instantiate-swarm"
-path = "fuzz_targets/instantiate-swarm.rs"
-test = false
-doc = false
-
-[[bin]]
-name = "instantiate-maybe-invalid"
-path = "fuzz_targets/instantiate-maybe-invalid.rs"
+name = "stacks"
+path = "fuzz_targets/stacks.rs"
 test = false
 doc = false
 
@@ -101,7 +94,39 @@ test = false
 doc = false
 
 [[bin]]
-name = "cranelift-fuzzgen-verify"
-path = "fuzz_targets/cranelift-fuzzgen-verify.rs"
+name = "instantiate-many"
+path = "fuzz_targets/instantiate-many.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "component_api"
+path = "fuzz_targets/component_api.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "cranelift-icache"
+path = "fuzz_targets/cranelift-icache.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "call_async"
+path = "fuzz_targets/call_async.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "memory_accesses"
+path = "fuzz_targets/memory_accesses.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pulley"
+path = "fuzz_targets/pulley.rs"
+test = false
+doc = false
+bench = false

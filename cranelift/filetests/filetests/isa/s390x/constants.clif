@@ -1,23 +1,37 @@
-test compile
+test compile precise-output
 target s390x
 
-function %f() -> b8 {
+function %f() -> i8 {
 block0:
-  v0 = bconst.b8 true
+  v0 = iconst.i8 -1
   return v0
 }
 
-; check:  lhi %r2, 255
-; nextln: br %r14
+; VCode:
+; block0:
+;   lhi %r2, 255
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lhi %r2, 0xff
+;   br %r14
 
-function %f() -> b16 {
+function %f() -> i16 {
 block0:
-  v0 = bconst.b16 false
+  v0 = iconst.i16 0
   return v0
 }
 
-; check:  lhi %r2, 0
-; nextln: br %r14
+; VCode:
+; block0:
+;   lhi %r2, 0
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lhi %r2, 0
+;   br %r14
 
 function %f() -> i64 {
 block0:
@@ -25,8 +39,15 @@ block0:
   return v0
 }
 
-; check:  lghi %r2, 0
-; nextln: br %r14
+; VCode:
+; block0:
+;   lghi %r2, 0
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lghi %r2, 0
+;   br %r14
 
 function %f() -> i64 {
 block0:
@@ -34,8 +55,15 @@ block0:
   return v0
 }
 
-; check:  lgfi %r2, 65535
-; nextln: br %r14
+; VCode:
+; block0:
+;   lgfi %r2, 65535
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lgfi %r2, 0xffff
+;   br %r14
 
 function %f() -> i64 {
 block0:
@@ -43,8 +71,15 @@ block0:
   return v0
 }
 
-; check:  llilh %r2, 65535
-; nextln: br %r14
+; VCode:
+; block0:
+;   llilh %r2, 65535
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   llilh %r2, 0xffff
+;   br %r14
 
 function %f() -> i64 {
 block0:
@@ -52,8 +87,15 @@ block0:
   return v0
 }
 
-; check:  llihl %r2, 65535
-; nextln: br %r14
+; VCode:
+; block0:
+;   llihl %r2, 65535
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   llihl %r2, 0xffff
+;   br %r14
 
 function %f() -> i64 {
 block0:
@@ -61,8 +103,15 @@ block0:
   return v0
 }
 
-; check:  llihh %r2, 65535
-; nextln: br %r14
+; VCode:
+; block0:
+;   llihh %r2, 65535
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   llihh %r2, 0xffff
+;   br %r14
 
 function %f() -> i64 {
 block0:
@@ -70,8 +119,15 @@ block0:
   return v0
 }
 
-; check:  lghi %r2, -1
-; nextln: br %r14
+; VCode:
+; block0:
+;   lghi %r2, -1
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lghi %r2, -1
+;   br %r14
 
 function %f() -> i64 {
 block0:
@@ -79,28 +135,51 @@ block0:
   return v0
 }
 
-; check:  lgfi %r2, -65536
-; nextln: br %r14
+; VCode:
+; block0:
+;   lgfi %r2, -65536
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lgfi %r2, -0x10000
+;   br %r14
 
 function %f() -> i64 {
 block0:
-  v0 = iconst.i64 0xf34bf0a31212003a ; random digits
+  v0 = iconst.i64 0xf34bf0a31212003a ;; random digits
   return v0
 }
 
-; check:  llihf %r2, 4081840291
-; nextln: iilf %r2, 303169594
-; nextln: br %r14
+; VCode:
+; block0:
+;   llihf %r2, 4081840291
+;   iilf %r2, 303169594
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   llihf %r2, 0xf34bf0a3
+;   iilf %r2, 0x1212003a
+;   br %r14
 
 function %f() -> i64 {
 block0:
-  v0 = iconst.i64 0x12e900001ef40000 ; random digits with 2 clear half words
+  v0 = iconst.i64 0x12e900001ef40000 ;; random digits with 2 clear half words
   return v0
 }
 
-; check:  llihh %r2, 4841
-; nextln: iilh %r2, 7924
-; nextln: br %r14
+; VCode:
+; block0:
+;   llihh %r2, 4841
+;   iilh %r2, 7924
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   llihh %r2, 0x12e9
+;   iilh %r2, 0x1ef4
+;   br %r14
 
 function %f() -> i32 {
 block0:
@@ -108,6 +187,13 @@ block0:
   return v0
 }
 
-; check:  lhi %r2, -1
-; nextln: br %r14
+; VCode:
+; block0:
+;   lhi %r2, -1
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lhi %r2, -1
+;   br %r14
 

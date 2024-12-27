@@ -1,10 +1,9 @@
 //! Test command for verifying the unwind emitted for each function.
 //!
 //! The `unwind` test command runs each function through the full code generator pipeline.
-#![cfg_attr(feature = "cargo-clippy", allow(clippy::cast_ptr_alignment))]
 
 use crate::subtest::{run_filecheck, Context, SubTest};
-use cranelift_codegen::{self, ir, isa::unwind::UnwindInfo};
+use cranelift_codegen::{ir, isa::unwind::UnwindInfo};
 use cranelift_reader::TestCommand;
 use gimli::{
     write::{Address, EhFrame, EndianVec, FrameTable},
@@ -39,10 +38,12 @@ impl SubTest for TestUnwind {
         let isa = context.isa.expect("unwind needs an ISA");
         let mut comp_ctx = cranelift_codegen::Context::for_function(func.into_owned());
 
-        comp_ctx.compile(isa).expect("failed to compile function");
+        let code = comp_ctx
+            .compile(isa, &mut Default::default())
+            .expect("failed to compile function");
 
         let mut text = String::new();
-        match comp_ctx.create_unwind_info(isa).expect("unwind info") {
+        match code.create_unwind_info(isa).expect("unwind info") {
             Some(UnwindInfo::WindowsX64(info)) => {
                 let mut mem = vec![0; info.emit_size()];
                 info.emit(&mut mem);
@@ -96,12 +97,8 @@ mod windowsx64 {
             writeln!(text, "                 info: {}", code.info).unwrap();
             match code.value {
                 UnwindValue::None => {}
-                UnwindValue::U16(v) => {
-                    writeln!(text, "                value: {} (u16)", v).unwrap()
-                }
-                UnwindValue::U32(v) => {
-                    writeln!(text, "                value: {} (u32)", v).unwrap()
-                }
+                UnwindValue::U16(v) => writeln!(text, "                value: {v} (u16)").unwrap(),
+                UnwindValue::U32(v) => writeln!(text, "                value: {v} (u32)").unwrap(),
             };
         }
     }
@@ -111,6 +108,7 @@ mod windowsx64 {
         version: u8,
         flags: u8,
         prologue_size: u8,
+        #[expect(dead_code, reason = "may get used later")]
         unwind_code_count_raw: u8,
         frame_register: u8,
         frame_register_offset: u8,
@@ -367,16 +365,15 @@ mod systemv {
     fn dump_pointer<W: Write>(w: &mut W, p: gimli::Pointer) -> Result<()> {
         match p {
             gimli::Pointer::Direct(p) => {
-                write!(w, "{:#018x}", p)?;
+                write!(w, "{p:#018x}")?;
             }
             gimli::Pointer::Indirect(p) => {
-                write!(w, "({:#018x})", p)?;
+                write!(w, "({p:#018x})")?;
             }
         }
         Ok(())
     }
 
-    #[allow(clippy::unneeded_field_pattern)]
     fn dump_cfi_instructions<R: Reader, W: Write>(
         w: &mut W,
         mut insns: gimli::CallFrameInstructionIter<R>,
@@ -399,7 +396,7 @@ mod systemv {
         loop {
             match insns.next() {
                 Err(e) => {
-                    writeln!(w, "Failed to decode CFI instruction: {}", e)?;
+                    writeln!(w, "Failed to decode CFI instruction: {e}")?;
                     return Ok(());
                 }
                 Ok(None) => {
@@ -410,10 +407,10 @@ mod systemv {
                 }
                 Ok(Some(op)) => match op {
                     SetLoc { address } => {
-                        writeln!(w, "                DW_CFA_set_loc ({:#x})", address)?;
+                        writeln!(w, "                DW_CFA_set_loc ({address:#x})")?;
                     }
                     AdvanceLoc { delta } => {
-                        writeln!(w, "                DW_CFA_advance_loc ({})", delta)?;
+                        writeln!(w, "                DW_CFA_advance_loc ({delta})")?;
                     }
                     DefCfa { register, offset } => {
                         writeln!(
@@ -442,13 +439,12 @@ mod systemv {
                         )?;
                     }
                     DefCfaOffset { offset } => {
-                        writeln!(w, "                DW_CFA_def_cfa_offset ({})", offset)?;
+                        writeln!(w, "                DW_CFA_def_cfa_offset ({offset})")?;
                     }
                     DefCfaOffsetSf { factored_offset } => {
                         writeln!(
                             w,
-                            "                DW_CFA_def_cfa_offset_sf ({})",
-                            factored_offset
+                            "                DW_CFA_def_cfa_offset_sf ({factored_offset})"
                         )?;
                     }
                     DefCfaExpression { expression: _ } => {
@@ -557,10 +553,16 @@ mod systemv {
                         writeln!(w, "                DW_CFA_restore_state")?;
                     }
                     ArgsSize { size } => {
-                        writeln!(w, "                DW_CFA_GNU_args_size ({})", size)?;
+                        writeln!(w, "                DW_CFA_GNU_args_size ({size})")?;
+                    }
+                    NegateRaState => {
+                        writeln!(w, "                DW_CFA_AARCH64_negate_ra_state")?;
                     }
                     Nop => {
                         writeln!(w, "                DW_CFA_nop")?;
+                    }
+                    _ => {
+                        writeln!(w, "                DW_CFA_<unknown>")?;
                     }
                 },
             }

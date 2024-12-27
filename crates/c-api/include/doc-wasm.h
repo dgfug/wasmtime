@@ -1,3 +1,5 @@
+/* clang-format off */
+
 /**
  * \file wasm.h
  *
@@ -358,6 +360,8 @@
  * \fn wasm_functype_t* wasm_functype_new(wasm_valtype_vec_t *params, wasm_valtype_vec_t *results);
  * \brief Creates a new function type with the provided parameter and result
  * types.
+ *
+ * This function takes ownership of the `params` and `results` arguments.
  *
  * The caller is responsible for deleting the returned value.
  *

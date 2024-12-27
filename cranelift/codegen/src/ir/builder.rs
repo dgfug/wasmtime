@@ -4,6 +4,7 @@
 //! function. Many of its methods are generated from the meta language instruction definitions.
 
 use crate::ir;
+use crate::ir::instructions::InstructionFormat;
 use crate::ir::types;
 use crate::ir::{DataFlowGraph, InstructionData};
 use crate::ir::{Inst, Opcode, Type, Value};
@@ -200,7 +201,7 @@ impl<'f> InstBuilderBase<'f> for ReplaceBuilder<'f> {
 
     fn build(self, data: InstructionData, ctrl_typevar: Type) -> (Inst, &'f mut DataFlowGraph) {
         // Splat the new instruction on top of the old one.
-        self.dfg[self.inst] = data;
+        self.dfg.insts[self.inst] = data;
 
         if !self.dfg.has_results(self.inst) {
             // The old result values were either detached or non-existent.
@@ -237,7 +238,7 @@ mod tests {
 
         // Formula.
         let cmp = pos.ins().icmp(IntCC::Equal, arg0, v0);
-        assert_eq!(pos.func.dfg.value_type(cmp), B1);
+        assert_eq!(pos.func.dfg.value_type(cmp), I8);
     }
 
     #[test]
@@ -261,5 +262,21 @@ mod tests {
         let iconst = pos.prev_inst().unwrap();
         assert!(iadd != iconst);
         assert_eq!(pos.func.dfg.value_def(v0), ValueDef::Result(iconst, 0));
+    }
+
+    #[test]
+    #[should_panic]
+    #[cfg(debug_assertions)]
+    fn panics_when_inserting_wrong_opcode() {
+        use crate::ir::{Opcode, TrapCode};
+
+        let mut func = Function::new();
+        let block0 = func.dfg.make_block();
+        let mut pos = FuncCursor::new(&mut func);
+        pos.insert_block(block0);
+
+        // We are trying to create a Opcode::Return with the InstData::Trap, which is obviously wrong
+        pos.ins()
+            .Trap(Opcode::Return, I32, TrapCode::BAD_CONVERSION_TO_INTEGER);
     }
 }

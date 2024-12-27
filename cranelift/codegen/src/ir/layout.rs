@@ -4,13 +4,11 @@
 //! determined by the `Layout` data structure defined in this module.
 
 use crate::entity::SecondaryMap;
-use crate::ir::dfg::DataFlowGraph;
-use crate::ir::progpoint::{ExpandedProgramPoint, ProgramOrder};
+use crate::ir::progpoint::ProgramPoint;
 use crate::ir::{Block, Inst};
 use crate::packed_option::PackedOption;
-use crate::timing;
+use crate::{timing, trace};
 use core::cmp;
-use core::iter::{IntoIterator, Iterator};
 
 /// The `Layout` struct determines the layout of blocks and instructions in a function. It does not
 /// contain definitions of instructions or blocks, but depends on `Inst` and `Block` entity references
@@ -25,7 +23,7 @@ use core::iter::{IntoIterator, Iterator};
 /// While data dependencies are not recorded, instruction ordering does affect control
 /// dependencies, so part of the semantics of the program are determined by the layout.
 ///
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct Layout {
     /// Linked list nodes for the layout order of blocks Forms a doubly linked list, terminated in
     /// both ends by `None`.
@@ -69,13 +67,11 @@ impl Layout {
 
 /// Sequence numbers.
 ///
-/// All instructions and blocks are given a sequence number that can be used to quickly determine
-/// their relative position in the layout. The sequence numbers are not contiguous, but are assigned
+/// All instructions are given a sequence number that can be used to quickly determine
+/// their relative position in a block. The sequence numbers are not contiguous, but are assigned
 /// like line numbers in BASIC: 10, 20, 30, ...
 ///
-/// The block sequence numbers are strictly increasing, and so are the instruction sequence numbers
-/// within a block. The instruction sequence numbers are all between the sequence number of their
-/// containing block and the following block.
+/// Sequence numbers are strictly increasing within a block, but are reset between blocks.
 ///
 /// The result is that sequence numbers work like BASIC line numbers for the textual form of the IR.
 type SequenceNumber = u32;
@@ -87,7 +83,7 @@ const MAJOR_STRIDE: SequenceNumber = 10;
 const MINOR_STRIDE: SequenceNumber = 2;
 
 /// Limit on the sequence number range we'll renumber locally. If this limit is exceeded, we'll
-/// switch to a full function renumbering.
+/// switch to a full block renumbering.
 const LOCAL_LIMIT: SequenceNumber = 100 * MINOR_STRIDE;
 
 /// Compute the midpoint between `a` and `b`.
@@ -103,106 +99,48 @@ fn midpoint(a: SequenceNumber, b: SequenceNumber) -> Option<SequenceNumber> {
     }
 }
 
-#[test]
-fn test_midpoint() {
-    assert_eq!(midpoint(0, 1), None);
-    assert_eq!(midpoint(0, 2), Some(1));
-    assert_eq!(midpoint(0, 3), Some(1));
-    assert_eq!(midpoint(0, 4), Some(2));
-    assert_eq!(midpoint(1, 4), Some(2));
-    assert_eq!(midpoint(2, 4), Some(3));
-    assert_eq!(midpoint(3, 4), None);
-    assert_eq!(midpoint(3, 4), None);
-}
-
-impl ProgramOrder for Layout {
-    fn cmp<A, B>(&self, a: A, b: B) -> cmp::Ordering
+impl Layout {
+    /// Compare the program points `a` and `b` in the same block relative to this program order.
+    ///
+    /// Return `Less` if `a` appears in the program before `b`.
+    ///
+    /// This is declared as a generic such that it can be called with `Inst` and `Block` arguments
+    /// directly. Depending on the implementation, there is a good chance performance will be
+    /// improved for those cases where the type of either argument is known statically.
+    pub fn pp_cmp<A, B>(&self, a: A, b: B) -> cmp::Ordering
     where
-        A: Into<ExpandedProgramPoint>,
-        B: Into<ExpandedProgramPoint>,
+        A: Into<ProgramPoint>,
+        B: Into<ProgramPoint>,
     {
-        let a_seq = self.seq(a);
-        let b_seq = self.seq(b);
+        let a = a.into();
+        let b = b.into();
+        debug_assert_eq!(self.pp_block(a), self.pp_block(b));
+        let a_seq = match a {
+            ProgramPoint::Block(_block) => 0,
+            ProgramPoint::Inst(inst) => self.insts[inst].seq,
+        };
+        let b_seq = match b {
+            ProgramPoint::Block(_block) => 0,
+            ProgramPoint::Inst(inst) => self.insts[inst].seq,
+        };
         a_seq.cmp(&b_seq)
-    }
-
-    fn is_block_gap(&self, inst: Inst, block: Block) -> bool {
-        let i = &self.insts[inst];
-        let e = &self.blocks[block];
-
-        i.next.is_none() && i.block == e.prev
     }
 }
 
 // Private methods for dealing with sequence numbers.
 impl Layout {
-    /// Get the sequence number of a program point that must correspond to an entity in the layout.
-    fn seq<PP: Into<ExpandedProgramPoint>>(&self, pp: PP) -> SequenceNumber {
-        // When `PP = Inst` or `PP = Block`, we expect this dynamic type check to be optimized out.
-        match pp.into() {
-            ExpandedProgramPoint::Block(block) => self.blocks[block].seq,
-            ExpandedProgramPoint::Inst(inst) => self.insts[inst].seq,
-        }
-    }
-
-    /// Get the last sequence number in `block`.
-    fn last_block_seq(&self, block: Block) -> SequenceNumber {
-        // Get the seq of the last instruction if it exists, otherwise use the block header seq.
-        self.blocks[block]
-            .last_inst
-            .map(|inst| self.insts[inst].seq)
-            .unwrap_or(self.blocks[block].seq)
-    }
-
-    /// Assign a valid sequence number to `block` such that the numbers are still monotonic. This may
-    /// require renumbering.
-    fn assign_block_seq(&mut self, block: Block) {
-        debug_assert!(self.is_block_inserted(block));
-
-        // Get the sequence number immediately before `block`, or 0.
-        let prev_seq = self.blocks[block]
-            .prev
-            .map(|prev_block| self.last_block_seq(prev_block))
-            .unwrap_or(0);
-
-        // Get the sequence number immediately following `block`.
-        let next_seq = if let Some(inst) = self.blocks[block].first_inst.expand() {
-            self.insts[inst].seq
-        } else if let Some(next_block) = self.blocks[block].next.expand() {
-            self.blocks[next_block].seq
-        } else {
-            // There is nothing after `block`. We can just use a major stride.
-            self.blocks[block].seq = prev_seq + MAJOR_STRIDE;
-            return;
-        };
-
-        // Check if there is room between these sequence numbers.
-        if let Some(seq) = midpoint(prev_seq, next_seq) {
-            self.blocks[block].seq = seq;
-        } else {
-            // No available integers between `prev_seq` and `next_seq`. We have to renumber.
-            self.renumber_from_block(block, prev_seq + MINOR_STRIDE, prev_seq + LOCAL_LIMIT);
-        }
-    }
-
     /// Assign a valid sequence number to `inst` such that the numbers are still monotonic. This may
     /// require renumbering.
     fn assign_inst_seq(&mut self, inst: Inst) {
-        let block = self
-            .inst_block(inst)
-            .expect("inst must be inserted before assigning an seq");
-
         // Get the sequence number immediately before `inst`.
         let prev_seq = match self.insts[inst].prev.expand() {
             Some(prev_inst) => self.insts[prev_inst].seq,
-            None => self.blocks[block].seq,
+            None => 0,
         };
 
         // Get the sequence number immediately following `inst`.
         let next_seq = if let Some(next_inst) = self.insts[inst].next.expand() {
             self.insts[next_inst].seq
-        } else if let Some(next_block) = self.blocks[block].next.expand() {
-            self.blocks[next_block].seq
         } else {
             // There is nothing after `inst`. We can just use a major stride.
             self.insts[inst].seq = prev_seq + MAJOR_STRIDE;
@@ -214,23 +152,15 @@ impl Layout {
             self.insts[inst].seq = seq;
         } else {
             // No available integers between `prev_seq` and `next_seq`. We have to renumber.
-            self.renumber_from_inst(inst, prev_seq + MINOR_STRIDE, prev_seq + LOCAL_LIMIT);
+            self.renumber_insts(inst, prev_seq + MINOR_STRIDE, prev_seq + LOCAL_LIMIT);
         }
     }
 
     /// Renumber instructions starting from `inst` until the end of the block or until numbers catch
     /// up.
     ///
-    /// Return `None` if renumbering has caught up and the sequence is monotonic again. Otherwise
-    /// return the last used sequence number.
-    ///
-    /// If sequence numbers exceed `limit`, switch to a full function renumbering and return `None`.
-    fn renumber_insts(
-        &mut self,
-        inst: Inst,
-        seq: SequenceNumber,
-        limit: SequenceNumber,
-    ) -> Option<SequenceNumber> {
+    /// If sequence numbers exceed `limit`, switch to a full block renumbering.
+    fn renumber_insts(&mut self, inst: Inst, seq: SequenceNumber, limit: SequenceNumber) {
         let mut inst = inst;
         let mut seq = seq;
 
@@ -239,56 +169,22 @@ impl Layout {
 
             // Next instruction.
             inst = match self.insts[inst].next.expand() {
-                None => return Some(seq),
+                None => return,
                 Some(next) => next,
             };
 
             if seq < self.insts[inst].seq {
                 // Sequence caught up.
-                return None;
+                return;
             }
 
             if seq > limit {
                 // We're pushing too many instructions in front of us.
-                // Switch to a full function renumbering to make some space.
-                self.full_renumber();
-                return None;
-            }
-
-            seq += MINOR_STRIDE;
-        }
-    }
-
-    /// Renumber starting from `block` to `seq` and continuing until the sequence numbers are
-    /// monotonic again.
-    fn renumber_from_block(
-        &mut self,
-        block: Block,
-        first_seq: SequenceNumber,
-        limit: SequenceNumber,
-    ) {
-        let mut block = block;
-        let mut seq = first_seq;
-
-        loop {
-            self.blocks[block].seq = seq;
-
-            // Renumber instructions in `block`. Stop when the numbers catch up.
-            if let Some(inst) = self.blocks[block].first_inst.expand() {
-                seq = match self.renumber_insts(inst, seq + MINOR_STRIDE, limit) {
-                    Some(s) => s,
-                    None => return,
-                }
-            }
-
-            // Advance to the next block.
-            block = match self.blocks[block].next.expand() {
-                Some(next) => next,
-                None => return,
-            };
-
-            // Stop renumbering once the numbers catch up.
-            if seq < self.blocks[block].seq {
+                // Switch to a full block renumbering to make some space.
+                self.full_block_renumber(
+                    self.inst_block(inst)
+                        .expect("inst must be inserted before assigning an seq"),
+                );
                 return;
             }
 
@@ -296,38 +192,22 @@ impl Layout {
         }
     }
 
-    /// Renumber starting from `inst` to `seq` and continuing until the sequence numbers are
-    /// monotonic again.
-    fn renumber_from_inst(&mut self, inst: Inst, first_seq: SequenceNumber, limit: SequenceNumber) {
-        if let Some(seq) = self.renumber_insts(inst, first_seq, limit) {
-            // Renumbering spills over into next block.
-            if let Some(next_block) = self.blocks[self.inst_block(inst).unwrap()].next.expand() {
-                self.renumber_from_block(next_block, seq + MINOR_STRIDE, limit);
-            }
-        }
-    }
-
-    /// Renumber all blocks and instructions in the layout.
+    /// Renumber all instructions in a block.
     ///
     /// This doesn't affect the position of anything, but it gives more room in the internal
     /// sequence numbers for inserting instructions later.
-    fn full_renumber(&mut self) {
+    fn full_block_renumber(&mut self, block: Block) {
         let _tt = timing::layout_renumber();
-        let mut seq = 0;
-        let mut next_block = self.first_block;
-        while let Some(block) = next_block {
-            self.blocks[block].seq = seq;
+        // Avoid 0 as this is reserved for the program point indicating the block itself
+        let mut seq = MAJOR_STRIDE;
+        let mut next_inst = self.blocks[block].first_inst.expand();
+        while let Some(inst) = next_inst {
+            self.insts[inst].seq = seq;
             seq += MAJOR_STRIDE;
-            next_block = self.blocks[block].next.expand();
-
-            let mut next_inst = self.blocks[block].first_inst.expand();
-            while let Some(inst) = next_inst {
-                self.insts[inst].seq = seq;
-                seq += MAJOR_STRIDE;
-                next_inst = self.insts[inst].next.expand();
-            }
+            next_inst = self.insts[inst].next.expand();
         }
-        log::trace!("Renumbered {} program points", seq / MAJOR_STRIDE);
+
+        trace!("Renumbered {} program points", seq / MAJOR_STRIDE);
     }
 }
 
@@ -364,7 +244,6 @@ impl Layout {
             self.first_block = Some(block);
         }
         self.last_block = Some(block);
-        self.assign_block_seq(block);
     }
 
     /// Insert `block` in the layout before the existing block `before`.
@@ -388,7 +267,6 @@ impl Layout {
             None => self.first_block = Some(block),
             Some(a) => self.blocks[a].next = block.into(),
         }
-        self.assign_block_seq(block);
     }
 
     /// Insert `block` in the layout *after* the existing block `after`.
@@ -412,7 +290,6 @@ impl Layout {
             None => self.last_block = Some(block),
             Some(b) => self.blocks[b].prev = block.into(),
         }
-        self.assign_block_seq(block);
     }
 
     /// Remove `block` from the layout.
@@ -469,18 +346,33 @@ impl Layout {
     pub fn next_block(&self, block: Block) -> Option<Block> {
         self.blocks[block].next.expand()
     }
+
+    /// Mark a block as "cold".
+    ///
+    /// This will try to move it out of the ordinary path of execution
+    /// when lowered to machine code.
+    pub fn set_cold(&mut self, block: Block) {
+        self.blocks[block].cold = true;
+    }
+
+    /// Is the given block cold?
+    pub fn is_cold(&self, block: Block) -> bool {
+        self.blocks[block].cold
+    }
 }
 
-#[derive(Clone, Debug, Default)]
+/// A single node in the linked-list of blocks.
+// **Note:** Whenever you add new fields here, don't forget to update the custom serializer for `Layout` too.
+#[derive(Clone, Debug, Default, PartialEq, Hash)]
 struct BlockNode {
     prev: PackedOption<Block>,
     next: PackedOption<Block>,
     first_inst: PackedOption<Inst>,
     last_inst: PackedOption<Inst>,
-    seq: SequenceNumber,
+    cold: bool,
 }
 
-/// Iterate over blocks in layout order. See `Layout::blocks()`.
+/// Iterate over blocks in layout order. See [crate::ir::layout::Layout::blocks].
 pub struct Blocks<'f> {
     layout: &'f Layout,
     next: Option<Block>,
@@ -521,15 +413,10 @@ impl Layout {
     }
 
     /// Get the block containing the program point `pp`. Panic if `pp` is not in the layout.
-    pub fn pp_block<PP>(&self, pp: PP) -> Block
-    where
-        PP: Into<ExpandedProgramPoint>,
-    {
-        match pp.into() {
-            ExpandedProgramPoint::Block(block) => block,
-            ExpandedProgramPoint::Inst(inst) => {
-                self.inst_block(inst).expect("Program point not in layout")
-            }
+    pub fn pp_block(&self, pp: ProgramPoint) -> Block {
+        match pp {
+            ProgramPoint::Block(block) => block,
+            ProgramPoint::Inst(inst) => self.inst_block(inst).expect("Program point not in layout"),
         }
     }
 
@@ -576,19 +463,6 @@ impl Layout {
     /// Fetch the instruction preceding `inst`.
     pub fn prev_inst(&self, inst: Inst) -> Option<Inst> {
         self.insts[inst].prev.expand()
-    }
-
-    /// Fetch the first instruction in a block's terminal branch group.
-    pub fn canonical_branch_inst(&self, dfg: &DataFlowGraph, block: Block) -> Option<Inst> {
-        // Basic blocks permit at most two terminal branch instructions.
-        // If two, the former is conditional and the latter is unconditional.
-        let last = self.last_inst(block)?;
-        if let Some(prev) = self.prev_inst(last) {
-            if dfg[prev].opcode().is_branch() {
-                return Some(prev);
-            }
-        }
-        Some(last)
     }
 
     /// Insert `inst` before the instruction `before` in the same block.
@@ -643,24 +517,6 @@ impl Layout {
             layout: self,
             head: self.blocks[block].first_inst.into(),
             tail: self.blocks[block].last_inst.into(),
-        }
-    }
-
-    /// Iterate over a limited set of instruction which are likely the branches of `block` in layout
-    /// order. Any instruction not visited by this iterator is not a branch, but an instruction visited by this may not be a branch.
-    pub fn block_likely_branches(&self, block: Block) -> Insts {
-        // Note: Checking whether an instruction is a branch or not while walking backward might add
-        // extra overhead. However, we know that the number of branches is limited to 2 at the end of
-        // each block, and therefore we can just iterate over the last 2 instructions.
-        let mut iter = self.block_insts(block);
-        let head = iter.head;
-        let tail = iter.tail;
-        iter.next_back();
-        let head = iter.next_back().or(head);
-        Insts {
-            layout: self,
-            head,
-            tail,
         }
     }
 
@@ -727,8 +583,6 @@ impl Layout {
             self.insts[i].block = new_block.into();
             opt_i = self.insts[i].next.into();
         }
-
-        self.assign_block_seq(new_block);
     }
 }
 
@@ -739,6 +593,24 @@ struct InstNode {
     prev: PackedOption<Inst>,
     next: PackedOption<Inst>,
     seq: SequenceNumber,
+}
+
+impl PartialEq for InstNode {
+    fn eq(&self, other: &Self) -> bool {
+        // Ignore the sequence number as it is an optimization used by pp_cmp and may be different
+        // even for equivalent layouts.
+        self.block == other.block && self.prev == other.prev && self.next == other.next
+    }
+}
+
+impl core::hash::Hash for InstNode {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        // Ignore the sequence number as it is an optimization used by pp_cmp and may be different
+        // even for equivalent layouts.
+        self.block.hash(state);
+        self.prev.hash(state);
+        self.next.hash(state);
+    }
 }
 
 /// Iterate over instructions in a block in layout order. See `Layout::block_insts()`.
@@ -789,14 +661,13 @@ impl<'f> DoubleEndedIterator for Insts<'f> {
 ///
 /// ```plain
 /// data = block_data * ;
-/// block_data = "block_id" , "inst_count" , ( "inst_id" * ) ;
+/// block_data = "block_id" , "cold" , "inst_count" , ( "inst_id" * ) ;
 /// ```
 #[cfg(feature = "enable-serde")]
 mod serde {
     use ::serde::de::{Deserializer, Error, SeqAccess, Visitor};
     use ::serde::ser::{SerializeSeq, Serializer};
     use ::serde::{Deserialize, Serialize};
-    use core::convert::TryFrom;
     use core::fmt;
     use core::marker::PhantomData;
 
@@ -807,7 +678,7 @@ mod serde {
         where
             S: Serializer,
         {
-            let size = self.blocks().count() * 2
+            let size = self.blocks().count() * 3
                 + self
                     .blocks()
                     .map(|block| self.block_insts(block).count())
@@ -815,6 +686,7 @@ mod serde {
             let mut seq = serializer.serialize_seq(Some(size))?;
             for block in self.blocks() {
                 seq.serialize_element(&block)?;
+                seq.serialize_element(&self.blocks[block].cold)?;
                 seq.serialize_element(&u32::try_from(self.block_insts(block).count()).unwrap())?;
                 for inst in self.block_insts(block) {
                     seq.serialize_element(&inst)?;
@@ -855,9 +727,15 @@ mod serde {
             while let Some(block) = access.next_element::<Block>()? {
                 layout.append_block(block);
 
+                let cold = access
+                    .next_element::<bool>()?
+                    .ok_or_else(|| Error::missing_field("cold"))?;
+                layout.blocks[block].cold = cold;
+
                 let count = access
                     .next_element::<u32>()?
                     .ok_or_else(|| Error::missing_field("count"))?;
+
                 for _ in 0..count {
                     let inst = access
                         .next_element::<Inst>()?
@@ -873,12 +751,24 @@ mod serde {
 
 #[cfg(test)]
 mod tests {
-    use super::Layout;
+    use super::*;
     use crate::cursor::{Cursor, CursorPosition};
     use crate::entity::EntityRef;
-    use crate::ir::{Block, Inst, ProgramOrder, SourceLoc};
+    use crate::ir::{Block, Inst, SourceLoc};
     use alloc::vec::Vec;
     use core::cmp::Ordering;
+
+    #[test]
+    fn test_midpoint() {
+        assert_eq!(midpoint(0, 1), None);
+        assert_eq!(midpoint(0, 2), Some(1));
+        assert_eq!(midpoint(0, 3), Some(1));
+        assert_eq!(midpoint(0, 4), Some(2));
+        assert_eq!(midpoint(1, 4), Some(2));
+        assert_eq!(midpoint(2, 4), Some(3));
+        assert_eq!(midpoint(3, 4), None);
+        assert_eq!(midpoint(3, 4), None);
+    }
 
     struct LayoutCursor<'f> {
         /// Borrowed function layout. Public so it can be re-borrowed from this cursor.
@@ -928,14 +818,12 @@ mod tests {
         // Check forward linkage with iterators.
         // Check that layout sequence numbers are strictly monotonic.
         {
-            let mut seq = 0;
             let mut block_iter = layout.blocks();
             for &(block, insts) in blocks {
                 assert!(layout.is_block_inserted(block));
                 assert_eq!(block_iter.next(), Some(block));
-                assert!(layout.blocks[block].seq > seq);
-                seq = layout.blocks[block].seq;
 
+                let mut seq = 0;
                 let mut inst_iter = layout.block_insts(block);
                 for &inst in insts {
                     assert_eq!(layout.inst_block(inst), Some(block));
@@ -1298,13 +1186,8 @@ mod tests {
         }
 
         // Check `ProgramOrder`.
-        assert_eq!(layout.cmp(e2, e2), Ordering::Equal);
-        assert_eq!(layout.cmp(e2, i2), Ordering::Less);
-        assert_eq!(layout.cmp(i3, i2), Ordering::Greater);
-
-        assert_eq!(layout.is_block_gap(i1, e2), true);
-        assert_eq!(layout.is_block_gap(i3, e1), true);
-        assert_eq!(layout.is_block_gap(i1, e1), false);
-        assert_eq!(layout.is_block_gap(i2, e1), false);
+        assert_eq!(layout.pp_cmp(e2, e2), Ordering::Equal);
+        assert_eq!(layout.pp_cmp(e2, i2), Ordering::Less);
+        assert_eq!(layout.pp_cmp(i3, i2), Ordering::Greater)
     }
 }

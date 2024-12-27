@@ -39,21 +39,18 @@ impl Operand {
         self
     }
 
-    pub fn doc(&self) -> Option<&str> {
+    pub fn doc(&self) -> &str {
         if let Some(doc) = &self.doc {
-            return Some(doc);
+            return doc;
         }
         match &self.kind.fields {
-            OperandKindFields::TypeVar(tvar) => Some(&tvar.doc),
+            OperandKindFields::TypeVar(tvar) => &tvar.doc,
             _ => self.kind.doc(),
         }
     }
 
     pub fn is_value(&self) -> bool {
-        match self.kind.fields {
-            OperandKindFields::TypeVar(_) => true,
-            _ => false,
-        }
+        matches!(self.kind.fields, OperandKindFields::TypeVar(_))
     }
 
     pub fn type_var(&self) -> Option<&TypeVar> {
@@ -64,39 +61,25 @@ impl Operand {
     }
 
     pub fn is_varargs(&self) -> bool {
-        match self.kind.fields {
-            OperandKindFields::VariableArgs => true,
-            _ => false,
-        }
+        matches!(self.kind.fields, OperandKindFields::VariableArgs)
     }
 
     /// Returns true if the operand has an immediate kind or is an EntityRef.
     pub fn is_immediate_or_entityref(&self) -> bool {
-        match self.kind.fields {
+        matches!(
+            self.kind.fields,
             OperandKindFields::ImmEnum(_)
-            | OperandKindFields::ImmValue
-            | OperandKindFields::EntityRef => true,
-            _ => false,
-        }
+                | OperandKindFields::ImmValue
+                | OperandKindFields::EntityRef
+        )
     }
 
     /// Returns true if the operand has an immediate kind.
     pub fn is_immediate(&self) -> bool {
-        match self.kind.fields {
-            OperandKindFields::ImmEnum(_) | OperandKindFields::ImmValue => true,
-            _ => false,
-        }
-    }
-
-    pub fn is_cpu_flags(&self) -> bool {
-        match &self.kind.fields {
-            OperandKindFields::TypeVar(type_var)
-                if type_var.name == "iflags" || type_var.name == "fflags" =>
-            {
-                true
-            }
-            _ => false,
-        }
+        matches!(
+            self.kind.fields,
+            OperandKindFields::ImmEnum(_) | OperandKindFields::ImmValue
+        )
     }
 }
 
@@ -109,6 +92,16 @@ pub(crate) enum OperandKindFields {
     ImmValue,
     ImmEnum(EnumValues),
     TypeVar(TypeVar),
+}
+
+impl OperandKindFields {
+    /// Return the [EnumValues] for this field if it is an `enum`.
+    pub(crate) fn enum_values(&self) -> Option<&EnumValues> {
+        match self {
+            OperandKindFields::ImmEnum(map) => Some(map),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -130,44 +123,47 @@ impl OperandKind {
         rust_field_name: &'static str,
         rust_type: &'static str,
         fields: OperandKindFields,
+        doc: &'static str,
     ) -> Self {
         Self {
             rust_field_name,
             rust_type,
             fields,
-            doc: None,
+            doc: Some(doc),
         }
     }
-    pub fn with_doc(mut self, doc: &'static str) -> Self {
-        assert!(self.doc.is_none());
-        self.doc = Some(doc);
-        self
-    }
-    fn doc(&self) -> Option<&str> {
+    fn doc(&self) -> &str {
         if let Some(doc) = &self.doc {
-            return Some(doc);
+            return doc;
         }
         match &self.fields {
-            OperandKindFields::TypeVar(type_var) => Some(&type_var.doc),
+            OperandKindFields::TypeVar(type_var) => &type_var.doc,
+            // The only method to create an OperandKind with `doc` set to None is using a TypeVar,
+            // so all other options are unreachable here.
             OperandKindFields::ImmEnum(_)
             | OperandKindFields::ImmValue
             | OperandKindFields::EntityRef
-            | OperandKindFields::VariableArgs => None,
+            | OperandKindFields::VariableArgs => unreachable!(),
         }
+    }
+
+    pub(crate) fn is_block(&self) -> bool {
+        self.rust_type == "ir::BlockCall"
     }
 }
 
-impl Into<OperandKind> for &TypeVar {
-    fn into(self) -> OperandKind {
-        OperandKind::new(
-            "value",
-            "ir::Value",
-            OperandKindFields::TypeVar(self.into()),
-        )
+impl From<&TypeVar> for OperandKind {
+    fn from(type_var: &TypeVar) -> Self {
+        OperandKind {
+            rust_field_name: "value",
+            rust_type: "ir::Value",
+            fields: OperandKindFields::TypeVar(type_var.into()),
+            doc: None,
+        }
     }
 }
-impl Into<OperandKind> for &OperandKind {
-    fn into(self) -> OperandKind {
-        self.clone()
+impl From<&OperandKind> for OperandKind {
+    fn from(kind: &OperandKind) -> Self {
+        kind.clone()
     }
 }

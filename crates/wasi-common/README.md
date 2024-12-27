@@ -32,14 +32,7 @@ Please note that the library requires Rust compiler version at least 1.37.0.
 
 ### *nix
 In our *nix implementation, we currently support the entire [WASI API]
-with the exception of socket hostcalls:
-- `sock_recv`
-- `sock_send`
-- `sock_shutdown`
-
-We expect these to be implemented when network access is standardised.
-
-We also currently do not support the `proc_raise` hostcall, as it is expected to
+with the exception of the `proc_raise` hostcall, as it is expected to
 be dropped entirely from WASI.
 
 [WASI API]: https://github.com/WebAssembly/WASI/blob/master/phases/snapshot/docs.md
@@ -51,10 +44,10 @@ so stay tuned!
 
 ## Development hints
 When testing the crate, you may want to enable and run full wasm32 integration testsuite. This
-requires `wasm32-wasi` target installed which can be done as follows using [rustup]
+requires `wasm32-wasip1` target installed which can be done as follows using [rustup]
 
 ```
-rustup target add wasm32-wasi
+rustup target add wasm32-wasip1
 ```
 
 [rustup]: https://rustup.rs

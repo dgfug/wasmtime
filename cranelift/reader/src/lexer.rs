@@ -3,8 +3,6 @@
 use crate::error::Location;
 use cranelift_codegen::ir::types;
 use cranelift_codegen::ir::{Block, Value};
-#[allow(unused_imports, deprecated)]
-use std::ascii::AsciiExt;
 use std::str::CharIndices;
 use std::u16;
 
@@ -15,39 +13,43 @@ use std::u16;
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Token<'a> {
     Comment(&'a str),
-    LPar,                 // '('
-    RPar,                 // ')'
-    LBrace,               // '{'
-    RBrace,               // '}'
-    LBracket,             // '['
-    RBracket,             // ']'
-    Minus,                // '-'
-    Plus,                 // '+'
-    Comma,                // ','
-    Dot,                  // '.'
-    Colon,                // ':'
-    Equal,                // '='
-    Not,                  // '!'
-    Arrow,                // '->'
-    Float(&'a str),       // Floating point immediate
-    Integer(&'a str),     // Integer immediate
-    Type(types::Type),    // i32, f32, b32x4, ...
-    Value(Value),         // v12, v7
-    Block(Block),         // block3
-    StackSlot(u32),       // ss3
-    GlobalValue(u32),     // gv3
-    Heap(u32),            // heap2
-    Table(u32),           // table2
-    JumpTable(u32),       // jt2
-    Constant(u32),        // const2
-    FuncRef(u32),         // fn2
-    SigRef(u32),          // sig2
-    UserRef(u32),         // u345
-    Name(&'a str),        // %9arbitrary_alphanum, %x3, %0, %function ...
-    String(&'a str),      // "arbitrary quoted string with no escape" ...
-    HexSequence(&'a str), // #89AF
-    Identifier(&'a str),  // Unrecognized identifier (opcode, enumerator, ...)
-    SourceLoc(&'a str),   // @00c7
+    LPar,                  // '('
+    RPar,                  // ')'
+    LBrace,                // '{'
+    RBrace,                // '}'
+    LBracket,              // '['
+    RBracket,              // ']'
+    Minus,                 // '-'
+    Plus,                  // '+'
+    Multiply,              // '*'
+    Comma,                 // ','
+    Dot,                   // '.'
+    Colon,                 // ':'
+    Equal,                 // '='
+    Bang,                  // '!'
+    At,                    // '@'
+    Arrow,                 // '->'
+    Float(&'a str),        // Floating point immediate
+    Integer(&'a str),      // Integer immediate
+    Type(types::Type),     // i32, f32, i32x4, ...
+    DynamicType(u32),      // dt5
+    Value(Value),          // v12, v7
+    Block(Block),          // block3
+    Cold,                  // cold (flag on block)
+    StackSlot(u32),        // ss3
+    DynamicStackSlot(u32), // dss4
+    GlobalValue(u32),      // gv3
+    MemoryType(u32),       // mt0
+    Constant(u32),         // const2
+    FuncRef(u32),          // fn2
+    SigRef(u32),           // sig2
+    UserRef(u32),          // u345
+    UserNameRef(u32),      // userextname345
+    Name(&'a str),         // %9arbitrary_alphanum, %x3, %0, %function ...
+    String(&'a str),       // "arbitrary quoted string with no escape" ...
+    HexSequence(&'a str),  // #89AF
+    Identifier(&'a str),   // Unrecognized identifier (opcode, enumerator, ...)
+    SourceLoc(&'a str),    // @00c7
 }
 
 /// A `Token` with an associated location.
@@ -324,8 +326,7 @@ impl<'a> Lexer<'a> {
                         .or_else(|| Self::value_type(text, prefix, number))
                 })
                 .unwrap_or_else(|| match text {
-                    "iflags" => Token::Type(types::IFLAGS),
-                    "fflags" => Token::Type(types::FFLAGS),
+                    "cold" => Token::Cold,
                     _ => Token::Identifier(text),
                 }),
             loc,
@@ -339,14 +340,15 @@ impl<'a> Lexer<'a> {
             "v" => Value::with_number(number).map(Token::Value),
             "block" => Block::with_number(number).map(Token::Block),
             "ss" => Some(Token::StackSlot(number)),
+            "dss" => Some(Token::DynamicStackSlot(number)),
+            "dt" => Some(Token::DynamicType(number)),
             "gv" => Some(Token::GlobalValue(number)),
-            "heap" => Some(Token::Heap(number)),
-            "table" => Some(Token::Table(number)),
-            "jt" => Some(Token::JumpTable(number)),
+            "mt" => Some(Token::MemoryType(number)),
             "const" => Some(Token::Constant(number)),
             "fn" => Some(Token::FuncRef(number)),
             "sig" => Some(Token::SigRef(number)),
             "u" => Some(Token::UserRef(number)),
+            "userextname" => Some(Token::UserNameRef(number)),
             _ => None,
         }
     }
@@ -365,21 +367,15 @@ impl<'a> Lexer<'a> {
             "i32" => types::I32,
             "i64" => types::I64,
             "i128" => types::I128,
+            "f16" => types::F16,
             "f32" => types::F32,
             "f64" => types::F64,
-            "b1" => types::B1,
-            "b8" => types::B8,
-            "b16" => types::B16,
-            "b32" => types::B32,
-            "b64" => types::B64,
-            "b128" => types::B128,
-            "r32" => types::R32,
-            "r64" => types::R64,
+            "f128" => types::F128,
             _ => return None,
         };
         if is_vector {
             if number <= u32::from(u16::MAX) {
-                base_type.by(number as u16).map(Token::Type)
+                base_type.by(number).map(Token::Type)
             } else {
                 None
             }
@@ -442,12 +438,17 @@ impl<'a> Lexer<'a> {
         token(Token::HexSequence(&self.source[begin..end]), loc)
     }
 
-    fn scan_srcloc(&mut self) -> Result<LocatedToken<'a>, LocatedError> {
-        let loc = self.loc();
-        let begin = self.pos + 1;
+    /// Given that we've consumed an `@` character, are we looking at a source
+    /// location?
+    fn looking_at_srcloc(&self) -> bool {
+        match self.lookahead {
+            Some(c) => char::is_digit(c, 16),
+            _ => false,
+        }
+    }
 
-        assert_eq!(self.lookahead, Some('@'));
-
+    fn scan_srcloc(&mut self, pos: usize, loc: Location) -> Result<LocatedToken<'a>, LocatedError> {
+        let begin = pos + 1;
         while let Some(c) = self.next_ch() {
             if !char::is_digit(c, 16) {
                 break;
@@ -461,7 +462,6 @@ impl<'a> Lexer<'a> {
     /// Get the next token or a lexical error.
     ///
     /// Return None when the end of the source is encountered.
-    #[allow(clippy::cognitive_complexity)]
     pub fn next(&mut self) -> Option<Result<LocatedToken<'a>, LocatedError>> {
         loop {
             let loc = self.loc();
@@ -478,8 +478,9 @@ impl<'a> Lexer<'a> {
                 Some('.') => Some(self.scan_char(Token::Dot)),
                 Some(':') => Some(self.scan_char(Token::Colon)),
                 Some('=') => Some(self.scan_char(Token::Equal)),
-                Some('!') => Some(self.scan_char(Token::Not)),
+                Some('!') => Some(self.scan_char(Token::Bang)),
                 Some('+') => Some(self.scan_number()),
+                Some('*') => Some(self.scan_char(Token::Multiply)),
                 Some('-') => {
                     if self.looking_at("->") {
                         Some(self.scan_chars(2, Token::Arrow))
@@ -498,7 +499,16 @@ impl<'a> Lexer<'a> {
                 Some('%') => Some(self.scan_name()),
                 Some('"') => Some(self.scan_string()),
                 Some('#') => Some(self.scan_hex_sequence()),
-                Some('@') => Some(self.scan_srcloc()),
+                Some('@') => {
+                    let pos = self.pos;
+                    let loc = self.loc();
+                    self.next_ch();
+                    if self.looking_at_srcloc() {
+                        Some(self.scan_srcloc(pos, loc))
+                    } else {
+                        Some(token(Token::At, loc))
+                    }
+                }
                 // all ascii whitespace
                 Some(' ') | Some('\x09'..='\x0d') => {
                     self.next_ch();
@@ -516,11 +526,7 @@ impl<'a> Lexer<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::trailing_digits;
     use super::*;
-    use crate::error::Location;
-    use cranelift_codegen::ir::types;
-    use cranelift_codegen::ir::{Block, Value};
 
     #[test]
     fn digits() {
@@ -618,8 +624,7 @@ mod tests {
     fn lex_identifiers() {
         let mut lex = Lexer::new(
             "v0 v00 vx01 block1234567890 block5234567890 v1x vx1 vxvx4 \
-             function0 function b1 i32x4 f32x5 \
-             iflags fflags iflagss",
+             function0 function i8 i32x4 f32x5 f16 f128",
         );
         assert_eq!(
             lex.next(),
@@ -637,12 +642,11 @@ mod tests {
         assert_eq!(lex.next(), token(Token::Identifier("vxvx4"), 1));
         assert_eq!(lex.next(), token(Token::Identifier("function0"), 1));
         assert_eq!(lex.next(), token(Token::Identifier("function"), 1));
-        assert_eq!(lex.next(), token(Token::Type(types::B1), 1));
+        assert_eq!(lex.next(), token(Token::Type(types::I8), 1));
         assert_eq!(lex.next(), token(Token::Type(types::I32X4), 1));
         assert_eq!(lex.next(), token(Token::Identifier("f32x5"), 1));
-        assert_eq!(lex.next(), token(Token::Type(types::IFLAGS), 1));
-        assert_eq!(lex.next(), token(Token::Type(types::FFLAGS), 1));
-        assert_eq!(lex.next(), token(Token::Identifier("iflagss"), 1));
+        assert_eq!(lex.next(), token(Token::Type(types::F16), 1));
+        assert_eq!(lex.next(), token(Token::Type(types::F128), 1));
         assert_eq!(lex.next(), None);
     }
 

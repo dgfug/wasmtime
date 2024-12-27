@@ -1,8 +1,11 @@
+;;! reference_types = true
+
 (module $m
   (global (export "g i32") i32 (i32.const 0))
   (global (export "g mut i32") (mut i32)  (i32.const 0))
 
   (table (export "t funcref") 0 funcref)
+  (table (export "t externref") 0 externref)
   (memory (export "mem") 0)
 
   (func (export "f"))
@@ -32,6 +35,10 @@
   (module (import "m" "t funcref" (table 1 funcref)))
   "expected table limits (min: 1, max: none) doesn't match provided table limits (min: 0, max: none)")
 
+(assert_unlinkable
+  (module (import "m" "t externref" (table 0 funcref)))
+  "expected table of type `funcref`, found table of type `externref`")
+
 ;; errors on memories
 (assert_unlinkable
   (module (import "m" "mem" (memory 1)))
@@ -40,8 +47,8 @@
 ;; errors on functions
 (assert_unlinkable
   (module (import "m" "f" (func (param i32))))
-  "expected func of type `(i32) -> ()`, found func of type `() -> ()`")
+  "expected type `(func (param i32))`, found type `(func)`")
 
 (assert_unlinkable
   (module (import "m" "f p1r2" (func (param i32 i32) (result f64))))
-  "expected func of type `(i32, i32) -> (f64)`, found func of type `(f32) -> (i32, i64)`")
+  "expected type `(func (param i32 i32) (result f64))`, found type `(func (param f32) (result i32 i64))`")

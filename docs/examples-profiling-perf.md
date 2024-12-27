@@ -6,6 +6,59 @@ an extremely powerful profiler with lots of documentation on the web, but for
 the rest of this section we'll assume you're running on Linux and already have
 `perf` installed.
 
+There are two profiling agents for `perf`:
+
+- a very simple one that will map code regions to symbol names: `perfmap`.
+- a more detailed one that can provide additional information and mappings between the source
+  language statements and generated JIT code: `jitdump`.
+
+## Profiling with `perfmap`
+
+Simple profiling support with `perf` generates a "perf map" file that the `perf` CLI will
+automatically look for, when running into unresolved symbols. This requires runtime support from
+Wasmtime itself, so you will need to manually change a few things to enable profiling support in
+your application. Enabling runtime support depends on how you're using Wasmtime:
+
+* **Rust API** - you'll want to call the [`Config::profiler`] method with
+  `ProfilingStrategy::PerfMap` to enable profiling of your wasm modules.
+
+* **C API** - you'll want to call the `wasmtime_config_profiler_set` API with a
+  `WASMTIME_PROFILING_STRATEGY_PERFMAP` value.
+
+* **Command Line** - you'll want to pass the `--profile=perfmap` flag on the command
+  line.
+
+Once perfmap support is enabled, you'll use `perf record` like usual to record
+your application's performance.
+
+For example if you're using the CLI, you'll execute:
+
+```sh
+$ perf record -k mono wasmtime --profile=perfmap foo.wasm
+```
+
+This will create a `perf.data` file as per usual, but it will *also* create a
+`/tmp/perf-XXXX.map` file. This extra `.map` file is the perf map file which is
+specified by `perf` and Wasmtime generates at runtime.
+
+After that you can explore the `perf.data` profile as you usually would, for example with:
+
+```sh
+$ perf report --input perf.data
+```
+
+You should be able to see time spent in wasm functions, generate flamegraphs based on that, etc..
+You should also see entries for wasm functions show up as one function and the name of each
+function matches the debug name section in the wasm file.
+
+Note that support for perfmap is still relatively new in Wasmtime, so if you
+have any problems, please don't hesitate to [file an issue]!
+
+[file an issue]: https://github.com/bytecodealliance/wasmtime/issues/new
+
+
+## Profiling with `jitdump`
+
 Profiling support with `perf` uses the "jitdump" support in the `perf` CLI. This
 requires runtime support from Wasmtime itself, so you will need to manually
 change a few things to enable profiling support in your application. First
@@ -19,7 +72,7 @@ depends on how you're using Wasmtime:
 * **C API** - you'll want to call the `wasmtime_config_profiler_set` API with a
   `WASMTIME_PROFILING_STRATEGY_JITDUMP` value.
 
-* **Command Line** - you'll want to pass the `--jitdump` flag on the command
+* **Command Line** - you'll want to pass the `--profile=jitdump` flag on the command
   line.
 
 Once jitdump support is enabled, you'll use `perf record` like usual to record
@@ -29,7 +82,7 @@ your application's performance. You'll need to also be sure to pass the
 For example if you're using the CLI, you'll execute:
 
 ```sh
-$ perf record -k mono wasmtime --jitdump foo.wasm
+$ perf record -k mono wasmtime --profile=jitdump foo.wasm
 ```
 
 This will create a `perf.data` file as per usual, but it will *also* create a
@@ -70,7 +123,7 @@ have any problems, please don't hesitate to [file an issue]!
 If the jitdump profile doesn't give you enough information by default, you can
 also enable dwarf debug information to be generated for JIT code which should
 give the `perf` profiler more information about what's being profiled. This can
-include information like more desriptive function names, filenames, and line
+include information like more descriptive function names, filenames, and line
 numbers.
 
 Enabling dwarf debug information for JIT code depends on how you're using
@@ -109,15 +162,15 @@ fn fib(n: u32) -> u32 {
 To collect perf information for this wasm module we'll execute:
 
 ```sh
-$ rustc --target wasm32-wasi fib.rs -O
-$ perf record -k mono wasmtime --jitdump fib.wasm
+$ rustc --target wasm32-wasip1 fib.rs -O
+$ perf record -k mono wasmtime --profile=jitdump fib.wasm
 fib(42) = 267914296
 [ perf record: Woken up 1 times to write data ]
 [ perf record: Captured and wrote 0.147 MB perf.data (3435 samples) ]
 $ perf inject --jit --input perf.data --output perf.jit.data
 ```
 
-And we should have all out information now! We can execute `perf report` for
+And we should have all our information now! We can execute `perf report` for
 example to see that 99% of our runtime (as expected) is spent in our `fib`
 function. Note that the symbol has been demangled to `fib::fib` which is what
 the Rust symbol is:

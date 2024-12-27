@@ -1,5 +1,3 @@
-extern crate proc_macro;
-
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::parse_macro_input;
@@ -27,8 +25,8 @@ use syn::parse_macro_input;
 ///       and return `Result<($return_types),$error_type>`
 ///
 ///     * When the `wiggle` crate is built with the `wasmtime_integration`
-///     feature, each module contains an `add_to_linker` function to add it to
-///     a `wasmtime::Linker`.
+///       feature, each module contains an `add_to_linker` function to add it to
+///       a `wasmtime::Linker`.
 ///
 /// Arguments are provided using Rust struct value syntax.
 ///
@@ -39,6 +37,10 @@ use syn::parse_macro_input;
 ///   `{ errno => YourErrnoType }`. This allows you to use the `UserErrorConversion`
 ///   trait to map these rich errors into the flat witx type, or to terminate
 ///   WebAssembly execution by trapping.
+///     * Instead of requiring the user to define an error type, wiggle can
+///       generate an error type for the user which has conversions to/from
+///       the base type, and permits trapping, using the syntax
+///       `errno => trappable AnErrorType`.
 /// * Optional: `async` takes a set of witx modules and functions which are
 ///   made Rust `async` functions in the module trait.
 ///
@@ -92,7 +94,7 @@ use syn::parse_macro_input;
 /// /// is an asynchronous method. Therefore, we use the `async_trait` proc macro
 /// /// to define this trait, so that `double_int_return_float` can be an `async fn`.
 /// /// `wiggle::async_trait` is defined as `#[async_trait::async_trait(?Send)]` -
-/// /// in wiggle, async methods do not have the Send constaint.
+/// /// in wiggle, async methods do not have the Send constraint.
 /// impl example::Example for YourCtxType {
 ///     /// The arrays module has two methods, shown here.
 ///     /// Note that the `GuestPtr` type comes from `wiggle`,
@@ -126,14 +128,14 @@ use syn::parse_macro_input;
 ///
 /// impl types::UserErrorConversion for YourCtxType {
 ///     fn errno_from_your_rich_error(&mut self, e: YourRichError)
-///         -> Result<types::Errno, wiggle::Trap>
+///         -> Result<types::Errno, wiggle::wasmtime_crate::Error>
 ///     {
 ///         println!("Rich error: {:?}", e);
 ///         match e {
 ///             YourRichError::InvalidArg{..} => Ok(types::Errno::InvalidArg),
 ///             YourRichError::Io{..} => Ok(types::Errno::Io),
 ///             YourRichError::Overflow => Ok(types::Errno::Overflow),
-///             YourRichError::Trap(s) => Err(wiggle::Trap::String(s)),
+///             YourRichError::Trap(s) => Err(wiggle::wasmtime_crate::Error::msg(s)),
 ///         }
 ///     }
 /// }
@@ -146,24 +148,48 @@ pub fn from_witx(args: TokenStream) -> TokenStream {
     let config = parse_macro_input!(args as wiggle_generate::Config);
 
     let doc = config.load_document();
-    let names = wiggle_generate::Names::new(quote!(wiggle));
 
     let settings = wiggle_generate::CodegenSettings::new(
         &config.errors,
         &config.async_,
         &doc,
-        cfg!(feature = "wasmtime") && config.wasmtime,
+        config.wasmtime,
+        &config.tracing,
+        config.mutable,
     )
     .expect("validating codegen settings");
 
-    let code = wiggle_generate::generate(&doc, &names, &settings);
+    let code = wiggle_generate::generate(&doc, &settings);
     let metadata = if cfg!(feature = "wiggle_metadata") {
-        wiggle_generate::generate_metadata(&doc, &names)
+        wiggle_generate::generate_metadata(&doc)
     } else {
         quote!()
     };
 
-    TokenStream::from(quote! { #code #metadata })
+    let mut ret = quote! { #code #metadata };
+
+    if std::env::var("WIGGLE_DEBUG_BINDGEN").is_ok() {
+        use std::path::Path;
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        static INVOCATION: AtomicUsize = AtomicUsize::new(0);
+        let root = Path::new(env!("DEBUG_OUTPUT_DIR"));
+        let n = INVOCATION.fetch_add(1, Relaxed);
+        let path = root.join(format!("wiggle{n}.rs"));
+
+        std::fs::write(&path, ret.to_string()).unwrap();
+
+        // optimistically format the code but don't require success
+        drop(
+            std::process::Command::new("rustfmt")
+                .arg(&path)
+                .arg("--edition=2021")
+                .output(),
+        );
+
+        let path = path.to_str().unwrap();
+        ret = quote!(include!(#path););
+    }
+    TokenStream::from(ret)
 }
 
 #[proc_macro_attribute]
@@ -176,7 +202,6 @@ pub fn async_trait(attr: TokenStream, item: TokenStream) -> TokenStream {
     })
 }
 
-#[cfg(feature = "wasmtime")]
 /// Define the structs required to integrate a Wiggle implementation with Wasmtime.
 ///
 /// ## Arguments
@@ -188,18 +213,19 @@ pub fn async_trait(attr: TokenStream, item: TokenStream) -> TokenStream {
 pub fn wasmtime_integration(args: TokenStream) -> TokenStream {
     let config = parse_macro_input!(args as wiggle_generate::WasmtimeConfig);
     let doc = config.c.load_document();
-    let names = wiggle_generate::Names::new(quote!(wiggle));
 
     let settings = wiggle_generate::CodegenSettings::new(
         &config.c.errors,
         &config.c.async_,
         &doc,
-        cfg!(feature = "wasmtime"),
+        true,
+        &config.c.tracing,
+        config.c.mutable,
     )
     .expect("validating codegen settings");
 
     let modules = doc.modules().map(|module| {
-        wiggle_generate::wasmtime::link_module(&module, &names, Some(&config.target), &settings)
+        wiggle_generate::wasmtime::link_module(&module, Some(&config.target), &settings)
     });
     quote!( #(#modules)* ).into()
 }

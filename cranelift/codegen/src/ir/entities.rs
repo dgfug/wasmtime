@@ -23,7 +23,7 @@ use crate::entity::entity_impl;
 use core::fmt;
 use core::u32;
 #[cfg(feature = "enable-serde")]
-use serde::{Deserialize, Serialize};
+use serde_derive::{Deserialize, Serialize};
 
 /// An opaque reference to a [basic block](https://en.wikipedia.org/wiki/Basic_block) in a
 /// [`Function`](super::function::Function).
@@ -56,9 +56,10 @@ impl Block {
 /// [`InstBuilder`](super::InstBuilder) instructions:
 ///
 /// - [`iconst`](super::InstBuilder::iconst) for integer constants
+/// - [`f16const`](super::InstBuilder::f16const) for 16-bit float constants
 /// - [`f32const`](super::InstBuilder::f32const) for 32-bit float constants
 /// - [`f64const`](super::InstBuilder::f64const) for 64-bit float constants
-/// - [`bconst`](super::InstBuilder::bconst) for boolean constants
+/// - [`f128const`](super::InstBuilder::f128const) for 128-bit float constants
 /// - [`vconst`](super::InstBuilder::vconst) for vector constants
 /// - [`null`](super::InstBuilder::null) for null reference constants
 ///
@@ -88,12 +89,10 @@ impl Value {
 ///
 /// Most usage of `Inst` is internal. `Inst`ructions are returned by
 /// [`InstBuilder`](super::InstBuilder) instructions that do not return a
-/// [`Value`], such as control flow and trap instructions.
-///
-/// If you look around the API, you can find many inventive uses for `Inst`,
-/// such as [annotating specific instructions with a comment][inst_comment]
-/// or [performing reflection at compile time](super::DataFlowGraph::analyze_branch)
-/// on the type of instruction.
+/// [`Value`], such as control flow and trap instructions, as well as instructions that return a
+/// variable (potentially zero!) number of values, like call or call-indirect instructions. To get
+/// the `Value` of such instructions, use [`inst_results`](super::DataFlowGraph::inst_results) or
+/// its analogue in `cranelift_frontend::FuncBuilder`.
 ///
 /// [inst_comment]: https://github.com/bjorn3/rustc_codegen_cranelift/blob/0f8814fd6da3d436a90549d4bb19b94034f2b19c/src/pretty_clif.rs
 ///
@@ -109,7 +108,9 @@ entity_impl!(Inst, "inst");
 /// [call stack](https://en.wikipedia.org/wiki/Call_stack).
 ///
 /// `StackSlot`s can be created with
-/// [`FunctionBuilder::create_stackslot`](https://docs.rs/cranelift-frontend/*/cranelift_frontend/struct.FunctionBuilder.html#method.create_stack_slot).
+/// [`FunctionBuilder::create_sized_stack_slot`](https://docs.rs/cranelift-frontend/*/cranelift_frontend/struct.FunctionBuilder.html#method.create_sized_stack_slot)
+/// or
+/// [`FunctionBuilder::create_dynamic_stack_slot`](https://docs.rs/cranelift-frontend/*/cranelift_frontend/struct.FunctionBuilder.html#method.create_dynamic_stack_slot).
 ///
 /// `StackSlot`s are most often used with
 /// [`stack_addr`](super::InstBuilder::stack_addr),
@@ -135,20 +136,55 @@ impl StackSlot {
     }
 }
 
+/// An opaque reference to a dynamic stack slot.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+pub struct DynamicStackSlot(u32);
+entity_impl!(DynamicStackSlot, "dss");
+
+impl DynamicStackSlot {
+    /// Create a new stack slot reference from its number.
+    ///
+    /// This method is for use by the parser.
+    pub fn with_number(n: u32) -> Option<Self> {
+        if n < u32::MAX {
+            Some(Self(n))
+        } else {
+            None
+        }
+    }
+}
+
+/// An opaque reference to a dynamic type.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+pub struct DynamicType(u32);
+entity_impl!(DynamicType, "dt");
+
+impl DynamicType {
+    /// Create a new dynamic type reference from its number.
+    ///
+    /// This method is for use by the parser.
+    pub fn with_number(n: u32) -> Option<Self> {
+        if n < u32::MAX {
+            Some(Self(n))
+        } else {
+            None
+        }
+    }
+}
+
 /// An opaque reference to a global value.
 ///
-/// A `GlobalValue` is a [`Value`](Value) that will be live across the entire
+/// A `GlobalValue` is a [`Value`] that will be live across the entire
 /// function lifetime. It can be preloaded from other global values.
 ///
 /// You can create a `GlobalValue` in the following ways:
 ///
-/// - When compiling to WASM, you can use it to load values from a
-/// [`VmContext`](super::GlobalValueData::VMContext) using
-/// [`FuncEnvironment::make_global`](https://docs.rs/cranelift-wasm/*/cranelift_wasm/trait.FuncEnvironment.html#tymethod.make_global).
 /// - When compiling to native code, you can use it for objects in static memory with
-/// [`Module::declare_data_in_func`](https://docs.rs/cranelift-module/*/cranelift_module/trait.Module.html#method.declare_data_in_func).
+///   [`Module::declare_data_in_func`](https://docs.rs/cranelift-module/*/cranelift_module/trait.Module.html#method.declare_data_in_func).
 /// - For any compilation target, it can be registered with
-/// [`FunctionBuilder::create_global_value`](https://docs.rs/cranelift-frontend/*/cranelift_frontend/struct.FunctionBuilder.html#method.create_global_value).
+///   [`FunctionBuilder::create_global_value`](https://docs.rs/cranelift-frontend/*/cranelift_frontend/struct.FunctionBuilder.html#method.create_global_value).
 ///
 /// `GlobalValue`s can be retrieved with
 /// [`InstBuilder:global_value`](super::InstBuilder::global_value).
@@ -161,6 +197,29 @@ entity_impl!(GlobalValue, "gv");
 
 impl GlobalValue {
     /// Create a new global value reference from its number.
+    ///
+    /// This method is for use by the parser.
+    pub fn with_number(n: u32) -> Option<Self> {
+        if n < u32::MAX {
+            Some(Self(n))
+        } else {
+            None
+        }
+    }
+}
+
+/// An opaque reference to a memory type.
+///
+/// A `MemoryType` is a descriptor of a struct layout in memory, with
+/// types and proof-carrying-code facts optionally attached to the
+/// fields.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+pub struct MemoryType(u32);
+entity_impl!(MemoryType, "mt");
+
+impl MemoryType {
+    /// Create a new memory type reference from its number.
     ///
     /// This method is for use by the parser.
     pub fn with_number(n: u32) -> Option<Self> {
@@ -263,13 +322,10 @@ impl JumpTable {
 /// `FuncRef`s can be created with
 ///
 /// - [`FunctionBuilder::import_function`](https://docs.rs/cranelift-frontend/*/cranelift_frontend/struct.FunctionBuilder.html#method.import_function)
-/// for external functions
+///   for external functions
 /// - [`Module::declare_func_in_func`](https://docs.rs/cranelift-module/*/cranelift_module/trait.Module.html#method.declare_func_in_func)
-/// for functions declared elsewhere in the same native
-/// [`Module`](https://docs.rs/cranelift-module/*/cranelift_module/trait.Module.html)
-/// - [`FuncEnvironment::make_direct_func`](https://docs.rs/cranelift-wasm/*/cranelift_wasm/trait.FuncEnvironment.html#tymethod.make_direct_func)
-/// for functions declared in the same WebAssembly
-/// [`FuncEnvironment`](https://docs.rs/cranelift-wasm/*/cranelift_wasm/trait.FuncEnvironment.html#tymethod.make_direct_func)
+///   for functions declared elsewhere in the same native
+///   [`Module`](https://docs.rs/cranelift-module/*/cranelift_module/trait.Module.html)
 ///
 /// While the order is stable, it is arbitrary.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -290,10 +346,16 @@ impl FuncRef {
     }
 }
 
+/// A reference to an `UserExternalName`, declared with `Function::declare_imported_user_function`.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+pub struct UserExternalNameRef(u32);
+entity_impl!(UserExternalNameRef, "userextname");
+
 /// An opaque reference to a function [`Signature`](super::Signature).
 ///
 /// `SigRef`s are used to declare a function with
-/// [`FunctionBuiler::import_function`](https://docs.rs/cranelift-frontend/*/cranelift_frontend/struct.FunctionBuilder.html#method.import_function)
+/// [`FunctionBuilder::import_function`](https://docs.rs/cranelift-frontend/*/cranelift_frontend/struct.FunctionBuilder.html#method.import_function)
 /// as well as to make an [indirect function call](super::InstBuilder::call_indirect).
 ///
 /// `SigRef`s can be created with
@@ -322,59 +384,6 @@ impl SigRef {
     }
 }
 
-/// An opaque reference to a [heap](https://en.wikipedia.org/wiki/Memory_management#DYNAMIC).
-///
-/// Heaps are used to access dynamically allocated memory through
-/// [`heap_addr`](super::InstBuilder::heap_addr).
-///
-/// To create a heap, use [`FunctionBuilder::create_heap`](https://docs.rs/cranelift-frontend/*/cranelift_frontend/struct.FunctionBuilder.html#method.create_heap).
-///
-/// While the order is stable, it is arbitrary.
-#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
-pub struct Heap(u32);
-entity_impl!(Heap, "heap");
-
-impl Heap {
-    /// Create a new heap reference from its number.
-    ///
-    /// This method is for use by the parser.
-    pub fn with_number(n: u32) -> Option<Self> {
-        if n < u32::MAX {
-            Some(Self(n))
-        } else {
-            None
-        }
-    }
-}
-
-/// An opaque reference to a [WebAssembly
-/// table](https://developer.mozilla.org/en-US/docs/WebAssembly/Understanding_the_text_format#WebAssembly_tables).
-///
-/// `Table`s are used to store a list of function references.
-/// They can be created with [`FuncEnvironment::make_table`](https://docs.rs/cranelift-wasm/*/cranelift_wasm/trait.FuncEnvironment.html#tymethod.make_table).
-/// They can be used with
-/// [`FuncEnvironment::translate_call_indirect`](https://docs.rs/cranelift-wasm/*/cranelift_wasm/trait.FuncEnvironment.html#tymethod.translate_call_indirect).
-///
-/// While the order is stable, it is arbitrary.
-#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
-pub struct Table(u32);
-entity_impl!(Table, "table");
-
-impl Table {
-    /// Create a new table reference from its number.
-    ///
-    /// This method is for use by the parser.
-    pub fn with_number(n: u32) -> Option<Self> {
-        if n < u32::MAX {
-            Some(Self(n))
-        } else {
-            None
-        }
-    }
-}
-
 /// An opaque reference to any of the entities defined in this module that can appear in CLIF IR.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
@@ -389,8 +398,14 @@ pub enum AnyEntity {
     Value(Value),
     /// A stack slot.
     StackSlot(StackSlot),
+    /// A dynamic stack slot.
+    DynamicStackSlot(DynamicStackSlot),
+    /// A dynamic type
+    DynamicType(DynamicType),
     /// A Global value.
     GlobalValue(GlobalValue),
+    /// A memory type.
+    MemoryType(MemoryType),
     /// A jump table.
     JumpTable(JumpTable),
     /// A constant.
@@ -399,10 +414,6 @@ pub enum AnyEntity {
     FuncRef(FuncRef),
     /// A function call signature.
     SigRef(SigRef),
-    /// A heap.
-    Heap(Heap),
-    /// A table.
-    Table(Table),
     /// A function's stack limit
     StackLimit,
 }
@@ -415,13 +426,14 @@ impl fmt::Display for AnyEntity {
             Self::Inst(r) => r.fmt(f),
             Self::Value(r) => r.fmt(f),
             Self::StackSlot(r) => r.fmt(f),
+            Self::DynamicStackSlot(r) => r.fmt(f),
+            Self::DynamicType(r) => r.fmt(f),
             Self::GlobalValue(r) => r.fmt(f),
+            Self::MemoryType(r) => r.fmt(f),
             Self::JumpTable(r) => r.fmt(f),
             Self::Constant(r) => r.fmt(f),
             Self::FuncRef(r) => r.fmt(f),
             Self::SigRef(r) => r.fmt(f),
-            Self::Heap(r) => r.fmt(f),
-            Self::Table(r) => r.fmt(f),
             Self::StackLimit => write!(f, "stack_limit"),
         }
     }
@@ -457,9 +469,27 @@ impl From<StackSlot> for AnyEntity {
     }
 }
 
+impl From<DynamicStackSlot> for AnyEntity {
+    fn from(r: DynamicStackSlot) -> Self {
+        Self::DynamicStackSlot(r)
+    }
+}
+
+impl From<DynamicType> for AnyEntity {
+    fn from(r: DynamicType) -> Self {
+        Self::DynamicType(r)
+    }
+}
+
 impl From<GlobalValue> for AnyEntity {
     fn from(r: GlobalValue) -> Self {
         Self::GlobalValue(r)
+    }
+}
+
+impl From<MemoryType> for AnyEntity {
+    fn from(r: MemoryType) -> Self {
+        Self::MemoryType(r)
     }
 }
 
@@ -487,23 +517,10 @@ impl From<SigRef> for AnyEntity {
     }
 }
 
-impl From<Heap> for AnyEntity {
-    fn from(r: Heap) -> Self {
-        Self::Heap(r)
-    }
-}
-
-impl From<Table> for AnyEntity {
-    fn from(r: Table) -> Self {
-        Self::Table(r)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloc::string::ToString;
-    use core::u32;
 
     #[test]
     fn value_with_number() {
@@ -523,6 +540,14 @@ mod tests {
             mem::size_of::<Value>(),
             mem::size_of::<PackedOption<Value>>()
         );
+    }
+
+    #[test]
+    fn memory_option() {
+        use core::mem;
+        // PackedOption is used because Option<EntityRef> is twice as large
+        // as EntityRef. If this ever fails to be the case, this test will fail.
+        assert_eq!(mem::size_of::<Value>() * 2, mem::size_of::<Option<Value>>());
     }
 
     #[test]

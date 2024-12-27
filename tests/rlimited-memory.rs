@@ -2,7 +2,6 @@
 // but the original author did not have a machine available to test it.
 #![cfg(target_os = "linux")]
 
-use anyhow::Result;
 use wasmtime::*;
 
 #[derive(Default)]
@@ -13,30 +12,56 @@ struct MemoryGrowFailureDetector {
 }
 
 impl ResourceLimiter for MemoryGrowFailureDetector {
-    fn memory_growing(&mut self, current: usize, desired: usize, _maximum: Option<usize>) -> bool {
+    fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> Result<bool> {
         self.current = current;
         self.desired = desired;
-        true
+        Ok(true)
     }
-
-    fn memory_grow_failed(&mut self, err: &anyhow::Error) {
+    fn memory_grow_failed(&mut self, err: anyhow::Error) -> Result<()> {
         self.error = Some(err.to_string());
+        Ok(())
     }
-
-    fn table_growing(&mut self, _current: u32, _desired: u32, _maximum: Option<u32>) -> bool {
-        true
+    fn table_growing(
+        &mut self,
+        _current: usize,
+        _desired: usize,
+        _maximum: Option<usize>,
+    ) -> Result<bool> {
+        Ok(true)
     }
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn custom_limiter_detect_os_oom_failure() -> Result<()> {
     if std::env::var("WASMTIME_TEST_NO_HOG_MEMORY").is_ok() {
         return Ok(());
     }
 
+    // Skip this test if it looks like we're in a cross-compiled situation,
+    // and we're emulating this test for a different platform. In that
+    // scenario QEMU ignores the data rlimit, which this test relies on. See
+    // QEMU commits 5dfa88f7162f ("linux-user: do setrlimit selectively") and
+    // 055d92f8673c ("linux-user: do prlimit selectively") for more
+    // information.
+    if std::env::vars()
+        .filter(|(k, _v)| k.starts_with("CARGO_TARGET") && k.ends_with("RUNNER"))
+        .count()
+        > 0
+    {
+        return Ok(());
+    }
+
     // Default behavior of on-demand memory allocation so that a
     // memory grow will hit Linux for a larger mmap.
-    let engine = Engine::default();
+    let mut config = Config::new();
+    config.wasm_reference_types(false);
+    let engine = Engine::new(&config)?;
     let linker = Linker::new(&engine);
     let module = Module::new(&engine, r#"(module (memory (export "m") 0))"#).unwrap();
 
@@ -46,10 +71,10 @@ fn custom_limiter_detect_os_oom_failure() -> Result<()> {
         // limit process to 256MiB memory
         let rlimit = libc::rlimit {
             rlim_cur: 0,
-            rlim_max: process_max_memory as u64,
+            rlim_max: process_max_memory as libc::rlim_t,
         };
         let res = libc::setrlimit(libc::RLIMIT_DATA, &rlimit);
-        assert_eq!(res, 0, "setrlimit failed: {}", res);
+        assert_eq!(res, 0, "setrlimit failed: {res}");
     };
 
     let context = MemoryGrowFailureDetector::default();
@@ -74,8 +99,7 @@ fn custom_limiter_detect_os_oom_failure() -> Result<()> {
         .to_string();
     assert!(
         err_msg.starts_with("failed to grow memory"),
-        "unexpected error: {}",
-        err_msg
+        "unexpected error: {err_msg}"
     );
 
     assert_eq!(store.data().current, 10 * 64 * 1024);
@@ -86,9 +110,8 @@ fn custom_limiter_detect_os_oom_failure() -> Result<()> {
     // The memory_grow_failed hook should show Linux gave OOM:
     let err_msg = store.data().error.as_ref().unwrap();
     assert!(
-        err_msg.starts_with("System call failed: Cannot allocate memory"),
-        "unexpected error: {}",
-        err_msg
+        err_msg.starts_with("Cannot allocate memory"),
+        "unexpected error: {err_msg}"
     );
     Ok(())
 }

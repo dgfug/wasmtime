@@ -1,46 +1,37 @@
 //! The module that implements the `wasmtime wast` command.
 
-use crate::CommonOptions;
 use anyhow::{Context as _, Result};
+use clap::Parser;
 use std::path::PathBuf;
-use structopt::{clap::AppSettings, StructOpt};
 use wasmtime::{Engine, Store};
-use wasmtime_wast::WastContext;
-
-lazy_static::lazy_static! {
-    static ref AFTER_HELP: String = {
-        crate::FLAG_EXPLANATIONS.to_string()
-    };
-}
+use wasmtime_cli_flags::CommonOptions;
+use wasmtime_wast::{SpectestConfig, WastContext};
 
 /// Runs a WebAssembly test script file
-#[derive(StructOpt)]
-#[structopt(
-    name = "wast",
-    version = env!("CARGO_PKG_VERSION"),
-    setting = AppSettings::ColoredHelp,
-    after_help = AFTER_HELP.as_str(),
-)]
+#[derive(Parser)]
 pub struct WastCommand {
-    #[structopt(flatten)]
+    #[command(flatten)]
     common: CommonOptions,
 
     /// The path of the WebAssembly test script to run
-    #[structopt(required = true, value_name = "SCRIPT_FILE", parse(from_os_str))]
+    #[arg(required = true, value_name = "SCRIPT_FILE")]
     scripts: Vec<PathBuf>,
 }
 
 impl WastCommand {
     /// Executes the command.
-    pub fn execute(self) -> Result<()> {
-        self.common.init_logging();
+    pub fn execute(mut self) -> Result<()> {
+        self.common.init_logging()?;
 
         let config = self.common.config(None)?;
         let store = Store::new(&Engine::new(&config)?, ());
         let mut wast_context = WastContext::new(store);
 
         wast_context
-            .register_spectest()
+            .register_spectest(&SpectestConfig {
+                use_shared_memory: true,
+                suppress_prints: false,
+            })
             .expect("error instantiating \"spectest\"");
 
         for script in self.scripts.iter() {

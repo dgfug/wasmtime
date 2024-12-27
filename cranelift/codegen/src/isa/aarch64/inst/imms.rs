@@ -1,14 +1,9 @@
 //! AArch64 ISA definitions: immediate constants.
 
-// Some variants are never constructed, but we still want them as options in the future.
-#[allow(dead_code)]
 use crate::ir::types::*;
-use crate::ir::Type;
 use crate::isa::aarch64::inst::{OperandSize, ScalarSize};
+use crate::machinst::PrettyPrint;
 
-use regalloc::{PrettyPrint, RealRegUniverse};
-
-use core::convert::TryFrom;
 use std::string::String;
 
 /// An immediate that represents the NZCV flags.
@@ -25,6 +20,7 @@ pub struct NZCV {
 }
 
 impl NZCV {
+    /// Create a new NZCV flags representation.
     pub fn new(n: bool, z: bool, c: bool, v: bool) -> NZCV {
         NZCV { n, z, c, v }
     }
@@ -46,6 +42,7 @@ pub struct UImm5 {
 }
 
 impl UImm5 {
+    /// Create an unsigned 5-bit immediate from u8.
     pub fn maybe_from_u8(value: u8) -> Option<UImm5> {
         if value < 32 {
             Some(UImm5 { value })
@@ -89,11 +86,6 @@ impl SImm7Scaled {
         }
     }
 
-    /// Create a zero immediate of this format.
-    pub fn zero(scale_ty: Type) -> SImm7Scaled {
-        SImm7Scaled { value: 0, scale_ty }
-    }
-
     /// Bits for encoding.
     pub fn bits(&self) -> u32 {
         let ty_bytes: i16 = self.scale_ty.bytes() as i16;
@@ -105,13 +97,17 @@ impl SImm7Scaled {
     }
 }
 
+/// Floating-point unit immediate left shift.
 #[derive(Clone, Copy, Debug)]
 pub struct FPULeftShiftImm {
+    /// Shift amount.
     pub amount: u8,
+    /// Lane size in bits.
     pub lane_size_in_bits: u8,
 }
 
 impl FPULeftShiftImm {
+    /// Create a floating-point unit immediate left shift from u8.
     pub fn maybe_from_u8(amount: u8, lane_size_in_bits: u8) -> Option<Self> {
         debug_assert!(lane_size_in_bits == 32 || lane_size_in_bits == 64);
         if amount < lane_size_in_bits {
@@ -124,6 +120,7 @@ impl FPULeftShiftImm {
         }
     }
 
+    /// Returns the encoding of the immediate.
     pub fn enc(&self) -> u32 {
         debug_assert!(self.lane_size_in_bits.is_power_of_two());
         debug_assert!(self.lane_size_in_bits > self.amount);
@@ -145,13 +142,17 @@ impl FPULeftShiftImm {
     }
 }
 
+/// Floating-point unit immediate right shift.
 #[derive(Clone, Copy, Debug)]
 pub struct FPURightShiftImm {
+    /// Shift amount.
     pub amount: u8,
+    /// Lane size in bits.
     pub lane_size_in_bits: u8,
 }
 
 impl FPURightShiftImm {
+    /// Create a floating-point unit immediate right shift from u8.
     pub fn maybe_from_u8(amount: u8, lane_size_in_bits: u8) -> Option<Self> {
         debug_assert!(lane_size_in_bits == 32 || lane_size_in_bits == 64);
         if amount > 0 && amount <= lane_size_in_bits {
@@ -164,6 +165,7 @@ impl FPURightShiftImm {
         }
     }
 
+    /// Returns encoding of the immediate.
     pub fn enc(&self) -> u32 {
         debug_assert_ne!(0, self.amount);
         // The encoding of the immediate follows the table below,
@@ -176,7 +178,7 @@ impl FPURightShiftImm {
         // | 32                | 01xxxxx  |
         // | 64                | 1xxxxxx  |
         //
-        // The shift amount is negated such that a shift ammount
+        // The shift amount is negated such that a shift amount
         // of 1 (in 64-bit) is encoded as 0b111111 and a shift
         // amount of 64 is encoded as 0b000000,
         // in the bottom 6 bits.
@@ -203,11 +205,6 @@ impl SImm9 {
         }
     }
 
-    /// Create a zero immediate of this format.
-    pub fn zero() -> SImm9 {
-        SImm9 { value: 0 }
-    }
-
     /// Bits for encoding.
     pub fn bits(&self) -> u32 {
         (self.value as u32) & 0x1ff
@@ -223,18 +220,15 @@ impl SImm9 {
 #[derive(Clone, Copy, Debug)]
 pub struct UImm12Scaled {
     /// The value.
-    pub value: u16,
+    value: u16,
     /// multiplied by the size of this type
-    pub scale_ty: Type,
+    scale_ty: Type,
 }
 
 impl UImm12Scaled {
     /// Create a UImm12Scaled from a raw offset and the known scale type, if
     /// possible.
     pub fn maybe_from_i64(value: i64, scale_ty: Type) -> Option<UImm12Scaled> {
-        // Ensure the type is at least one byte.
-        let scale_ty = if scale_ty == B1 { B8 } else { scale_ty };
-
         let scale = scale_ty.bytes();
         assert!(scale.is_power_of_two());
         let scale = scale as i64;
@@ -263,16 +257,11 @@ impl UImm12Scaled {
     pub fn value(&self) -> u32 {
         self.value as u32
     }
-
-    /// The value type which is the scaling base.
-    pub fn scale_ty(&self) -> Type {
-        self.scale_ty
-    }
 }
 
 /// A shifted immediate value in 'imm12' format: supports 12 bits, shifted
 /// left by 0 or 12 places.
-#[derive(Clone, Debug)]
+#[derive(Copy, Clone, Debug)]
 pub struct Imm12 {
     /// The immediate bits.
     pub bits: u16,
@@ -283,31 +272,18 @@ pub struct Imm12 {
 impl Imm12 {
     /// Compute a Imm12 from raw bits, if possible.
     pub fn maybe_from_u64(val: u64) -> Option<Imm12> {
-        if val == 0 {
-            Some(Imm12 {
-                bits: 0,
-                shift12: false,
-            })
-        } else if val < 0xfff {
+        if val & !0xfff == 0 {
             Some(Imm12 {
                 bits: val as u16,
                 shift12: false,
             })
-        } else if val < 0xfff_000 && (val & 0xfff == 0) {
+        } else if val & !(0xfff << 12) == 0 {
             Some(Imm12 {
                 bits: (val >> 12) as u16,
                 shift12: true,
             })
         } else {
             None
-        }
-    }
-
-    /// Create a zero immediate of this format.
-    pub fn zero() -> Self {
-        Imm12 {
-            bits: 0,
-            shift12: false,
         }
     }
 
@@ -324,10 +300,20 @@ impl Imm12 {
     pub fn imm_bits(&self) -> u32 {
         self.bits as u32
     }
+
+    /// Get the actual value that this immediate corresponds to.
+    pub fn value(&self) -> u32 {
+        let base = self.bits as u32;
+        if self.shift12 {
+            base << 12
+        } else {
+            base
+        }
+    }
 }
 
 /// An immediate for logical instructions.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub struct ImmLogic {
     /// The actual value.
     value: u64,
@@ -549,41 +535,10 @@ impl ImmLogic {
         // For every ImmLogical immediate, the inverse can also be encoded.
         Self::maybe_from_u64(!self.value, self.size.to_ty()).unwrap()
     }
-
-    /// This provides a safe(ish) way to avoid the costs of `maybe_from_u64` when we want to
-    /// encode a constant that we know at compiler-build time.  It constructs an `ImmLogic` from
-    /// the fields `n`, `r`, `s` and `size`, but in a debug build, checks that `value_to_check`
-    /// corresponds to those four fields.  The intention is that, in a non-debug build, this
-    /// reduces to something small enough that it will be a candidate for inlining.
-    pub fn from_n_r_s(value_to_check: u64, n: bool, r: u8, s: u8, size: OperandSize) -> Self {
-        // Construct it from the components we got given.
-        let imml = Self {
-            value: value_to_check,
-            n,
-            r,
-            s,
-            size,
-        };
-
-        // In debug mode, check that `n`/`r`/`s` are correct, given `value` and `size`.
-        debug_assert!(match ImmLogic::maybe_from_u64(
-            value_to_check,
-            if size == OperandSize::Size64 {
-                I64
-            } else {
-                I32
-            }
-        ) {
-            None => false, // fail: `value` is unrepresentable
-            Some(imml_check) => imml_check == imml,
-        });
-
-        imml
-    }
 }
 
 /// An immediate for shift instructions.
-#[derive(Clone, Debug)]
+#[derive(Copy, Clone, Debug)]
 pub struct ImmShift {
     /// 6-bit shift amount.
     pub imm: u8,
@@ -649,6 +604,7 @@ impl MoveWideConst {
         None
     }
 
+    /// Create a `MoveWideCosnt` from a given shift, if possible.
     pub fn maybe_with_shift(imm: u16, shift: u8) -> Option<MoveWideConst> {
         let shift_enc = shift / 16;
         if shift_enc > 3 {
@@ -661,9 +617,9 @@ impl MoveWideConst {
         }
     }
 
-    /// Returns the value that this constant represents.
-    pub fn value(&self) -> u64 {
-        (self.bits as u64) << (16 * self.shift)
+    /// Create a zero immediate of this format.
+    pub fn zero() -> MoveWideConst {
+        MoveWideConst { bits: 0, shift: 0 }
     }
 }
 
@@ -794,7 +750,7 @@ impl ASIMDMovModImm {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ASIMDFPModImm {
     imm: u8,
-    is_64bit: bool,
+    size: ScalarSize,
 }
 
 impl ASIMDFPModImm {
@@ -803,6 +759,21 @@ impl ASIMDFPModImm {
         // In all cases immediates are encoded as an 8-bit number 0b_abcdefgh;
         // let `D` be the inverse of the digit `d`.
         match size {
+            ScalarSize::Size16 => {
+                // In this case the representable immediates are 16-bit numbers of the form
+                // 0b_aBbb_cdef_gh00_0000.
+                let value = value as u16;
+                let b0_5 = (value >> 6) & 0b111111;
+                let b6 = (value >> 6) & (1 << 6);
+                let b7 = (value >> 8) & (1 << 7);
+                let imm = (b0_5 | b6 | b7) as u8;
+
+                if value == Self::value16(imm) {
+                    Some(ASIMDFPModImm { imm, size })
+                } else {
+                    None
+                }
+            }
             ScalarSize::Size32 => {
                 // In this case the representable immediates are 32-bit numbers of the form
                 // 0b_aBbb_bbbc_defg_h000 shifted to the left by 16.
@@ -813,10 +784,7 @@ impl ASIMDFPModImm {
                 let imm = (b0_5 | b6 | b7) as u8;
 
                 if value == Self::value32(imm) {
-                    Some(ASIMDFPModImm {
-                        imm,
-                        is_64bit: false,
-                    })
+                    Some(ASIMDFPModImm { imm, size })
                 } else {
                     None
                 }
@@ -830,10 +798,7 @@ impl ASIMDFPModImm {
                 let imm = (b0_5 | b6 | b7) as u8;
 
                 if value == Self::value64(imm) {
-                    Some(ASIMDFPModImm {
-                        imm,
-                        is_64bit: true,
-                    })
+                    Some(ASIMDFPModImm { imm, size })
                 } else {
                     None
                 }
@@ -845,6 +810,17 @@ impl ASIMDFPModImm {
     /// Returns bits ready for encoding.
     pub fn enc_bits(&self) -> u8 {
         self.imm
+    }
+
+    /// Returns the 16-bit value that corresponds to an 8-bit encoding.
+    fn value16(imm: u8) -> u16 {
+        let imm = imm as u16;
+        let b0_5 = imm & 0b111111;
+        let b6 = (imm >> 6) & 1;
+        let b6_inv = b6 ^ 1;
+        let b7 = (imm >> 7) & 1;
+
+        b0_5 << 6 | (b6 * 0b11) << 12 | b6_inv << 14 | b7 << 15
     }
 
     /// Returns the 32-bit value that corresponds to an 8-bit encoding.
@@ -871,7 +847,7 @@ impl ASIMDFPModImm {
 }
 
 impl PrettyPrint for NZCV {
-    fn show_rru(&self, _mb_rru: Option<&RealRegUniverse>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         let fmt = |c: char, v| if v { c.to_ascii_uppercase() } else { c };
         format!(
             "#{}{}{}{}",
@@ -884,63 +860,63 @@ impl PrettyPrint for NZCV {
 }
 
 impl PrettyPrint for UImm5 {
-    fn show_rru(&self, _mb_rru: Option<&RealRegUniverse>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         format!("#{}", self.value)
     }
 }
 
 impl PrettyPrint for Imm12 {
-    fn show_rru(&self, _mb_rru: Option<&RealRegUniverse>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         let shift = if self.shift12 { 12 } else { 0 };
         let value = u32::from(self.bits) << shift;
-        format!("#{}", value)
+        format!("#{value}")
     }
 }
 
 impl PrettyPrint for SImm7Scaled {
-    fn show_rru(&self, _mb_rru: Option<&RealRegUniverse>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         format!("#{}", self.value)
     }
 }
 
 impl PrettyPrint for FPULeftShiftImm {
-    fn show_rru(&self, _mb_rru: Option<&RealRegUniverse>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         format!("#{}", self.amount)
     }
 }
 
 impl PrettyPrint for FPURightShiftImm {
-    fn show_rru(&self, _mb_rru: Option<&RealRegUniverse>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         format!("#{}", self.amount)
     }
 }
 
 impl PrettyPrint for SImm9 {
-    fn show_rru(&self, _mb_rru: Option<&RealRegUniverse>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         format!("#{}", self.value)
     }
 }
 
 impl PrettyPrint for UImm12Scaled {
-    fn show_rru(&self, _mb_rru: Option<&RealRegUniverse>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         format!("#{}", self.value)
     }
 }
 
 impl PrettyPrint for ImmLogic {
-    fn show_rru(&self, _mb_rru: Option<&RealRegUniverse>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         format!("#{}", self.value())
     }
 }
 
 impl PrettyPrint for ImmShift {
-    fn show_rru(&self, _mb_rru: Option<&RealRegUniverse>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         format!("#{}", self.imm)
     }
 }
 
 impl PrettyPrint for MoveWideConst {
-    fn show_rru(&self, _mb_rru: Option<&RealRegUniverse>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         if self.shift == 0 {
             format!("#{}", self.bits)
         } else {
@@ -950,7 +926,7 @@ impl PrettyPrint for MoveWideConst {
 }
 
 impl PrettyPrint for ASIMDMovModImm {
-    fn show_rru(&self, _mb_rru: Option<&RealRegUniverse>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         if self.is_64bit {
             debug_assert_eq!(self.shift, 0);
 
@@ -963,7 +939,7 @@ impl PrettyPrint for ASIMDMovModImm {
                 imm |= (-b as u8 as u64) << (i * 8);
             }
 
-            format!("#{}", imm)
+            format!("#{imm}")
         } else if self.shift == 0 {
             format!("#{}", self.imm)
         } else {
@@ -974,11 +950,22 @@ impl PrettyPrint for ASIMDMovModImm {
 }
 
 impl PrettyPrint for ASIMDFPModImm {
-    fn show_rru(&self, _mb_rru: Option<&RealRegUniverse>) -> String {
-        if self.is_64bit {
-            format!("#{}", f64::from_bits(Self::value64(self.imm)))
-        } else {
-            format!("#{}", f32::from_bits(Self::value32(self.imm)))
+    fn pretty_print(&self, _: u8) -> String {
+        match self.size {
+            ScalarSize::Size16 => {
+                // FIXME(#8312): Use `f16` once it is stable.
+                // `value` will always be a normal number. Convert it to a `f32`.
+                let value: u32 = Self::value16(self.imm).into();
+                let sign = (value & 0x8000) << 16;
+                // Adjust the exponent for the difference between the `f16` exponent bias and the
+                // `f32` exponent bias.
+                let exponent = ((value & 0x7c00) + ((127 - 15) << 10)) << 13;
+                let significand = (value & 0x3ff) << 13;
+                format!("#{}", f32::from_bits(sign | exponent | significand))
+            }
+            ScalarSize::Size32 => format!("#{}", f32::from_bits(Self::value32(self.imm))),
+            ScalarSize::Size64 => format!("#{}", f64::from_bits(Self::value64(self.imm))),
+            _ => unreachable!(),
         }
     }
 }

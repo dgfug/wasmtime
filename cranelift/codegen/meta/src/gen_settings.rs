@@ -1,7 +1,8 @@
 //! Generate the ISA-specific settings.
 use std::collections::HashMap;
 
-use cranelift_codegen_shared::constant_hash::{generate_table, simple_hash};
+use crate::constant_hash::generate_table;
+use cranelift_codegen_shared::constant_hash::simple_hash;
 
 use crate::cdsl::camel_case;
 use crate::cdsl::settings::{
@@ -20,7 +21,7 @@ pub(crate) enum ParentGroup {
 fn gen_constructor(group: &SettingGroup, parent: ParentGroup, fmt: &mut Formatter) {
     let args = match parent {
         ParentGroup::None => "builder: Builder",
-        ParentGroup::Shared => "shared: &settings::Flags, builder: Builder",
+        ParentGroup::Shared => "shared: &settings::Flags, builder: &Builder",
     };
     fmtln!(fmt, "impl Flags {");
     fmt.indent(|fmt| {
@@ -97,6 +98,26 @@ fn gen_iterator(group: &SettingGroup, fmt: &mut Formatter) {
     fmtln!(fmt, "}");
 }
 
+/// Generates a `all()` function with all options for this enum
+fn gen_enum_all(name: &str, values: &[&'static str], fmt: &mut Formatter) {
+    fmtln!(
+        fmt,
+        "/// Returns a slice with all possible [{}] values.",
+        name
+    );
+    fmtln!(fmt, "pub fn all() -> &'static [{}] {{", name);
+    fmt.indent(|fmt| {
+        fmtln!(fmt, "&[");
+        fmt.indent(|fmt| {
+            for v in values.iter() {
+                fmtln!(fmt, "Self::{},", camel_case(v));
+            }
+        });
+        fmtln!(fmt, "]");
+    });
+    fmtln!(fmt, "}");
+}
+
 /// Emit Display and FromStr implementations for enum settings.
 fn gen_to_and_from_str(name: &str, values: &[&'static str], fmt: &mut Formatter) {
     fmtln!(fmt, "impl fmt::Display for {} {{", name);
@@ -118,7 +139,7 @@ fn gen_to_and_from_str(name: &str, values: &[&'static str], fmt: &mut Formatter)
     });
     fmtln!(fmt, "}");
 
-    fmtln!(fmt, "impl str::FromStr for {} {{", name);
+    fmtln!(fmt, "impl core::str::FromStr for {} {{", name);
     fmt.indent(|fmt| {
         fmtln!(fmt, "type Err = ();");
         fmtln!(fmt, "fn from_str(s: &str) -> Result<Self, Self::Err> {");
@@ -151,9 +172,15 @@ fn gen_enum_types(group: &SettingGroup, fmt: &mut Formatter) {
         fmtln!(fmt, "pub enum {} {{", name);
         fmt.indent(|fmt| {
             for v in values.iter() {
-                fmt.doc_comment(format!("`{}`.", v));
+                fmt.doc_comment(format!("`{v}`."));
                 fmtln!(fmt, "{},", camel_case(v));
             }
+        });
+        fmtln!(fmt, "}");
+
+        fmtln!(fmt, "impl {} {{", name);
+        fmt.indent(|fmt| {
+            gen_enum_all(&name, values, fmt);
         });
         fmtln!(fmt, "}");
 
@@ -180,7 +207,7 @@ fn gen_getter(setting: &Setting, fmt: &mut Formatter) {
             fmt.indent(|fmt| {
                 let mut m = Match::new(format!("self.bytes[{}]", setting.byte_offset));
                 for (i, v) in values.iter().enumerate() {
-                    m.arm_no_fields(format!("{}", i), format!("{}::{}", ty, camel_case(v)));
+                    m.arm_no_fields(format!("{i}"), format!("{}::{}", ty, camel_case(v)));
                 }
                 m.arm_no_fields("_", "panic!(\"Invalid enum value\")");
                 fmt.add_match(m);
@@ -240,10 +267,10 @@ fn gen_getters(group: &SettingGroup, fmt: &mut Formatter) {
         }
 
         for setting in &group.settings {
-            gen_getter(&setting, fmt);
+            gen_getter(setting, fmt);
         }
         for predicate in &group.predicates {
-            gen_pred_getter(&predicate, &group, fmt);
+            gen_pred_getter(predicate, group, fmt);
         }
     });
     fmtln!(fmt, "}");
@@ -337,8 +364,8 @@ fn gen_descriptors(group: &SettingGroup, fmt: &mut Formatter) {
 
     // Generate hash table.
     let mut hash_entries: Vec<SettingOrPreset> = Vec::new();
-    hash_entries.extend(group.settings.iter().map(|x| SettingOrPreset::Setting(x)));
-    hash_entries.extend(group.presets.iter().map(|x| SettingOrPreset::Preset(x)));
+    hash_entries.extend(group.settings.iter().map(SettingOrPreset::Setting));
+    hash_entries.extend(group.presets.iter().map(SettingOrPreset::Preset));
 
     let hash_table = generate_table(hash_entries.iter(), hash_entries.len(), |entry| {
         simple_hash(entry.name())
@@ -369,8 +396,12 @@ fn gen_descriptors(group: &SettingGroup, fmt: &mut Formatter) {
     );
     fmt.indent(|fmt| {
         for preset in &group.presets {
-            fmt.comment(preset.name);
-            for (mask, value) in preset.layout(&group) {
+            fmt.comment(format!(
+                "{}: {}",
+                preset.name,
+                preset.setting_names(group).collect::<Vec<_>>().join(", ")
+            ));
+            for (mask, value) in preset.layout(group) {
                 fmtln!(fmt, "(0b{:08b}, 0b{:08b}),", mask, value);
             }
         }
@@ -384,10 +415,7 @@ fn gen_template(group: &SettingGroup, fmt: &mut Formatter) {
         *default_bytes.get_mut(setting.byte_offset as usize).unwrap() |= setting.default_byte();
     }
 
-    let default_bytes: Vec<String> = default_bytes
-        .iter()
-        .map(|x| format!("{:#04x}", x))
-        .collect();
+    let default_bytes: Vec<String> = default_bytes.iter().map(|x| format!("{x:#04x}")).collect();
     let default_bytes_str = default_bytes.join(", ");
 
     fmtln!(
@@ -468,10 +496,10 @@ pub(crate) fn generate(
     settings: &SettingGroup,
     parent_group: ParentGroup,
     filename: &str,
-    out_dir: &str,
+    out_dir: &std::path::Path,
 ) -> Result<(), error::Error> {
     let mut fmt = Formatter::new();
-    gen_group(&settings, parent_group, &mut fmt);
+    gen_group(settings, parent_group, &mut fmt);
     fmt.update_file(filename, out_dir)?;
     Ok(())
 }

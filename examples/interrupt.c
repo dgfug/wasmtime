@@ -7,7 +7,6 @@ You can compile and run this example on Linux with:
    cargo build --release -p wasmtime-c-api
    cc examples/interrupt.c \
        -I crates/c-api/include \
-       -I crates/c-api/wasm-c-api/include \
        target/release/libwasmtime.a \
        -lpthread -ldl -lm \
        -o interrupt
@@ -16,6 +15,11 @@ You can compile and run this example on Linux with:
 Note that on Windows and macOS the command will be similar, but you'll need
 to tweak the `-lpthread` and such annotations as well as the name of the
 `libwasmtime.a` file on Windows.
+
+You can also build using cmake:
+
+mkdir build && cd build && cmake .. && \
+  cmake --build . --target wasmtime-interrupt
 */
 
 #include <assert.h>
@@ -25,59 +29,60 @@ to tweak the `-lpthread` and such annotations as well as the name of the
 #include <wasmtime.h>
 
 #ifdef _WIN32
-static void spawn_interrupt(wasmtime_interrupt_handle_t *handle) {
-  wasmtime_interrupt_handle_interrupt(handle);
-  wasmtime_interrupt_handle_delete(handle);
+static void spawn_interrupt(wasm_engine_t *engine) {
+  wasmtime_engine_increment_epoch(engine);
 }
 #else
 #include <pthread.h>
 #include <time.h>
 
-static void* helper(void *_handle) {
-  wasmtime_interrupt_handle_t *handle = _handle;
+static void *helper(void *_engine) {
+  wasm_engine_t *engine = _engine;
   struct timespec sleep_dur;
   sleep_dur.tv_sec = 1;
   sleep_dur.tv_nsec = 0;
   nanosleep(&sleep_dur, NULL);
   printf("Sending an interrupt\n");
-  wasmtime_interrupt_handle_interrupt(handle);
-  wasmtime_interrupt_handle_delete(handle);
+  wasmtime_engine_increment_epoch(engine);
   return 0;
 }
 
-static void spawn_interrupt(wasmtime_interrupt_handle_t *handle) {
+static void spawn_interrupt(wasm_engine_t *engine) {
   pthread_t child;
-  int rc = pthread_create(&child, NULL, helper, handle);
+  int rc = pthread_create(&child, NULL, helper, engine);
   assert(rc == 0);
 }
 #endif
 
-static void exit_with_error(const char *message, wasmtime_error_t *error, wasm_trap_t *trap);
+static void exit_with_error(const char *message, wasmtime_error_t *error,
+                            wasm_trap_t *trap);
 
 int main() {
   // Create a `wasm_store_t` with interrupts enabled
   wasm_config_t *config = wasm_config_new();
   assert(config != NULL);
-  wasmtime_config_interruptable_set(config, true);
+  wasmtime_config_epoch_interruption_set(config, true);
   wasm_engine_t *engine = wasm_engine_new_with_config(config);
   assert(engine != NULL);
   wasmtime_store_t *store = wasmtime_store_new(engine, NULL, NULL);
   assert(store != NULL);
   wasmtime_context_t *context = wasmtime_store_context(store);
 
-  // Create our interrupt handle we'll use later
-  wasmtime_interrupt_handle_t *handle = wasmtime_interrupt_handle_new(context);
-  assert(handle != NULL);
+  // Configure the epoch deadline after which WebAssembly code will trap.
+  wasmtime_context_set_epoch_deadline(context, 1);
 
   // Read our input file, which in this case is a wasm text file.
-  FILE* file = fopen("examples/interrupt.wat", "r");
+  FILE *file = fopen("examples/interrupt.wat", "r");
   assert(file != NULL);
   fseek(file, 0L, SEEK_END);
   size_t file_size = ftell(file);
   fseek(file, 0L, SEEK_SET);
   wasm_byte_vec_t wat;
   wasm_byte_vec_new_uninitialized(&wat, file_size);
-  assert(fread(wat.data, file_size, 1, file) == 1);
+  if (fread(wat.data, file_size, 1, file) != 1) {
+    printf("> Error loading module!\n");
+    return 1;
+  }
   fclose(file);
 
   // Parse the wat into the binary wasm format
@@ -89,7 +94,7 @@ int main() {
 
   // Now that we've got our binary webassembly we can compile our module.
   wasmtime_module_t *module = NULL;
-  error = wasmtime_module_new(engine, (uint8_t*) wasm.data, wasm.size, &module);
+  error = wasmtime_module_new(engine, (uint8_t *)wasm.data, wasm.size, &module);
   wasm_byte_vec_delete(&wasm);
   if (error != NULL)
     exit_with_error("failed to compile module", error, NULL);
@@ -108,7 +113,7 @@ int main() {
   assert(run.kind == WASMTIME_EXTERN_FUNC);
 
   // Spawn a thread to send us an interrupt after a period of time.
-  spawn_interrupt(handle);
+  spawn_interrupt(engine);
 
   // And call it!
   printf("Entering infinite loop...\n");
@@ -117,19 +122,13 @@ int main() {
   assert(trap != NULL);
   printf("Got a trap!...\n");
 
-  // `trap` can be inspected here to see the trap message has an interrupt in it
-  wasmtime_trap_code_t code;
-  ok = wasmtime_trap_code(trap, &code);
-  assert(ok);
-  assert(code == WASMTIME_TRAP_CODE_INTERRUPT);
-  wasm_trap_delete(trap);
-
   wasmtime_store_delete(store);
   wasm_engine_delete(engine);
   return 0;
 }
 
-static void exit_with_error(const char *message, wasmtime_error_t *error, wasm_trap_t *trap) {
+static void exit_with_error(const char *message, wasmtime_error_t *error,
+                            wasm_trap_t *trap) {
   fprintf(stderr, "error: %s\n", message);
   wasm_byte_vec_t error_message;
   if (error != NULL) {
@@ -139,7 +138,7 @@ static void exit_with_error(const char *message, wasmtime_error_t *error, wasm_t
     wasm_trap_message(trap, &error_message);
     wasm_trap_delete(trap);
   }
-  fprintf(stderr, "%.*s\n", (int) error_message.size, error_message.data);
+  fprintf(stderr, "%.*s\n", (int)error_message.size, error_message.data);
   wasm_byte_vec_delete(&error_message);
   exit(1);
 }

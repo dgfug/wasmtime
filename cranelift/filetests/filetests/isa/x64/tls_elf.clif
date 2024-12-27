@@ -1,4 +1,4 @@
-test compile
+test compile precise-output
 set tls_model=elf_gd
 target x86_64
 
@@ -10,9 +10,23 @@ block0(v0: i32):
     return v1
 }
 
-; check:  pushq   %rbp
-; nextln: movq    %rsp, %rbp
-; nextln: elf_tls_get_addr User { namespace: 1, index: 0 }
-; nextln: movq    %rbp, %rsp
-; nextln: popq    %rbp
-; nextln: ret
+; VCode:
+;   pushq   %rbp
+;   movq    %rsp, %rbp
+; block0:
+;   %rax = elf_tls_get_addr User(userextname0)
+;   movq    %rbp, %rsp
+;   popq    %rbp
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   pushq %rbp
+;   movq %rsp, %rbp
+; block1: ; offset 0x4
+;   leaq (%rip), %rdi ; reloc_external ElfX86_64TlsGd u1:0 -4
+;   callq 0x14 ; reloc_external CallPLTRel4 %ElfTlsGetAddr -4
+;   movq %rbp, %rsp
+;   popq %rbp
+;   retq
+

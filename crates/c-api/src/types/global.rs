@@ -1,5 +1,5 @@
 use crate::{wasm_externtype_t, wasm_valtype_t, CExternType};
-use once_cell::unsync::OnceCell;
+use std::cell::OnceCell;
 use wasmtime::GlobalType;
 
 pub type wasm_mutability_t = u8;
@@ -24,7 +24,7 @@ pub(crate) struct CGlobalType {
 impl wasm_globaltype_t {
     pub(crate) fn new(ty: GlobalType) -> wasm_globaltype_t {
         wasm_globaltype_t {
-            ext: wasm_externtype_t::new(ty.into()),
+            ext: wasm_externtype_t::from_extern_type(ty.into()),
         }
     }
 

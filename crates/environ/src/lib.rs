@@ -3,88 +3,72 @@
 //! the translation the base addresses of regions of memory that will hold the globals, tables and
 //! linear memories.
 
-#![deny(missing_docs, trivial_numeric_casts, unused_extern_crates)]
-#![warn(unused_import_braces)]
-#![cfg_attr(feature = "clippy", plugin(clippy(conf_file = "../../clippy.toml")))]
-#![cfg_attr(
-    feature = "cargo-clippy",
-    allow(clippy::new_without_default, clippy::new_without_default)
-)]
-#![cfg_attr(
-    feature = "cargo-clippy",
-    warn(
-        clippy::float_arithmetic,
-        clippy::mut_mut,
-        clippy::nonminimal_bool,
-        clippy::map_unwrap_or,
-        clippy::clippy::print_stdout,
-        clippy::unicode_not_nfc,
-        clippy::use_self
-    )
-)]
+#![deny(missing_docs, warnings)]
+#![warn(clippy::cast_sign_loss)]
+#![no_std]
+
+#[cfg(feature = "std")]
+#[macro_use]
+extern crate std;
+extern crate alloc;
+
+pub mod prelude;
 
 mod address_map;
+#[macro_use]
 mod builtin;
-mod compilation;
+mod demangling;
+mod error;
+mod ext;
+mod gc;
+mod hostcall;
 mod module;
-mod module_environ;
+mod module_artifacts;
+mod module_types;
 pub mod obj;
+mod ref_bits;
+mod scopevec;
 mod stack_map;
 mod trap_encoding;
 mod tunables;
+mod types;
 mod vmoffsets;
 
+pub use self::ext::*;
 pub use crate::address_map::*;
 pub use crate::builtin::*;
-pub use crate::compilation::*;
+pub use crate::demangling::*;
+pub use crate::error::*;
+pub use crate::gc::*;
+pub use crate::hostcall::*;
 pub use crate::module::*;
-pub use crate::module_environ::*;
+pub use crate::module_artifacts::*;
+pub use crate::module_types::*;
+pub use crate::ref_bits::*;
+pub use crate::scopevec::ScopeVec;
 pub use crate::stack_map::StackMap;
 pub use crate::trap_encoding::*;
-pub use crate::tunables::Tunables;
+pub use crate::tunables::*;
+pub use crate::types::*;
 pub use crate::vmoffsets::*;
 pub use object;
+
+pub use wasmparser;
+
+#[cfg(feature = "compile")]
+mod compile;
+#[cfg(feature = "compile")]
+pub use crate::compile::*;
+
+#[cfg(feature = "component-model")]
+pub mod component;
+#[cfg(all(feature = "component-model", feature = "compile"))]
+pub mod fact;
 
 // Reexport all of these type-level since they're quite commonly used and it's
 // much easier to refer to everything through one crate rather than importing
 // one of three and making sure you're using the right one.
 pub use cranelift_entity::*;
-pub use wasmtime_types::*;
-
-/// WebAssembly page sizes are defined to be 64KiB.
-pub const WASM_PAGE_SIZE: u32 = 0x10000;
-
-/// The number of pages (for 32-bit modules) we can have before we run out of
-/// byte index space.
-pub const WASM32_MAX_PAGES: u64 = 1 << 16;
-/// The number of pages (for 64-bit modules) we can have before we run out of
-/// byte index space.
-pub const WASM64_MAX_PAGES: u64 = 1 << 48;
 
 /// Version number of this crate.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// Iterates through all `LibCall` members and all runtime exported functions.
-#[macro_export]
-macro_rules! for_each_libcall {
-    ($op:ident) => {
-        $op![
-            (UdivI64, wasmtime_i64_udiv),
-            (UdivI64, wasmtime_i64_udiv),
-            (SdivI64, wasmtime_i64_sdiv),
-            (UremI64, wasmtime_i64_urem),
-            (SremI64, wasmtime_i64_srem),
-            (IshlI64, wasmtime_i64_ishl),
-            (UshrI64, wasmtime_i64_ushr),
-            (SshrI64, wasmtime_i64_sshr),
-            (CeilF32, wasmtime_f32_ceil),
-            (FloorF32, wasmtime_f32_floor),
-            (TruncF32, wasmtime_f32_trunc),
-            (NearestF32, wasmtime_f32_nearest),
-            (CeilF64, wasmtime_f64_ceil),
-            (FloorF64, wasmtime_f64_floor),
-            (TruncF64, wasmtime_f64_trunc),
-            (NearestF64, wasmtime_f64_nearest)
-        ];
-    };
-}

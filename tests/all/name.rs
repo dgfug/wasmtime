@@ -1,3 +1,5 @@
+#![cfg(not(miri))]
+
 use wasmtime::*;
 
 #[test]
@@ -26,9 +28,6 @@ fn test_module_name() -> anyhow::Result<()> {
 
     let module = Module::new(&engine, wat)?;
     assert_eq!(module.name(), Some("from_name_section"));
-
-    let module = Module::new_with_name(&engine, wat, "override")?;
-    assert_eq!(module.name(), Some("override"));
 
     Ok(())
 }

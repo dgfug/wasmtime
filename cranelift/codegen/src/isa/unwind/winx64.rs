@@ -1,44 +1,20 @@
 //! Windows x64 ABI unwind information.
 
-use crate::result::{CodegenError, CodegenResult};
 use alloc::vec::Vec;
 use log::warn;
 #[cfg(feature = "enable-serde")]
-use serde::{Deserialize, Serialize};
+use serde_derive::{Deserialize, Serialize};
 
 use crate::binemit::CodeOffset;
 use crate::isa::unwind::UnwindInst;
+use crate::result::{CodegenError, CodegenResult};
+
+use super::Writer;
 
 /// Maximum (inclusive) size of a "small" stack allocation
 const SMALL_ALLOC_MAX_SIZE: u32 = 128;
 /// Maximum (inclusive) size of a "large" stack allocation that can represented in 16-bits
 const LARGE_ALLOC_16BIT_MAX_SIZE: u32 = 524280;
-
-struct Writer<'a> {
-    buf: &'a mut [u8],
-    offset: usize,
-}
-
-impl<'a> Writer<'a> {
-    pub fn new(buf: &'a mut [u8]) -> Self {
-        Self { buf, offset: 0 }
-    }
-
-    fn write_u8(&mut self, v: u8) {
-        self.buf[self.offset] = v;
-        self.offset += 1;
-    }
-
-    fn write_u16_le(&mut self, v: u16) {
-        self.buf[self.offset..(self.offset + 2)].copy_from_slice(&v.to_le_bytes());
-        self.offset += 2;
-    }
-
-    fn write_u32_le(&mut self, v: u32) {
-        self.buf[self.offset..(self.offset + 4)].copy_from_slice(&v.to_le_bytes());
-        self.offset += 4;
-    }
-}
 
 /// The supported unwind codes for the x64 Windows ABI.
 ///
@@ -262,7 +238,7 @@ impl UnwindInfo {
 
 const UNWIND_RBP_REG: u8 = 5;
 
-pub(crate) fn create_unwind_info_from_insts<MR: RegisterMapper<regalloc::Reg>>(
+pub(crate) fn create_unwind_info_from_insts<MR: RegisterMapper<crate::machinst::Reg>>(
     insts: &[(CodeOffset, UnwindInst)],
 ) -> CodegenResult<UnwindInfo> {
     let mut unwind_codes = vec![];
@@ -293,7 +269,7 @@ pub(crate) fn create_unwind_info_from_insts<MR: RegisterMapper<regalloc::Reg>>(
             &UnwindInst::SaveReg {
                 clobber_offset,
                 reg,
-            } => match MR::map(reg.to_reg()) {
+            } => match MR::map(reg.into()) {
                 MappedRegister::Int(reg) => {
                     unwind_codes.push(UnwindCode::SaveReg {
                         instruction_offset,
@@ -309,6 +285,9 @@ pub(crate) fn create_unwind_info_from_insts<MR: RegisterMapper<regalloc::Reg>>(
                     });
                 }
             },
+            &UnwindInst::RegStackOffset { .. } => {
+                unreachable!("only supported with DWARF");
+            }
             &UnwindInst::Aarch64SetPointerAuth { .. } => {
                 unreachable!("no aarch64 on x64");
             }

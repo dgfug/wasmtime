@@ -29,22 +29,7 @@
 //!   references allocated from an associated memory pool. It has a much smaller footprint than
 //!   `Vec`.
 
-#![deny(missing_docs, trivial_numeric_casts, unused_extern_crates)]
-#![warn(unused_import_braces)]
-#![cfg_attr(feature = "clippy", plugin(clippy(conf_file = "../../clippy.toml")))]
-#![cfg_attr(feature = "cargo-clippy", allow(clippy::new_without_default))]
-#![cfg_attr(
-    feature = "cargo-clippy",
-    warn(
-        clippy::float_arithmetic,
-        clippy::mut_mut,
-        clippy::nonminimal_bool,
-        clippy::map_unwrap_or,
-        clippy::clippy::print_stdout,
-        clippy::unicode_not_nfc,
-        clippy::use_self
-    )
-)]
+#![deny(missing_docs)]
 #![no_std]
 
 extern crate alloc;
@@ -52,6 +37,9 @@ extern crate alloc;
 // Re-export core so that the macros works with both std and no_std crates
 #[doc(hidden)]
 pub extern crate core as __core;
+
+use core::iter::FusedIterator;
+use core::ops::Range;
 
 /// A type wrapping a small integer index should implement `EntityRef` so it can be used as the key
 /// of an `SecondaryMap` or `SparseMap`.
@@ -62,6 +50,67 @@ pub trait EntityRef: Copy + Eq {
 
     /// Get the index that was used to create this entity reference.
     fn index(self) -> usize;
+}
+
+/// Iterate over a `Range<E: EntityRef>`, yielding a sequence of `E` items.
+#[inline]
+pub fn iter_entity_range<E>(range: Range<E>) -> IterEntityRange<E>
+where
+    E: EntityRef,
+{
+    IterEntityRange {
+        range: range.start.index()..range.end.index(),
+        _phantom: core::marker::PhantomData,
+    }
+}
+
+/// Iterator type returned by `iter_entity_range`.
+pub struct IterEntityRange<E> {
+    range: Range<usize>,
+    _phantom: core::marker::PhantomData<E>,
+}
+
+impl<E> Iterator for IterEntityRange<E>
+where
+    E: EntityRef,
+{
+    type Item = E;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let i = self.range.next()?;
+        Some(E::new(i))
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.range.size_hint()
+    }
+}
+
+impl<E> DoubleEndedIterator for IterEntityRange<E>
+where
+    E: EntityRef,
+{
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let i = self.range.next_back()?;
+        Some(E::new(i))
+    }
+}
+
+impl<E> FusedIterator for IterEntityRange<E>
+where
+    E: EntityRef,
+    Range<usize>: FusedIterator,
+{
+}
+
+impl<E> ExactSizeIterator for IterEntityRange<E>
+where
+    E: EntityRef,
+    Range<usize>: ExactSizeIterator,
+{
 }
 
 /// Macro which provides the common implementation of a 32-bit entity reference.
@@ -96,7 +145,7 @@ macro_rules! entity_impl {
 
         impl $entity {
             /// Create a new instance from a `u32`.
-            #[allow(dead_code)]
+            #[allow(dead_code, reason = "macro-generated code")]
             #[inline]
             pub fn from_u32(x: u32) -> Self {
                 debug_assert!(x < $crate::__core::u32::MAX);
@@ -104,10 +153,24 @@ macro_rules! entity_impl {
             }
 
             /// Return the underlying index value as a `u32`.
-            #[allow(dead_code)]
+            #[allow(dead_code, reason = "macro-generated code")]
             #[inline]
             pub fn as_u32(self) -> u32 {
                 self.0
+            }
+
+            /// Return the raw bit encoding for this instance.
+            #[allow(dead_code, reason = "macro-generated code")]
+            #[inline]
+            pub fn as_bits(self) -> u32 {
+                self.0
+            }
+
+            /// Create a new instance from the raw bit encoding.
+            #[allow(dead_code, reason = "macro-generated code")]
+            #[inline]
+            pub fn from_bits(x: u32) -> Self {
+                $entity(x)
             }
         }
     };
@@ -162,7 +225,7 @@ macro_rules! entity_impl {
 
         impl $entity {
             /// Create a new instance from a `u32`.
-            #[allow(dead_code)]
+            #[allow(dead_code, reason = "macro-generated code")]
             #[inline]
             pub fn from_u32(x: u32) -> Self {
                 debug_assert!(x < $crate::__core::u32::MAX);
@@ -171,7 +234,7 @@ macro_rules! entity_impl {
             }
 
             /// Return the underlying index value as a `u32`.
-            #[allow(dead_code)]
+            #[allow(dead_code, reason = "macro-generated code")]
             #[inline]
             pub fn as_u32(self) -> u32 {
                 let $arg = self;
@@ -202,7 +265,9 @@ mod list;
 mod map;
 mod primary;
 mod set;
+mod signed;
 mod sparse;
+mod unsigned;
 
 pub use self::boxed_slice::BoxedSlice;
 pub use self::iter::{Iter, IterMut};
@@ -211,7 +276,9 @@ pub use self::list::{EntityList, ListPool};
 pub use self::map::SecondaryMap;
 pub use self::primary::PrimaryMap;
 pub use self::set::EntitySet;
+pub use self::signed::Signed;
 pub use self::sparse::{SparseMap, SparseMapValue, SparseSet};
+pub use self::unsigned::Unsigned;
 
 /// A collection of tests to ensure that use of the different `entity_impl!` forms will generate
 /// `EntityRef` implementations that behave the same way.
@@ -240,6 +307,7 @@ mod tests {
             }
 
             #[should_panic]
+            #[cfg(debug_assertions)]
             #[test]
             fn cannot_construct_from_reserved_u32() {
                 use crate::packed_option::ReservedValue;
@@ -248,6 +316,7 @@ mod tests {
             }
 
             #[should_panic]
+            #[cfg(debug_assertions)]
             #[test]
             fn cannot_construct_from_reserved_usize() {
                 use crate::packed_option::ReservedValue;
@@ -277,7 +346,7 @@ mod tests {
         #[test]
         fn display_prefix_works() {
             let e = PrefixEntity::new(0);
-            assert_eq!(alloc::format!("{}", e), "prefix-0");
+            assert_eq!(alloc::format!("{e}"), "prefix-0");
         }
     }
 
@@ -308,7 +377,7 @@ mod tests {
         #[test]
         fn display_prefix_works() {
             let e = InnerEntity::new(0);
-            assert_eq!(alloc::format!("{}", e), "inner-0");
+            assert_eq!(alloc::format!("{e}"), "inner-0");
         }
     }
 }

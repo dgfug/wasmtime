@@ -1,31 +1,22 @@
 //! Cranelift umbrella crate, providing a convenient one-line dependency.
 
-#![deny(
-    missing_docs,
-    trivial_numeric_casts,
-    unused_extern_crates,
-    unstable_features
-)]
-#![warn(unused_import_braces)]
-#![cfg_attr(feature = "clippy", plugin(clippy(conf_file = "../../clippy.toml")))]
-#![cfg_attr(feature = "cargo-clippy", allow(clippy::new_without_default))]
-#![cfg_attr(
-    feature = "cargo-clippy",
-    warn(
-        clippy::float_arithmetic,
-        clippy::mut_mut,
-        clippy::nonminimal_bool,
-        clippy::map_unwrap_or,
-        clippy::clippy::print_stdout,
-        clippy::unicode_not_nfc,
-        clippy::use_self
-    )
-)]
+#![deny(missing_docs)]
 #![no_std]
 
 /// Provide these crates, renamed to reduce stutter.
 pub use cranelift_codegen as codegen;
+#[cfg(feature = "frontend")]
 pub use cranelift_frontend as frontend;
+#[cfg(feature = "interpreter")]
+pub use cranelift_interpreter as interpreter;
+#[cfg(feature = "jit")]
+pub use cranelift_jit as jit;
+#[cfg(feature = "module")]
+pub use cranelift_module as module;
+#[cfg(feature = "native")]
+pub use cranelift_native as native;
+#[cfg(feature = "object")]
+pub use cranelift_object as object;
 
 /// A prelude providing convenient access to commonly-used cranelift features. Use
 /// as `use cranelift::prelude::*`.
@@ -42,6 +33,7 @@ pub mod prelude {
     pub use crate::codegen::isa;
     pub use crate::codegen::settings::{self, Configurable};
 
+    #[cfg(feature = "frontend")]
     pub use crate::frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 }
 

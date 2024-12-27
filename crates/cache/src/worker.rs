@@ -7,7 +7,7 @@
 
 use super::{fs_write_atomic, CacheConfig};
 use log::{debug, info, trace, warn};
-use serde::{Deserialize, Serialize};
+use serde_derive::{Deserialize, Serialize};
 use std::cmp;
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -53,10 +53,7 @@ enum CacheEvent {
 }
 
 impl Worker {
-    pub(super) fn start_new(
-        cache_config: &CacheConfig,
-        init_file_per_thread_logger: Option<&'static str>,
-    ) -> Self {
+    pub(super) fn start_new(cache_config: &CacheConfig) -> Self {
         let queue_size = match cache_config.worker_event_queue_size() {
             num if num <= usize::max_value() as u64 => num as usize,
             _ => usize::max_value(),
@@ -76,7 +73,7 @@ impl Worker {
         // when self is dropped, sender will be dropped, what will cause the channel
         // to hang, and the worker thread to exit -- it happens in the tests
         // non-tests binary has only a static worker, so Rust doesn't drop it
-        thread::spawn(move || worker_thread.run(init_file_per_thread_logger));
+        thread::spawn(move || worker_thread.run());
 
         Self {
             sender: tx,
@@ -192,11 +189,7 @@ macro_rules! unwrap_or_warn {
 }
 
 impl WorkerThread {
-    fn run(self, init_file_per_thread_logger: Option<&'static str>) {
-        if let Some(prefix) = init_file_per_thread_logger {
-            file_per_thread_logger::initialize(prefix);
-        }
-
+    fn run(self) {
         debug!("Cache worker thread started.");
 
         Self::lower_thread_priority();
@@ -230,9 +223,7 @@ impl WorkerThread {
 
     #[cfg(target_os = "windows")]
     fn lower_thread_priority() {
-        use std::convert::TryInto;
-        use winapi::um::processthreadsapi::{GetCurrentThread, SetThreadPriority};
-        use winapi::um::winbase::THREAD_MODE_BACKGROUND_BEGIN;
+        use windows_sys::Win32::System::Threading::*;
 
         // https://docs.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setthreadpriority
         // https://docs.microsoft.com/en-us/windows/win32/procthread/scheduling-priorities
@@ -256,7 +247,7 @@ impl WorkerThread {
 
         const NICE_DELTA_FOR_BACKGROUND_TASKS: i32 = 3;
 
-        match rsix::process::nice(NICE_DELTA_FOR_BACKGROUND_TASKS) {
+        match rustix::process::nice(NICE_DELTA_FOR_BACKGROUND_TASKS) {
             Ok(current_nice) => {
                 debug!("New nice value of worker thread: {}", current_nice);
             }
@@ -268,13 +259,13 @@ impl WorkerThread {
     }
 
     /// Increases the usage counter and recompresses the file
-    /// if the usage counter reached configurable treshold.
+    /// if the usage counter reached configurable threshold.
     fn handle_on_cache_get(&self, path: PathBuf) {
         trace!("handle_on_cache_get() for path: {}", path.display());
 
         // construct .stats file path
         let filename = path.file_name().unwrap().to_str().unwrap();
-        let stats_path = path.with_file_name(format!("{}.stats", filename));
+        let stats_path = path.with_file_name(format!("{filename}.stats"));
 
         // load .stats file (default if none or error)
         let mut stats = read_stats_file(stats_path.as_ref())
@@ -408,7 +399,7 @@ impl WorkerThread {
             .expect("Expected valid cache file name")
             .to_str()
             .expect("Expected valid cache file name");
-        let stats_path = path.with_file_name(format!("{}.stats", filename));
+        let stats_path = path.with_file_name(format!("{filename}.stats"));
 
         // create and write stats file
         let mut stats = ModuleCacheStatistics::default(&self.cache_config);
@@ -693,7 +684,6 @@ impl WorkerThread {
                             stats_path
                         );
                         // .into() called for the SystemTimeStub if cfg(test)
-                        #[allow(clippy::identity_conversion)]
                         vec.push(CacheEntry::Recognized {
                             path: mod_path.to_path_buf(),
                             mtime: stats_mtime.into(),
@@ -711,7 +701,6 @@ impl WorkerThread {
                             mod_path
                         );
                         // .into() called for the SystemTimeStub if cfg(test)
-                        #[allow(clippy::identity_conversion)]
                         vec.push(CacheEntry::Recognized {
                             path: mod_path.to_path_buf(),
                             mtime: mod_mtime.into(),
@@ -739,7 +728,7 @@ impl WorkerThread {
 }
 
 fn read_stats_file(path: &Path) -> Option<ModuleCacheStatistics> {
-    fs::read(path)
+    fs::read_to_string(path)
         .map_err(|err| {
             trace!(
                 "Failed to read stats file, path: {}, err: {}",
@@ -747,8 +736,8 @@ fn read_stats_file(path: &Path) -> Option<ModuleCacheStatistics> {
                 err
             )
         })
-        .and_then(|bytes| {
-            toml::from_slice::<ModuleCacheStatistics>(&bytes[..]).map_err(|err| {
+        .and_then(|contents| {
+            toml::from_str::<ModuleCacheStatistics>(&contents).map_err(|err| {
                 trace!(
                     "Failed to parse stats file, path: {}, err: {}",
                     path.display(),
@@ -769,11 +758,7 @@ fn write_stats_file(path: &Path, stats: &ModuleCacheStatistics) -> bool {
             )
         })
         .and_then(|serialized| {
-            if fs_write_atomic(path, "stats", serialized.as_bytes()) {
-                Ok(())
-            } else {
-                Err(())
-            }
+            fs_write_atomic(path, "stats", serialized.as_bytes()).map_err(|_| ())
         })
         .is_ok()
 }
@@ -862,7 +847,7 @@ fn acquire_task_fs_lock(
 
 // we have either both, or just path; dir entry is desirable since on some platforms we can get
 // metadata without extra syscalls
-// futhermore: it's better to get a path if we have it instead of allocating a new one from the dir entry
+// furthermore: it's better to get a path if we have it instead of allocating a new one from the dir entry
 fn is_fs_lock_expired(
     entry: Option<&fs::DirEntry>,
     path: &PathBuf,

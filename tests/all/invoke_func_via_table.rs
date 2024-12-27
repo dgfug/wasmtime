@@ -1,4 +1,6 @@
-use anyhow::{Context as _, Result};
+#![cfg(not(miri))]
+
+use anyhow::Context as _;
 use wasmtime::*;
 
 #[test]
@@ -9,7 +11,7 @@ fn test_invoke_func_via_table() -> Result<()> {
       (module
         (func $f (result i64) (i64.const 42))
 
-        (table (export "table") 1 1 anyfunc)
+        (table (export "table") 1 1 funcref)
         (elem (i32.const 0) $f)
       )
     "#;
@@ -17,15 +19,13 @@ fn test_invoke_func_via_table() -> Result<()> {
     let instance =
         Instance::new(&mut store, &module, &[]).context("> Error instantiating module!")?;
 
-    let f = instance
+    let f = *instance
         .get_table(&mut store, "table")
         .unwrap()
         .get(&mut store, 0)
         .unwrap()
-        .funcref()
-        .unwrap()
-        .unwrap()
-        .clone();
+        .unwrap_func()
+        .unwrap();
     let mut results = [Val::I32(0)];
     f.call(&mut store, &[], &mut results).unwrap();
     assert_eq!(results[0].unwrap_i64(), 42);

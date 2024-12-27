@@ -10,7 +10,7 @@ pub struct FunctionStore<'a> {
     function_names: HashMap<String, FuncIndex>,
 }
 
-/// An opaque reference to a [`Function`](Function) stored in the [FunctionStore].
+/// An opaque reference to a [`Function`] stored in the [FunctionStore].
 #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FuncIndex(u32);
 entity_impl!(FuncIndex, "fn");
@@ -63,18 +63,20 @@ impl<'a> FunctionStore<'a> {
 /// currently it retrieves the function name as a string and performs string matching.
 fn get_function_name(func_ref: FuncRef, function: &Function) -> String {
     function
+        .stencil
         .dfg
         .ext_funcs
         .get(func_ref)
         .expect("function to exist")
         .name
+        .display(Some(&function.params))
         .to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cranelift_codegen::ir::{ExternalName, Signature};
+    use cranelift_codegen::ir::{Signature, UserFuncName};
     use cranelift_codegen::isa::CallConv;
 
     #[test]
@@ -95,7 +97,7 @@ mod tests {
 
     #[test]
     fn from() {
-        let name = ExternalName::testcase("test");
+        let name = UserFuncName::testcase("test");
         let signature = Signature::new(CallConv::Fast);
         let func = &Function::with_name_signature(name, signature);
         let env: FunctionStore = func.into();

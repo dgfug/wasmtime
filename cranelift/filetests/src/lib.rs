@@ -3,54 +3,30 @@
 //! This crate contains the main test driver as well as implementations of the
 //! available filetest commands.
 
-#![deny(
-    missing_docs,
-    trivial_numeric_casts,
-    unused_extern_crates,
-    unstable_features
-)]
-#![warn(unused_import_braces)]
-#![cfg_attr(feature = "cargo-clippy", allow(clippy::type_complexity))]
-#![cfg_attr(
-    feature = "cargo-clippy",
-    warn(
-        clippy::mut_mut,
-        clippy::nonminimal_bool,
-        clippy::map_unwrap_or,
-        clippy::clippy::unicode_not_nfc,
-        clippy::use_self
-    )
-)]
+#![deny(missing_docs)]
 
-pub use crate::function_runner::SingleFunctionCompiler;
+pub use crate::function_runner::TestFileCompiler;
 use crate::runner::TestRunner;
-use cranelift_codegen::timing;
 use cranelift_reader::TestCommand;
 use std::path::Path;
-use std::time;
 
 mod concurrent;
 pub mod function_runner;
 mod match_directive;
 mod runner;
 mod runone;
-mod runtest_environment;
 mod subtest;
 
+mod test_alias_analysis;
 mod test_cat;
 mod test_compile;
-mod test_dce;
 mod test_domtree;
 mod test_interpret;
 mod test_legalizer;
-mod test_licm;
-mod test_peepmatic;
-mod test_preopt;
+mod test_optimize;
 mod test_print_cfg;
 mod test_run;
 mod test_safepoint;
-mod test_simple_gvn;
-mod test_simple_preopt;
 mod test_unwind;
 mod test_verifier;
 
@@ -63,7 +39,7 @@ mod test_verifier;
 /// Directories are scanned recursively for test cases ending in `.clif`. These test cases are
 /// executed on background threads.
 ///
-pub fn run(verbose: bool, report_times: bool, files: &[String]) -> anyhow::Result<time::Duration> {
+pub fn run(verbose: bool, report_times: bool, files: &[String]) -> anyhow::Result<()> {
     let mut runner = TestRunner::new(verbose, report_times);
 
     for path in files.iter().map(Path::new) {
@@ -89,8 +65,8 @@ pub fn run_passes(
     passes: &[String],
     target: &str,
     file: &str,
-) -> anyhow::Result<time::Duration> {
-    let mut runner = TestRunner::new(verbose, /* report_times */ false);
+) -> anyhow::Result<()> {
+    let mut runner = TestRunner::new(verbose, report_times);
 
     let path = Path::new(file);
     if path == Path::new("-") || path.is_file() {
@@ -99,11 +75,8 @@ pub fn run_passes(
         runner.push_dir(path);
     }
 
-    let result = runner.run_passes(passes, target);
-    if report_times {
-        println!("{}", timing::take_current());
-    }
-    result
+    runner.start_threads();
+    runner.run_passes(passes, target)
 }
 
 /// Create a new subcommand trait object to match `parsed.command`.
@@ -112,20 +85,16 @@ pub fn run_passes(
 /// a `.clif` test file.
 fn new_subtest(parsed: &TestCommand) -> anyhow::Result<Box<dyn subtest::SubTest>> {
     match parsed.command {
+        "alias-analysis" => test_alias_analysis::subtest(parsed),
         "cat" => test_cat::subtest(parsed),
         "compile" => test_compile::subtest(parsed),
-        "dce" => test_dce::subtest(parsed),
         "domtree" => test_domtree::subtest(parsed),
         "interpret" => test_interpret::subtest(parsed),
         "legalizer" => test_legalizer::subtest(parsed),
-        "licm" => test_licm::subtest(parsed),
-        "peepmatic" => test_peepmatic::subtest(parsed),
-        "preopt" => test_preopt::subtest(parsed),
+        "optimize" => test_optimize::subtest(parsed),
         "print-cfg" => test_print_cfg::subtest(parsed),
         "run" => test_run::subtest(parsed),
         "safepoint" => test_safepoint::subtest(parsed),
-        "simple-gvn" => test_simple_gvn::subtest(parsed),
-        "simple_preopt" => test_simple_preopt::subtest(parsed),
         "unwind" => test_unwind::subtest(parsed),
         "verifier" => test_verifier::subtest(parsed),
         _ => anyhow::bail!("unknown test command '{}'", parsed.command),

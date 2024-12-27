@@ -3,182 +3,66 @@
 //! This crate provides an implementation of the `wasmtime_environ::Compiler`
 //! and `wasmtime_environ::CompilerBuilder` traits.
 
-// # How does Wasmtime prevent stack overflow?
-//
-// A few locations throughout the codebase link to this file to explain
-// interrupts and stack overflow. To start off, let's take a look at stack
-// overflow. Wasm code is well-defined to have stack overflow being recoverable
-// and raising a trap, so we need to handle this somehow! There's also an added
-// constraint where as an embedder you frequently are running host-provided
-// code called from wasm. WebAssembly and native code currently share the same
-// call stack, so you want to make sure that your host-provided code will have
-// enough call-stack available to it.
-//
-// Given all that, the way that stack overflow is handled is by adding a
-// prologue check to all JIT functions for how much native stack is remaining.
-// The `VMContext` pointer is the first argument to all functions, and the first
-// field of this structure is `*const VMInterrupts` and the first field of that
-// is the stack limit. Note that the stack limit in this case means "if the
-// stack pointer goes below this, trap". Each JIT function which consumes stack
-// space or isn't a leaf function starts off by loading the stack limit,
-// checking it against the stack pointer, and optionally traps.
-//
-// This manual check allows the embedder (us) to give wasm a relatively precise
-// amount of stack allocation. Using this scheme we reserve a chunk of stack
-// for wasm code relative from where wasm code was called. This ensures that
-// native code called by wasm should have native stack space to run, and the
-// numbers of stack spaces here should all be configurable for various
-// embeddings.
-//
-// Note that we do not consider each thread's stack guard page here. It's
-// considered that if you hit that you still abort the whole program. This
-// shouldn't happen most of the time because wasm is always stack-bound and
-// it's up to the embedder to bound its own native stack.
-//
-// So all-in-all, that's how we implement stack checks. Note that stack checks
-// cannot be disabled because it's a feature of core wasm semantics. This means
-// that all functions almost always have a stack check prologue, and it's up to
-// us to optimize away that cost as much as we can.
-//
-// For more information about the tricky bits of managing the reserved stack
-// size of wasm, see the implementation in `traphandlers.rs` in the
-// `update_stack_limit` function.
-//
-// # How is Wasmtime interrupted?
-//
-// Ok so given all that background of stack checks, the next thing we want to
-// build on top of this is the ability to *interrupt* executing wasm code. This
-// is useful to ensure that wasm always executes within a particular time slice
-// or otherwise doesn't consume all CPU resources on a system. There are two
-// major ways that interrupts are required:
-//
-// * Loops - likely immediately apparent but it's easy to write an infinite
-//   loop in wasm, so we need the ability to interrupt loops.
-// * Function entries - somewhat more subtle, but imagine a module where each
-//   function calls the next function twice. This creates 2^n calls pretty
-//   quickly, so a pretty small module can export a function with no loops
-//   that takes an extremely long time to call.
-//
-// In many cases if an interrupt comes in you want to interrupt host code as
-// well, but we're explicitly not considering that here. We're hoping that
-// interrupting host code is largely left to the embedder (e.g. figuring out
-// how to interrupt blocking syscalls) and they can figure that out. The purpose
-// of this feature is to basically only give the ability to interrupt
-// currently-executing wasm code (or triggering an interrupt as soon as wasm
-// reenters itself).
-//
-// To implement interruption of loops we insert code at the head of all loops
-// which checks the stack limit counter. If the counter matches a magical
-// sentinel value that's impossible to be the real stack limit, then we
-// interrupt the loop and trap. To implement interrupts of functions, we
-// actually do the same thing where the magical sentinel value we use here is
-// automatically considered as considering all stack pointer values as "you ran
-// over your stack". This means that with a write of a magical value to one
-// location we can interrupt both loops and function bodies.
-//
-// The "magical value" here is `usize::max_value() - N`. We reserve
-// `usize::max_value()` for "the stack limit isn't set yet" and so -N is
-// then used for "you got interrupted". We do a bit of patching afterwards to
-// translate a stack overflow into an interrupt trap if we see that an
-// interrupt happened. Note that `N` here is a medium-size-ish nonzero value
-// chosen in coordination with the cranelift backend. Currently it's 32k. The
-// value of N is basically a threshold in the backend for "anything less than
-// this requires only one branch in the prologue, any stack size bigger requires
-// two branches". Naturally we want most functions to have one branch, but we
-// also need to actually catch stack overflow, so for now 32k is chosen and it's
-// assume no valid stack pointer will ever be `usize::max_value() - 32k`.
+// See documentation in crates/wasmtime/src/runtime.rs for why this is
+// selectively enabled here.
+#![warn(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
-use cranelift_codegen::binemit;
-use cranelift_codegen::ir;
-use cranelift_codegen::isa::{unwind::UnwindInfo, CallConv, TargetIsa};
+use cranelift_codegen::{
+    binemit,
+    cursor::FuncCursor,
+    ir::{self, AbiParam, ArgumentPurpose, ExternalName, InstBuilder, Signature, TrapCode},
+    isa::{CallConv, TargetIsa},
+    settings, FinalizedMachReloc, FinalizedRelocTarget, MachTrap,
+};
 use cranelift_entity::PrimaryMap;
-use cranelift_wasm::{DefinedFuncIndex, FuncIndex, WasmFuncType, WasmType};
-use target_lexicon::CallingConvention;
+
+use target_lexicon::Architecture;
 use wasmtime_environ::{
-    FilePos, FunctionInfo, InstructionAddressMap, ModuleTranslation, TrapInformation, TypeTables,
+    BuiltinFunctionIndex, FlagValue, FuncIndex, RelocationTarget, Trap, TrapInformation, Tunables,
+    WasmFuncType, WasmHeapTopType, WasmHeapType, WasmValType,
 };
 
 pub use builder::builder;
+
+pub mod isa_builder;
+mod obj;
+pub use obj::*;
+mod compiled_function;
+pub use compiled_function::*;
 
 mod builder;
 mod compiler;
 mod debug;
 mod func_environ;
-mod obj;
+mod gc;
+mod translate;
 
-type CompiledFunctions = PrimaryMap<DefinedFuncIndex, CompiledFunction>;
+use self::compiler::Compiler;
 
-/// Compiled function: machine code body, jump table offsets, and unwind information.
-#[derive(Default)]
-pub struct CompiledFunction {
-    /// The machine code for this function.
-    body: Vec<u8>,
-
-    /// The unwind information.
-    unwind_info: Option<UnwindInfo>,
-
-    /// Information used to translate from binary offsets back to the original
-    /// location found in the wasm input.
-    address_map: FunctionAddressMap,
-
-    /// Metadata about traps in this module, mapping code offsets to the trap
-    /// that they may cause.
-    traps: Vec<TrapInformation>,
-
-    relocations: Vec<Relocation>,
-    value_labels_ranges: cranelift_codegen::ValueLabelsRanges,
-    stack_slots: ir::StackSlots,
-
-    info: FunctionInfo,
-}
-
-/// Function and its instructions addresses mappings.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct FunctionAddressMap {
-    /// An array of data for the instructions in this function, indicating where
-    /// each instruction maps back to in the original function.
-    ///
-    /// This array is sorted least-to-greatest by the `code_offset` field.
-    /// Additionally the span of each `InstructionAddressMap` is implicitly the
-    /// gap between it and the next item in the array.
-    instructions: Box<[InstructionAddressMap]>,
-
-    /// Function's initial offset in the source file, specified in bytes from
-    /// the front of the file.
-    start_srcloc: FilePos,
-
-    /// Function's end offset in the source file, specified in bytes from
-    /// the front of the file.
-    end_srcloc: FilePos,
-
-    /// Generated function body offset if applicable, otherwise 0.
-    body_offset: usize,
-
-    /// Generated function body length.
-    body_len: u32,
-}
-
-/// A record of a relocation to perform.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Relocation {
-    /// The relocation code.
-    reloc: binemit::Reloc,
-    /// Relocation target.
-    reloc_target: RelocationTarget,
-    /// The offset where to apply the relocation.
-    offset: binemit::CodeOffset,
-    /// The addend to add to the relocation value.
-    addend: binemit::Addend,
-}
-
-/// Destination function. Can be either user function or some special one, like `memory.grow`.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-enum RelocationTarget {
-    /// The user function index.
-    UserFunc(FuncIndex),
-    /// A compiler-generated libcall.
-    LibCall(ir::LibCall),
-}
+const TRAP_INTERNAL_ASSERT: TrapCode = TrapCode::unwrap_user(1);
+const TRAP_OFFSET: u8 = 2;
+pub const TRAP_ALWAYS: TrapCode =
+    TrapCode::unwrap_user(Trap::AlwaysTrapAdapter as u8 + TRAP_OFFSET);
+pub const TRAP_CANNOT_ENTER: TrapCode =
+    TrapCode::unwrap_user(Trap::CannotEnterComponent as u8 + TRAP_OFFSET);
+pub const TRAP_INDIRECT_CALL_TO_NULL: TrapCode =
+    TrapCode::unwrap_user(Trap::IndirectCallToNull as u8 + TRAP_OFFSET);
+pub const TRAP_BAD_SIGNATURE: TrapCode =
+    TrapCode::unwrap_user(Trap::BadSignature as u8 + TRAP_OFFSET);
+pub const TRAP_NULL_REFERENCE: TrapCode =
+    TrapCode::unwrap_user(Trap::NullReference as u8 + TRAP_OFFSET);
+pub const TRAP_ALLOCATION_TOO_LARGE: TrapCode =
+    TrapCode::unwrap_user(Trap::AllocationTooLarge as u8 + TRAP_OFFSET);
+pub const TRAP_ARRAY_OUT_OF_BOUNDS: TrapCode =
+    TrapCode::unwrap_user(Trap::ArrayOutOfBounds as u8 + TRAP_OFFSET);
+pub const TRAP_UNREACHABLE: TrapCode =
+    TrapCode::unwrap_user(Trap::UnreachableCodeReached as u8 + TRAP_OFFSET);
+pub const TRAP_HEAP_MISALIGNED: TrapCode =
+    TrapCode::unwrap_user(Trap::HeapMisaligned as u8 + TRAP_OFFSET);
+pub const TRAP_TABLE_OUT_OF_BOUNDS: TrapCode =
+    TrapCode::unwrap_user(Trap::TableOutOfBounds as u8 + TRAP_OFFSET);
+pub const TRAP_CAST_FAILURE: TrapCode =
+    TrapCode::unwrap_user(Trap::CastFailure as u8 + TRAP_OFFSET);
 
 /// Creates a new cranelift `Signature` with no wasm params/results for the
 /// given calling convention.
@@ -196,96 +80,351 @@ fn blank_sig(isa: &dyn TargetIsa, call_conv: CallConv) -> ir::Signature {
     return sig;
 }
 
-/// Returns the default calling convention for the `isa` provided.
+/// Emit code for the following unbarriered memory write of the given type:
 ///
-/// Note that this calling convention is used for exported functions.
-fn wasmtime_call_conv(isa: &dyn TargetIsa) -> CallConv {
-    match isa.triple().default_calling_convention() {
-        Ok(CallingConvention::AppleAarch64) => CallConv::WasmtimeAppleAarch64,
-        Ok(CallingConvention::SystemV) | Err(()) => CallConv::WasmtimeSystemV,
-        Ok(CallingConvention::WindowsFastcall) => CallConv::WasmtimeFastcall,
-        Ok(unimp) => unimplemented!("calling convention: {:?}", unimp),
-    }
+/// ```ignore
+/// *(base + offset) = value
+/// ```
+///
+/// This is intended to be used with things like `ValRaw` and the array calling
+/// convention.
+fn unbarriered_store_type_at_offset(
+    pos: &mut FuncCursor,
+    flags: ir::MemFlags,
+    base: ir::Value,
+    offset: i32,
+    value: ir::Value,
+) {
+    pos.ins().store(flags, value, base, offset);
 }
 
-/// Appends the types of the `wasm` function signature into the `sig` signature
-/// provided.
+/// Emit code to do the following unbarriered memory read of the given type and
+/// with the given flags:
 ///
-/// Typically the `sig` signature will have been created from [`blank_sig`]
-/// above.
-fn push_types(isa: &dyn TargetIsa, sig: &mut ir::Signature, wasm: &WasmFuncType) {
-    let cvt = |ty: &WasmType| ir::AbiParam::new(value_type(isa, *ty));
-    sig.params.extend(wasm.params().iter().map(&cvt));
-    sig.returns.extend(wasm.returns().iter().map(&cvt));
+/// ```ignore
+/// result = *(base + offset)
+/// ```
+///
+/// This is intended to be used with things like `ValRaw` and the array calling
+/// convention.
+fn unbarriered_load_type_at_offset(
+    isa: &dyn TargetIsa,
+    pos: &mut FuncCursor,
+    ty: WasmValType,
+    flags: ir::MemFlags,
+    base: ir::Value,
+    offset: i32,
+) -> ir::Value {
+    let ir_ty = value_type(isa, ty);
+    pos.ins().load(ir_ty, flags, base, offset)
 }
 
 /// Returns the corresponding cranelift type for the provided wasm type.
-fn value_type(isa: &dyn TargetIsa, ty: WasmType) -> ir::types::Type {
+fn value_type(isa: &dyn TargetIsa, ty: WasmValType) -> ir::types::Type {
     match ty {
-        WasmType::I32 => ir::types::I32,
-        WasmType::I64 => ir::types::I64,
-        WasmType::F32 => ir::types::F32,
-        WasmType::F64 => ir::types::F64,
-        WasmType::V128 => ir::types::I8X16,
-        WasmType::FuncRef | WasmType::ExternRef => reference_type(ty, isa.pointer_type()),
-        WasmType::ExnRef => unimplemented!(),
+        WasmValType::I32 => ir::types::I32,
+        WasmValType::I64 => ir::types::I64,
+        WasmValType::F32 => ir::types::F32,
+        WasmValType::F64 => ir::types::F64,
+        WasmValType::V128 => ir::types::I8X16,
+        WasmValType::Ref(rt) => reference_type(rt.heap_type, isa.pointer_type()),
     }
 }
 
-/// Returns a cranelift signature suitable to indirectly call the wasm signature
-/// specified by `wasm`.
+/// Get the Cranelift signature for all array-call functions, that is:
 ///
-/// This will implicitly use the default calling convention for `isa` since to
-/// indirectly call a wasm function it must be possibly exported somehow (e.g.
-/// this assumes the function target to call doesn't use the "fast" calling
-/// convention).
-fn indirect_signature(isa: &dyn TargetIsa, wasm: &WasmFuncType) -> ir::Signature {
-    let mut sig = blank_sig(isa, wasmtime_call_conv(isa));
-    push_types(isa, &mut sig, wasm);
-    return sig;
+/// ```ignore
+/// unsafe extern "C" fn(
+///     callee_vmctx: *mut VMOpaqueContext,
+///     caller_vmctx: *mut VMOpaqueContext,
+///     values_ptr: *mut ValRaw,
+///     values_len: usize,
+/// )
+/// ```
+///
+/// This signature uses the target's default calling convention.
+///
+/// Note that regardless of the Wasm function type, the array-call calling
+/// convention always uses that same signature.
+fn array_call_signature(isa: &dyn TargetIsa) -> ir::Signature {
+    let mut sig = blank_sig(isa, CallConv::triple_default(isa.triple()));
+    // The array-call signature has an added parameter for the `values_vec`
+    // input/output buffer in addition to the size of the buffer, in units
+    // of `ValRaw`.
+    sig.params.push(ir::AbiParam::new(isa.pointer_type()));
+    sig.params.push(ir::AbiParam::new(isa.pointer_type()));
+    // boolean return value of whether this function trapped
+    sig.returns.push(ir::AbiParam::new(ir::types::I8));
+    sig
 }
 
-/// Returns the cranelift fucntion signature of the function specified.
-///
-/// Note that this will determine the calling convention for the function, and
-/// namely includes an optimization where functions never exported from a module
-/// use a custom theoretically faster calling convention instead of the default.
-fn func_signature(
-    isa: &dyn TargetIsa,
-    translation: &ModuleTranslation,
-    types: &TypeTables,
-    index: FuncIndex,
-) -> ir::Signature {
-    let call_conv = match translation.module.defined_func_index(index) {
-        // If this is a defined function in the module and it's never possibly
-        // exported, then we can optimize this function to use the fastest
-        // calling convention since it's purely an internal implementation
-        // detail of the module itself.
-        Some(idx) if !translation.escaped_funcs.contains(&idx) => CallConv::Fast,
+/// Get the internal Wasm calling convention for the target/tunables combo
+fn wasm_call_conv(isa: &dyn TargetIsa, tunables: &Tunables) -> CallConv {
+    // The default calling convention is `CallConv::Tail` to enable the use of
+    // tail calls in modules when needed. Note that this is used even if the
+    // tail call proposal is disabled in wasm. This is not interacted with on
+    // the host so it's purely an internal detail of wasm itself.
+    //
+    // The Winch calling convention is used instead when generating trampolines
+    // which call Winch-generated functions. The winch calling convention is
+    // only implemented for x64 and aarch64, so assert that here and panic on
+    // other architectures.
+    if tunables.winch_callable {
+        assert!(
+            matches!(
+                isa.triple().architecture,
+                Architecture::X86_64 | Architecture::Aarch64(_)
+            ),
+            "The Winch calling convention is only implemented for x86_64 and aarch64"
+        );
+        CallConv::Winch
+    } else {
+        CallConv::Tail
+    }
+}
 
-        // ... otherwise if it's an imported function or if it's a possibly
-        // exported function then we use the default ABI wasmtime would
-        // otherwise select.
-        _ => wasmtime_call_conv(isa),
-    };
+/// Get the internal Wasm calling convention signature for the given type.
+fn wasm_call_signature(
+    isa: &dyn TargetIsa,
+    wasm_func_ty: &WasmFuncType,
+    tunables: &Tunables,
+) -> ir::Signature {
+    let call_conv = wasm_call_conv(isa, tunables);
     let mut sig = blank_sig(isa, call_conv);
-    push_types(
-        isa,
-        &mut sig,
-        &types.wasm_signatures[translation.module.functions[index]],
-    );
-    return sig;
+    let cvt = |ty: &WasmValType| ir::AbiParam::new(value_type(isa, *ty));
+    sig.params.extend(wasm_func_ty.params().iter().map(&cvt));
+    sig.returns.extend(wasm_func_ty.returns().iter().map(&cvt));
+    sig
 }
 
 /// Returns the reference type to use for the provided wasm type.
-fn reference_type(wasm_ty: cranelift_wasm::WasmType, pointer_type: ir::Type) -> ir::Type {
-    match wasm_ty {
-        cranelift_wasm::WasmType::FuncRef => pointer_type,
-        cranelift_wasm::WasmType::ExternRef => match pointer_type {
-            ir::types::I32 => ir::types::R32,
-            ir::types::I64 => ir::types::R64,
-            _ => panic!("unsupported pointer type"),
-        },
-        _ => panic!("unsupported Wasm reference type"),
+fn reference_type(wasm_ht: WasmHeapType, pointer_type: ir::Type) -> ir::Type {
+    match wasm_ht.top() {
+        WasmHeapTopType::Func => pointer_type,
+        WasmHeapTopType::Any | WasmHeapTopType::Extern => ir::types::I32,
     }
 }
+
+// List of namespaces which are processed in `mach_reloc_to_reloc` below.
+
+/// Namespace corresponding to wasm functions, the index is the index of the
+/// defined function that's being referenced.
+pub const NS_WASM_FUNC: u32 = 0;
+
+/// Namespace for builtin function trampolines. The index is the index of the
+/// builtin that's being referenced. These trampolines invoke the real host
+/// function through an indirect function call loaded by the `VMContext`.
+pub const NS_WASMTIME_BUILTIN: u32 = 1;
+
+/// Namespace used to when a call from Pulley to the host is being made. This is
+/// used with a `colocated: false` name to trigger codegen for a special opcode
+/// for pulley-to-host communication. The index of the functions used in this
+/// namespace correspond to the function signature of `for_each_host_signature!`
+/// in the pulley_interpreter crate.
+pub const NS_PULLEY_HOSTCALL: u32 = 2;
+
+/// A record of a relocation to perform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Relocation {
+    /// The relocation code.
+    pub reloc: binemit::Reloc,
+    /// Relocation target.
+    pub reloc_target: RelocationTarget,
+    /// The offset where to apply the relocation.
+    pub offset: binemit::CodeOffset,
+    /// The addend to add to the relocation value.
+    pub addend: binemit::Addend,
+}
+
+/// Converts cranelift_codegen settings to the wasmtime_environ equivalent.
+pub fn clif_flags_to_wasmtime(
+    flags: impl IntoIterator<Item = settings::Value>,
+) -> Vec<(&'static str, FlagValue<'static>)> {
+    flags
+        .into_iter()
+        .map(|val| (val.name, to_flag_value(&val)))
+        .collect()
+}
+
+fn to_flag_value(v: &settings::Value) -> FlagValue<'static> {
+    match v.kind() {
+        settings::SettingKind::Enum => FlagValue::Enum(v.as_enum().unwrap()),
+        settings::SettingKind::Num => FlagValue::Num(v.as_num().unwrap()),
+        settings::SettingKind::Bool => FlagValue::Bool(v.as_bool().unwrap()),
+        settings::SettingKind::Preset => unreachable!(),
+    }
+}
+
+/// Converts machine traps to trap information.
+pub fn mach_trap_to_trap(trap: &MachTrap) -> Option<TrapInformation> {
+    let &MachTrap { offset, code } = trap;
+    Some(TrapInformation {
+        code_offset: offset,
+        trap_code: clif_trap_to_env_trap(code)?,
+    })
+}
+
+fn clif_trap_to_env_trap(trap: ir::TrapCode) -> Option<Trap> {
+    Some(match trap {
+        ir::TrapCode::STACK_OVERFLOW => Trap::StackOverflow,
+        ir::TrapCode::HEAP_OUT_OF_BOUNDS => Trap::MemoryOutOfBounds,
+        ir::TrapCode::INTEGER_OVERFLOW => Trap::IntegerOverflow,
+        ir::TrapCode::INTEGER_DIVISION_BY_ZERO => Trap::IntegerDivisionByZero,
+        ir::TrapCode::BAD_CONVERSION_TO_INTEGER => Trap::BadConversionToInteger,
+
+        // These do not get converted to wasmtime traps, since they
+        // shouldn't ever be hit in theory. Instead of catching and handling
+        // these, we let the signal crash the process.
+        TRAP_INTERNAL_ASSERT => return None,
+
+        other => Trap::from_u8(other.as_raw().get() - TRAP_OFFSET).unwrap(),
+    })
+}
+
+/// Converts machine relocations to relocation information
+/// to perform.
+fn mach_reloc_to_reloc(
+    reloc: &FinalizedMachReloc,
+    name_map: &PrimaryMap<ir::UserExternalNameRef, ir::UserExternalName>,
+) -> Relocation {
+    let &FinalizedMachReloc {
+        offset,
+        kind,
+        ref target,
+        addend,
+    } = reloc;
+    let reloc_target = match *target {
+        FinalizedRelocTarget::ExternalName(ExternalName::User(user_func_ref)) => {
+            let name = &name_map[user_func_ref];
+            match name.namespace {
+                NS_WASM_FUNC => RelocationTarget::Wasm(FuncIndex::from_u32(name.index)),
+                NS_WASMTIME_BUILTIN => {
+                    RelocationTarget::Builtin(BuiltinFunctionIndex::from_u32(name.index))
+                }
+                NS_PULLEY_HOSTCALL => RelocationTarget::PulleyHostcall(name.index),
+                _ => panic!("unknown namespace {}", name.namespace),
+            }
+        }
+        FinalizedRelocTarget::ExternalName(ExternalName::LibCall(libcall)) => {
+            let libcall = libcall_cranelift_to_wasmtime(libcall);
+            RelocationTarget::HostLibcall(libcall)
+        }
+        _ => panic!("unrecognized external name"),
+    };
+    Relocation {
+        reloc: kind,
+        reloc_target,
+        offset,
+        addend,
+    }
+}
+
+fn libcall_cranelift_to_wasmtime(call: ir::LibCall) -> wasmtime_environ::obj::LibCall {
+    use wasmtime_environ::obj::LibCall as LC;
+    match call {
+        ir::LibCall::FloorF32 => LC::FloorF32,
+        ir::LibCall::FloorF64 => LC::FloorF64,
+        ir::LibCall::NearestF32 => LC::NearestF32,
+        ir::LibCall::NearestF64 => LC::NearestF64,
+        ir::LibCall::CeilF32 => LC::CeilF32,
+        ir::LibCall::CeilF64 => LC::CeilF64,
+        ir::LibCall::TruncF32 => LC::TruncF32,
+        ir::LibCall::TruncF64 => LC::TruncF64,
+        ir::LibCall::FmaF32 => LC::FmaF32,
+        ir::LibCall::FmaF64 => LC::FmaF64,
+        ir::LibCall::X86Pshufb => LC::X86Pshufb,
+        _ => panic!("cranelift emitted a libcall wasmtime does not support: {call:?}"),
+    }
+}
+
+/// Helper structure for creating a `Signature` for all builtins.
+struct BuiltinFunctionSignatures {
+    pointer_type: ir::Type,
+
+    host_call_conv: CallConv,
+    wasm_call_conv: CallConv,
+}
+
+impl BuiltinFunctionSignatures {
+    fn new(compiler: &Compiler) -> Self {
+        Self {
+            pointer_type: compiler.isa().pointer_type(),
+            host_call_conv: CallConv::triple_default(compiler.isa().triple()),
+            wasm_call_conv: wasm_call_conv(compiler.isa(), compiler.tunables()),
+        }
+    }
+
+    fn vmctx(&self) -> AbiParam {
+        AbiParam::special(self.pointer_type, ArgumentPurpose::VMContext)
+    }
+
+    fn pointer(&self) -> AbiParam {
+        AbiParam::new(self.pointer_type)
+    }
+
+    fn i32(&self) -> AbiParam {
+        // Some platform ABIs require i32 values to be zero- or sign-
+        // extended to the full register width.  We need to indicate
+        // this here by using the appropriate .uext or .sext attribute.
+        // The attribute can be added unconditionally; platforms whose
+        // ABI does not require such extensions will simply ignore it.
+        // Note that currently all i32 arguments or return values used
+        // by builtin functions are unsigned, so we always use .uext.
+        // If that ever changes, we will have to add a second type
+        // marker here.
+        AbiParam::new(ir::types::I32).uext()
+    }
+
+    fn i64(&self) -> AbiParam {
+        AbiParam::new(ir::types::I64)
+    }
+
+    fn u8(&self) -> AbiParam {
+        AbiParam::new(ir::types::I8)
+    }
+
+    fn bool(&self) -> AbiParam {
+        AbiParam::new(ir::types::I8)
+    }
+
+    fn wasm_signature(&self, builtin: BuiltinFunctionIndex) -> Signature {
+        let mut _cur = 0;
+        macro_rules! iter {
+            (
+                $(
+                    $( #[$attr:meta] )*
+                    $name:ident( $( $pname:ident: $param:ident ),* ) $( -> $result:ident )?;
+                )*
+            ) => {
+                $(
+                    $( #[$attr] )*
+                    if _cur == builtin.index() {
+                        return Signature {
+                            params: vec![ $( self.$param() ),* ],
+                            returns: vec![ $( self.$result() )? ],
+                            call_conv: self.wasm_call_conv,
+                        };
+                    }
+                    _cur += 1;
+                )*
+            };
+        }
+
+        wasmtime_environ::foreach_builtin_function!(iter);
+
+        unreachable!();
+    }
+
+    fn host_signature(&self, builtin: BuiltinFunctionIndex) -> Signature {
+        let mut sig = self.wasm_signature(builtin);
+        sig.call_conv = self.host_call_conv;
+        sig
+    }
+}
+
+/// If this bit is set on a GC reference, then the GC reference is actually an
+/// unboxed `i31`.
+///
+/// Must be kept in sync with
+/// `crate::runtime::vm::gc::VMGcRef::I31_REF_DISCRIMINANT`.
+const I31_REF_DISCRIMINANT: u32 = 1;

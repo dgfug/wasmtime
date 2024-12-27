@@ -1,8 +1,9 @@
 [package]
 name = "wiggle"
-version = "0.30.0"
+version.workspace = true
 authors = ["Pat Hickey <phickey@fastly.com>", "Jakub Konka <kubkonk@jakubkonka.com>", "Alex Crichton <alex@alexcrichton.com>"]
-edition = "2018"
+edition.workspace = true
+rust-version.workspace = true
 license = "Apache-2.0 WITH LLVM-exception"
 description = "Runtime components of wiggle code generator"
 categories = ["wasm"]
@@ -10,24 +11,29 @@ keywords = ["webassembly", "wasm"]
 repository = "https://github.com/bytecodealliance/wasmtime"
 include = ["src/**/*", "README.md", "LICENSE"]
 
-[dependencies]
-thiserror = "1"
-witx = { path = "../wasi-common/WASI/tools/witx", version = "0.9.1", optional = true }
-wiggle-macro = { path = "macro", version = "0.30.0" }
-tracing = "0.1.26"
-bitflags = "1.2"
-async-trait = "0.1.42"
-wasmtime = { path = "../wasmtime", version = "0.30.0", optional = true, default-features = false }
-anyhow = "1.0"
+[lints]
+workspace = true
 
-[badges]
-maintenance = { status = "actively-developed" }
+[dependencies]
+thiserror = { workspace = true }
+witx = { version = "0.9.1", optional = true }
+wiggle-macro = { workspace = true }
+tracing = { workspace = true }
+bitflags = { workspace = true }
+async-trait = { workspace = true }
+wasmtime = { workspace = true, optional = true }
+anyhow = { workspace = true }
 
 [dev-dependencies]
 wiggle-test = { path = "test-helpers" }
-anyhow = "1"
 proptest = "1.0.0"
 tokio = { version = "1", features = ["rt-multi-thread","time", "macros"] }
+wasmtime = { workspace = true }
+
+[[test]]
+name = "atoms_async"
+path = "tests/atoms_async.rs"
+required-features = ["wasmtime_async"]
 
 [[test]]
 name = "wasmtime_async"
@@ -37,12 +43,12 @@ required-features = ["wasmtime_async", "wasmtime/wat"]
 [[test]]
 name = "wasmtime_sync"
 path = "tests/wasmtime_sync.rs"
-required-features = ["wasmtime_integration", "wasmtime/wat"]
+required-features = ["wasmtime/wat"]
 
 [[test]]
 name = "wasmtime_integration"
 path = "tests/wasmtime_integration.rs"
-required-features = ["wasmtime_integration", "wasmtime/wat"]
+required-features = ["wasmtime/wat"]
 
 
 [features]
@@ -58,9 +64,10 @@ wiggle_metadata = ['witx', "wiggle-macro/wiggle_metadata"]
 # the logs out of wiggle-generated libraries.
 tracing_log = [ "tracing/log" ]
 
-# Generate adapters for wasmtime, and expose the wasmtime_integration macro.
-wasmtime_integration = [ "wasmtime", "wiggle-macro/wasmtime" ]
-# Support for async in the wasmtime crates.
-wasmtime_async = [ "wasmtime_integration", "wasmtime/async" ]
+# This feature enables integration with wasmtime.
+wasmtime = ["dep:wasmtime"]
 
-default = ["wiggle_metadata", "wasmtime_integration" ]
+# Support for async in the wasmtime crates.
+wasmtime_async = [ "wasmtime/async" ]
+
+default = ["wiggle_metadata", "wasmtime", "wasmtime_async" ]

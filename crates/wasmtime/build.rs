@@ -1,20 +1,42 @@
 fn main() {
-    // Code in the `wasmtime` crate will use #[cfg(compiler)] conditional
-    // compilation when runtime compilation is supported or not. This #[cfg] is
-    // defined by this build script here, and is guarded with a conditional.
-    // Currently this conditional is #[cfg(feature = "cranelift")] since that's
-    // the only supported compiler.
-    //
-    // Note that #[doc(cfg)] throughout the `wasmtime` crate points here. We
-    // want the rustdoc documentation to accurately reflect the requirements for
-    // APIs, so the condition here is duplicated into all #[doc(cfg)]
-    // attributes. If this condition is updated to emit #[cfg(compiler)] more
-    // frequently then all rustdoc attributes also need to be updated with the
-    // new condition to ensure the documentation accurately reflects when an API
-    // is available.
-    if cfg!(feature = "cranelift") {
-        println!("cargo:rustc-cfg=compiler");
+    println!("cargo:rerun-if-changed=build.rs");
+
+    #[cfg(feature = "runtime")]
+    build_c_helpers();
+}
+
+#[cfg(feature = "runtime")]
+fn build_c_helpers() {
+    use wasmtime_versioned_export_macros::versioned_suffix;
+
+    // NB: duplicating a workaround in the wasmtime-fiber build script.
+    println!("cargo:rustc-check-cfg=cfg(asan)");
+    match std::env::var("CARGO_CFG_SANITIZE") {
+        Ok(s) if s == "address" => {
+            println!("cargo:rustc-cfg=asan");
+        }
+        _ => {}
     }
 
-    println!("cargo:rerun-if-changed=build.rs");
+    // If this platform is neither unix nor windows then there's no default need
+    // for a C helper library since `helpers.c` is tailored for just these
+    // platforms currently.
+    if std::env::var("CARGO_CFG_UNIX").is_err() && std::env::var("CARGO_CFG_WINDOWS").is_err() {
+        return;
+    }
+
+    let mut build = cc::Build::new();
+    build.warnings(true);
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
+    build.define(&format!("CFG_TARGET_OS_{os}"), None);
+    build.define(&format!("CFG_TARGET_ARCH_{arch}"), None);
+    build.define("VERSIONED_SUFFIX", Some(versioned_suffix!()));
+    if std::env::var("CARGO_FEATURE_DEBUG_BUILTINS").is_ok() {
+        build.define("FEATURE_DEBUG_BUILTINS", None);
+    }
+
+    println!("cargo:rerun-if-changed=src/runtime/vm/helpers.c");
+    build.file("src/runtime/vm/helpers.c");
+    build.compile("wasmtime-helpers");
 }

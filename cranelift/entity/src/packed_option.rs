@@ -11,7 +11,7 @@ use core::fmt;
 use core::mem;
 
 #[cfg(feature = "enable-serde")]
-use serde::{Deserialize, Serialize};
+use serde_derive::{Deserialize, Serialize};
 
 /// Types that have a reserved value which can't be created any other way.
 pub trait ReservedValue {
@@ -22,8 +22,12 @@ pub trait ReservedValue {
 }
 
 /// Packed representation of `Option<T>`.
+///
+/// This is a wrapper around a `T`, using `T::reserved_value` to represent
+/// `None`.
 #[derive(Clone, Copy, PartialEq, PartialOrd, Eq, Ord, Hash)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
+#[repr(transparent)]
 pub struct PackedOption<T: ReservedValue>(T);
 
 impl<T: ReservedValue> PackedOption<T> {
@@ -55,11 +59,13 @@ impl<T: ReservedValue> PackedOption<T> {
     }
 
     /// Unwrap a packed `Some` value or panic.
+    #[track_caller]
     pub fn unwrap(self) -> T {
         self.expand().unwrap()
     }
 
     /// Unwrap a packed `Some` value or panic.
+    #[track_caller]
     pub fn expect(self, msg: &str) -> T {
         self.expand().expect(msg)
     }

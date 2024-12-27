@@ -10,11 +10,11 @@ this using the `wasmtime` runtime.
     - [Compiling to WASI](#compiling-to-wasi)
         - [From C](#from-c)
         - [From Rust](#from-rust)
-    - [Executing in `wasmtime` runtime](#executing-in-wasmtime-runtime)
+    - [Executing in Wasmtime](#executing-in-wasmtime)
   - [Web assembly text example](#web-assembly-text-example)
 
 ## Running common languages with WASI
-## Compiling to WASI
+### Compiling to WASI
 #### From C
 Let's start with a simple C program which performs a file copy, which will
 show to compile and run programs, as well as perform simple sandbox
@@ -154,18 +154,18 @@ Let's put this source in the main file of our crate `src/main.rs`.
 In order to build it, we first need to install a WASI-enabled Rust toolchain:
 
 ```
-$ rustup target add wasm32-wasi
-$ cargo build --target wasm32-wasi
+$ rustup target add wasm32-wasip1
+$ cargo build --target wasm32-wasip1
 ```
 
-We should now have the WebAssembly module created in `target/wasm32-wasi/debug`:
+We should now have the WebAssembly module created in `target/wasm32-wasip1/debug`:
 
 ```
-$ file target/wasm32-wasi/debug/demo.wasm
+$ file target/wasm32-wasip1/debug/demo.wasm
 demo.wasm: WebAssembly (wasm) binary module version 0x1 (MVP)
 ```
 
-## Executing in `wasmtime` runtime
+### Executing in Wasmtime
 The resultant WebAssembly module `demo.wasm` compiled either from C or Rust is simply
 a single file containing a self-contained wasm module, that doesn't require
 any supporting JS code.
@@ -182,7 +182,7 @@ Ok, this program needs some command-line arguments. So let's give it some:
 ```
 $ echo hello world > test.txt
 $ wasmtime demo.wasm test.txt /tmp/somewhere.txt
-error opening input test.txt: Capabilities insufficient
+error opening input test.txt: No such file or directory
 ```
 
 Aha, now we're seeing the sandboxing in action. This program is attempting to
@@ -217,8 +217,7 @@ directory to the WebAssembly program. So providing a full path doesn't work:
 
 ```
 $ wasmtime --dir=$PWD --dir=/tmp demo.wasm test.txt /tmp/somewhere.txt
-$ cat /tmp/somewhere.txt
-error opening input test.txt: Capabilities insufficient
+error opening input test.txt: No such file or directory
 ```
 
 So, we always have to use `.` to refer to the current directory.
@@ -228,21 +227,20 @@ out of the sandbox? Let's see:
 
 ```
 $ wasmtime --dir=. --dir=/tmp demo.wasm test.txt /tmp/../etc/passwd
-error opening output /tmp/../etc/passwd: Capabilities insufficient
+error opening output /tmp/../etc/passwd: Operation not permitted
 ```
 
 The sandbox says no. And note that this is the capabilities system saying no
-here ("Capabilities insufficient"), rather than Unix access controls
+here ("Operation not permitted"), rather than Unix access controls
 ("Permission denied"). Even if the user running `wasmtime` had write access to
 `/etc/passwd`, WASI programs don't have the capability to access files outside
 of the directories they've been granted. This is true when resolving symbolic
 links as well.
 
-`wasmtime` also has the ability to remap directories, with the `--mapdir`
-command-line option:
+`wasmtime` also has the ability to remap directories:
 
 ```
-$ wasmtime --dir=. --mapdir=/tmp::/var/tmp demo.wasm test.txt /tmp/somewhere.txt
+$ wasmtime --dir=. --dir=/var/tmp::/tmp demo.wasm test.txt /tmp/somewhere.txt
 $ cat /var/tmp/somewhere.txt
 hello world
 ```
@@ -271,8 +269,8 @@ First, create a new `demo.wat` file:
 (module
     ;; Import the required fd_write WASI function which will write the given io vectors to stdout
     ;; The function signature for fd_write is:
-    ;; (File Descriptor, *iovs, iovs_len, nwritten) -> Returns number of bytes written
-    (import "wasi_unstable" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
+    ;; (File Descriptor, *iovs, iovs_len, *nwritten) -> Returns 0 on success, nonzero on error
+    (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
 
     (memory 1)
     (export "memory" (memory 0))
@@ -305,10 +303,10 @@ hello world
 ```
 
 Or, you can compile the `.wat` WebAssembly text format into the wasm binary format
-yourself using the [wabt] command line tools:
+yourself using the [wasm-tools] command line tools:
 
 ```
-$ wat2wasm demo.wat
+$ wasm-tools parse demo.wat -o demo.wasm
 ```
 
 The created `.wasm` file can now be executed with `wasmtime` directly like so:
@@ -318,8 +316,7 @@ $ wasmtime demo.wasm
 hello world
 ```
 
-To run this example within the browser, simply upload the compiled `.wasm` file to
-the [WASI browser polyfill].
+To run this example within the browser, use [jco].
 
-[wabt]: https://github.com/WebAssembly/wabt
-[WASI browser polyfill]: https://wasi.dev/polyfill/
+[wasm-tools]: https://github.com/bytecodealliance/wasm-tools
+[jco]: https://github.com/bytecodealliance/jco

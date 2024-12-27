@@ -1,79 +1,74 @@
 //! The module that implements the `wasmtime compile` command.
 
-use crate::CommonOptions;
 use anyhow::{bail, Context, Result};
+use clap::Parser;
 use std::fs;
 use std::path::PathBuf;
-use structopt::{clap::AppSettings, StructOpt};
-use target_lexicon::Triple;
-use wasmtime::Engine;
+use wasmtime::{CodeBuilder, CodeHint, Engine};
+use wasmtime_cli_flags::CommonOptions;
 
-lazy_static::lazy_static! {
-    static ref AFTER_HELP: String = {
-        format!(
-            "By default, no CPU features or presets will be enabled for the compilation.\n\
-            \n\
-            {}\
-            \n\
-            Usage examples:\n\
-            \n\
-            Compiling a WebAssembly module for the current platform:\n\
-            \n  \
-            wasmtime compile example.wasm
-            \n\
-            Specifying the output file:\n\
-            \n  \
-            wasmtime compile -o output.cwasm input.wasm\n\
-            \n\
-            Compiling for a specific platform (Linux) and CPU preset (Skylake):\n\
-            \n  \
-            wasmtime compile --target x86_64-unknown-linux --cranelift-enable skylake foo.wasm\n",
-            crate::FLAG_EXPLANATIONS.as_str()
-        )
-    };
-}
+const AFTER_HELP: &str =
+    "By default, no CPU features or presets will be enabled for the compilation.\n\
+        \n\
+        Usage examples:\n\
+        \n\
+        Compiling a WebAssembly module for the current platform:\n\
+        \n  \
+        wasmtime compile example.wasm
+        \n\
+        Specifying the output file:\n\
+        \n  \
+        wasmtime compile -o output.cwasm input.wasm\n\
+        \n\
+        Compiling for a specific platform (Linux) and CPU preset (Skylake):\n\
+        \n  \
+        wasmtime compile --target x86_64-unknown-linux -Ccranelift-skylake foo.wasm\n";
 
 /// Compiles a WebAssembly module.
-#[derive(StructOpt)]
-#[structopt(
-    name = "compile",
-    version = env!("CARGO_PKG_VERSION"),
-    setting = AppSettings::ColoredHelp,
-    after_help = AFTER_HELP.as_str()
+#[derive(Parser)]
+#[command(
+    version,
+    after_help = AFTER_HELP,
 )]
 pub struct CompileCommand {
-    #[structopt(flatten)]
-    common: CommonOptions,
+    #[command(flatten)]
+    #[allow(missing_docs)]
+    pub common: CommonOptions,
 
-    /// Enable support for interrupting WebAssembly code.
-    #[structopt(long)]
-    interruptable: bool,
+    /// The path of the output compiled module; defaults to `<MODULE>.cwasm`
+    #[arg(short = 'o', long, value_name = "OUTPUT")]
+    pub output: Option<PathBuf>,
 
-    /// The target triple; default is the host triple
-    #[structopt(long, value_name = "TARGET")]
-    target: Option<String>,
-
-    /// The path of the output compiled module; defaults to <MODULE>.cwasm
-    #[structopt(short = "o", long, value_name = "OUTPUT", parse(from_os_str))]
-    output: Option<PathBuf>,
+    /// The directory path to write clif files into, one clif file per wasm function.
+    #[arg(long = "emit-clif", value_name = "PATH")]
+    pub emit_clif: Option<PathBuf>,
 
     /// The path of the WebAssembly to compile
-    #[structopt(index = 1, value_name = "MODULE", parse(from_os_str))]
-    module: PathBuf,
+    #[arg(index = 1, value_name = "MODULE")]
+    pub module: PathBuf,
 }
 
 impl CompileCommand {
     /// Executes the command.
     pub fn execute(mut self) -> Result<()> {
-        self.common.init_logging();
+        self.common.init_logging()?;
 
-        let target = self
-            .target
-            .take()
-            .unwrap_or_else(|| Triple::host().to_string());
+        let mut config = self.common.config(None)?;
 
-        let mut config = self.common.config(Some(&target))?;
-        config.interruptable(self.interruptable);
+        if let Some(path) = self.emit_clif {
+            if !path.exists() {
+                std::fs::create_dir(&path)?;
+            }
+
+            if !path.is_dir() {
+                bail!(
+                    "the path passed for '--emit-clif' ({}) must be a directory",
+                    path.display()
+                );
+            }
+
+            config.emit_clif(&path);
+        }
 
         let engine = Engine::new(&config)?;
 
@@ -84,7 +79,8 @@ impl CompileCommand {
             );
         }
 
-        let input = fs::read(&self.module).with_context(|| "failed to read input file")?;
+        let mut code = CodeBuilder::new(&engine);
+        code.wasm_binary_or_text_file(&self.module)?;
 
         let output = self.output.take().unwrap_or_else(|| {
             let mut output: PathBuf = self.module.file_name().unwrap().into();
@@ -92,13 +88,23 @@ impl CompileCommand {
             output
         });
 
-        fs::write(output, engine.precompile_module(&input)?)?;
+        let output_bytes = match code.hint() {
+            #[cfg(feature = "component-model")]
+            Some(CodeHint::Component) => code.compile_component_serialized()?,
+            #[cfg(not(feature = "component-model"))]
+            Some(CodeHint::Component) => {
+                bail!("component model support was disabled at compile time")
+            }
+            Some(CodeHint::Module) | None => code.compile_module_serialized()?,
+        };
+        fs::write(&output, output_bytes)
+            .with_context(|| format!("failed to write output: {}", output.display()))?;
 
         Ok(())
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 mod test {
     use super::*;
     use std::io::Write;
@@ -115,9 +121,9 @@ mod test {
 
         let output_path = NamedTempFile::new()?.into_temp_path();
 
-        let command = CompileCommand::from_iter_safe(vec![
+        let command = CompileCommand::try_parse_from(vec![
             "compile",
-            "--disable-logging",
+            "-Dlogging=n",
             "-o",
             output_path.to_str().unwrap(),
             input_path.to_str().unwrap(),
@@ -130,7 +136,7 @@ mod test {
         let module = unsafe { Module::deserialize(&engine, contents)? };
         let mut store = Store::new(&engine, ());
         let instance = Instance::new(&mut store, &module, &[])?;
-        let f = instance.get_typed_func::<i32, i32, _>(&mut store, "f")?;
+        let f = instance.get_typed_func::<i32, i32>(&mut store, "f")?;
         assert_eq!(f.call(&mut store, 1234).unwrap(), 1234);
 
         Ok(())
@@ -146,35 +152,23 @@ mod test {
         let output_path = NamedTempFile::new()?.into_temp_path();
 
         // Set all the x64 flags to make sure they work
-        let command = CompileCommand::from_iter_safe(vec![
+        let command = CompileCommand::try_parse_from(vec![
             "compile",
-            "--disable-logging",
-            "--cranelift-enable",
-            "has_sse3",
-            "--cranelift-enable",
-            "has_ssse3",
-            "--cranelift-enable",
-            "has_sse41",
-            "--cranelift-enable",
-            "has_sse42",
-            "--cranelift-enable",
-            "has_avx",
-            "--cranelift-enable",
-            "has_avx2",
-            "--cranelift-enable",
-            "has_avx512dq",
-            "--cranelift-enable",
-            "has_avx512vl",
-            "--cranelift-enable",
-            "has_avx512f",
-            "--cranelift-enable",
-            "has_popcnt",
-            "--cranelift-enable",
-            "has_bmi1",
-            "--cranelift-enable",
-            "has_bmi2",
-            "--cranelift-enable",
-            "has_lzcnt",
+            "-Dlogging=n",
+            "-Ccranelift-has-sse3",
+            "-Ccranelift-has-ssse3",
+            "-Ccranelift-has-sse41",
+            "-Ccranelift-has-sse42",
+            "-Ccranelift-has-avx",
+            "-Ccranelift-has-avx2",
+            "-Ccranelift-has-fma",
+            "-Ccranelift-has-avx512dq",
+            "-Ccranelift-has-avx512vl",
+            "-Ccranelift-has-avx512f",
+            "-Ccranelift-has-popcnt",
+            "-Ccranelift-has-bmi1",
+            "-Ccranelift-has-bmi2",
+            "-Ccranelift-has-lzcnt",
             "-o",
             output_path.to_str().unwrap(),
             input_path.to_str().unwrap(),
@@ -195,11 +189,15 @@ mod test {
         let output_path = NamedTempFile::new()?.into_temp_path();
 
         // Set all the aarch64 flags to make sure they work
-        let command = CompileCommand::from_iter_safe(vec![
+        let command = CompileCommand::try_parse_from(vec![
             "compile",
-            "--disable-logging",
-            "--cranelift-enable",
-            "has_lse",
+            "-Dlogging=n",
+            "-Ccranelift-has-lse",
+            "-Ccranelift-has-pauth",
+            "-Ccranelift-has-fp16",
+            "-Ccranelift-sign-return-address",
+            "-Ccranelift-sign-return-address-all",
+            "-Ccranelift-sign-return-address-with-bkey",
             "-o",
             output_path.to_str().unwrap(),
             input_path.to_str().unwrap(),
@@ -220,11 +218,10 @@ mod test {
         let output_path = NamedTempFile::new()?.into_temp_path();
 
         // aarch64 flags should not be supported
-        let command = CompileCommand::from_iter_safe(vec![
+        let command = CompileCommand::try_parse_from(vec![
             "compile",
-            "--disable-logging",
-            "--cranelift-enable",
-            "has_lse",
+            "-Dlogging=n",
+            "-Ccranelift-has-lse",
             "-o",
             output_path.to_str().unwrap(),
             input_path.to_str().unwrap(),
@@ -256,11 +253,11 @@ mod test {
             "icelake",
             "znver1",
         ] {
-            let command = CompileCommand::from_iter_safe(vec![
+            let flag = format!("-Ccranelift-{preset}");
+            let command = CompileCommand::try_parse_from(vec![
                 "compile",
-                "--disable-logging",
-                "--cranelift-enable",
-                preset,
+                "-Dlogging=n",
+                flag.as_str(),
                 "-o",
                 output_path.to_str().unwrap(),
                 input_path.to_str().unwrap(),

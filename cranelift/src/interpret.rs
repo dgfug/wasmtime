@@ -1,35 +1,29 @@
 //! CLI tool to interpret Cranelift IR files.
 
 use crate::utils::iterate_files;
+use clap::Parser;
 use cranelift_interpreter::environment::FunctionStore;
 use cranelift_interpreter::interpreter::{Interpreter, InterpreterState};
 use cranelift_interpreter::step::ControlFlow;
 use cranelift_reader::{parse_run_command, parse_test, ParseError, ParseOptions};
 use std::path::PathBuf;
 use std::{fs, io};
-use structopt::StructOpt;
 use thiserror::Error;
 
 /// Interpret clif code
-#[derive(StructOpt)]
+#[derive(Parser)]
 pub struct Options {
     /// Specify an input file to be used. Use '-' for stdin.
-    #[structopt(required(true), parse(from_os_str))]
+    #[arg(required = true)]
     files: Vec<PathBuf>,
 
-    /// Enable debug output on stderr/stdout
-    #[structopt(short = "d")]
-    debug: bool,
-
     /// Be more verbose
-    #[structopt(short = "v", long = "verbose")]
+    #[arg(short, long)]
     verbose: bool,
 }
 
 /// Run files through the Cranelift interpreter, interpreting any functions with annotations.
 pub fn run(options: &Options) -> anyhow::Result<()> {
-    crate::handle_debug_flag(options.debug);
-
     let mut total = 0;
     let mut errors = 0;
     for file in iterate_files(&options.files) {
@@ -54,7 +48,7 @@ pub fn run(options: &Options) -> anyhow::Result<()> {
         match total {
             0 => println!("0 files"),
             1 => println!("1 file"),
-            n => println!("{} files", n),
+            n => println!("{n} files"),
         }
     }
 
@@ -128,7 +122,7 @@ impl FileInterpreter {
             command
                 .run(|func_name, args| {
                     // Because we have stored function names with a leading %, we need to re-add it.
-                    let func_name = &format!("%{}", func_name);
+                    let func_name = &format!("%{func_name}");
                     let state = InterpreterState::default().with_function_store(env.clone());
                     match Interpreter::new(state).call_by_name(func_name, args) {
                         Ok(ControlFlow::Return(results)) => Ok(results.to_vec()),
@@ -162,14 +156,14 @@ mod test {
     fn nop() {
         let code = String::from(
             "
-            function %test() -> b8 {
+            function %test() -> i8 {
             block0:
                 nop
-                v1 = bconst.b8 true
+                v1 = iconst.i8 -1
                 v2 = iconst.i8 42
                 return v1
             }
-            ; run: %test() == true
+            ; run: %test() == -1
             ",
         );
         FileInterpreter::from_inline_code(code).run().unwrap()
@@ -179,7 +173,6 @@ mod test {
     fn filetests() {
         run(&Options {
             files: vec![PathBuf::from("../filetests/filetests/interpreter")],
-            debug: true,
             verbose: true,
         })
         .unwrap()

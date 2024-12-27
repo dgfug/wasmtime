@@ -1,19 +1,12 @@
-use cranelift_entity::{entity_impl, PrimaryMap};
-
 use std::fmt;
 use std::rc::Rc;
 
 use crate::cdsl::camel_case;
 use crate::cdsl::formats::InstructionFormat;
 use crate::cdsl::operands::Operand;
-use crate::cdsl::type_inference::Constraint;
 use crate::cdsl::typevar::TypeVar;
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) struct OpcodeNumber(u32);
-entity_impl!(OpcodeNumber);
-
-pub(crate) type AllInstructions = PrimaryMap<OpcodeNumber, Instruction>;
+pub(crate) type AllInstructions = Vec<Instruction>;
 
 pub(crate) struct InstructionGroupBuilder<'all_inst> {
     all_instructions: &'all_inst mut AllInstructions,
@@ -25,8 +18,7 @@ impl<'all_inst> InstructionGroupBuilder<'all_inst> {
     }
 
     pub fn push(&mut self, builder: InstructionBuilder) {
-        let opcode_number = OpcodeNumber(self.all_instructions.next_key().as_u32());
-        let inst = builder.build(opcode_number);
+        let inst = builder.build();
         self.all_instructions.push(inst);
     }
 }
@@ -42,7 +34,6 @@ pub(crate) struct InstructionContent {
     /// Instruction mnemonic, also becomes opcode name.
     pub name: String,
     pub camel_name: String,
-    pub opcode_number: OpcodeNumber,
 
     /// Documentation string.
     pub doc: String,
@@ -52,7 +43,7 @@ pub(crate) struct InstructionContent {
     /// Output operands. The output operands must be SSA values or `variable_args`.
     pub operands_out: Vec<Operand>,
 
-    /// Instruction format, automatically derived from the input operands.
+    /// Instruction format.
     pub format: Rc<InstructionFormat>,
 
     /// One of the input or output operands is a free type variable. None if the instruction is not
@@ -70,14 +61,10 @@ pub(crate) struct InstructionContent {
     pub is_terminator: bool,
     /// True for all branch or jump instructions.
     pub is_branch: bool,
-    /// True for all indirect branch or jump instructions.',
-    pub is_indirect_branch: bool,
     /// Is this a call instruction?
     pub is_call: bool,
     /// Is this a return instruction?
     pub is_return: bool,
-    /// Is this a ghost instruction?
-    pub is_ghost: bool,
     /// Can this instruction read from memory?
     pub can_load: bool,
     /// Can this instruction write to memory?
@@ -86,10 +73,8 @@ pub(crate) struct InstructionContent {
     pub can_trap: bool,
     /// Does this instruction have other side effects besides can_* flags?
     pub other_side_effects: bool,
-    /// Does this instruction write to CPU flags?
-    pub writes_cpu_flags: bool,
-    /// Should this opcode be considered to clobber all live registers, during regalloc?
-    pub clobbers_all_regs: bool,
+    /// Despite having other side effects, is this instruction okay to GVN?
+    pub side_effects_idempotent: bool,
 }
 
 impl InstructionContent {
@@ -140,20 +125,17 @@ pub(crate) struct InstructionBuilder {
     format: Rc<InstructionFormat>,
     operands_in: Option<Vec<Operand>>,
     operands_out: Option<Vec<Operand>>,
-    constraints: Option<Vec<Constraint>>,
 
     // See Instruction comments for the meaning of these fields.
     is_terminator: bool,
     is_branch: bool,
-    is_indirect_branch: bool,
     is_call: bool,
     is_return: bool,
-    is_ghost: bool,
     can_load: bool,
     can_store: bool,
     can_trap: bool,
     other_side_effects: bool,
-    clobbers_all_regs: bool,
+    side_effects_idempotent: bool,
 }
 
 impl InstructionBuilder {
@@ -164,99 +146,90 @@ impl InstructionBuilder {
             format: format.clone(),
             operands_in: None,
             operands_out: None,
-            constraints: None,
 
             is_terminator: false,
             is_branch: false,
-            is_indirect_branch: false,
             is_call: false,
             is_return: false,
-            is_ghost: false,
             can_load: false,
             can_store: false,
             can_trap: false,
             other_side_effects: false,
-            clobbers_all_regs: false,
+            side_effects_idempotent: false,
         }
     }
 
-    pub fn operands_in(mut self, operands: Vec<&Operand>) -> Self {
+    pub fn operands_in(mut self, operands: Vec<Operand>) -> Self {
         assert!(self.operands_in.is_none());
-        self.operands_in = Some(operands.iter().map(|x| (*x).clone()).collect());
+        self.operands_in = Some(operands);
         self
     }
 
-    pub fn operands_out(mut self, operands: Vec<&Operand>) -> Self {
+    pub fn operands_out(mut self, operands: Vec<Operand>) -> Self {
         assert!(self.operands_out.is_none());
-        self.operands_out = Some(operands.iter().map(|x| (*x).clone()).collect());
+        self.operands_out = Some(operands);
         self
     }
 
-    pub fn constraints(mut self, constraints: Vec<Constraint>) -> Self {
-        assert!(self.constraints.is_none());
-        self.constraints = Some(constraints);
+    /// Mark this instruction as a block terminator.
+    pub fn terminates_block(mut self) -> Self {
+        self.is_terminator = true;
         self
     }
 
-    #[allow(clippy::wrong_self_convention)]
-    pub fn is_terminator(mut self, val: bool) -> Self {
-        self.is_terminator = val;
+    /// Mark this instruction as a branch instruction. This also implies that the instruction is a
+    /// block terminator.
+    pub fn branches(mut self) -> Self {
+        self.is_branch = true;
+        self.terminates_block()
+    }
+
+    /// Mark this instruction as a call instruction.
+    pub fn call(mut self) -> Self {
+        self.is_call = true;
         self
     }
 
-    #[allow(clippy::wrong_self_convention)]
-    pub fn is_branch(mut self, val: bool) -> Self {
-        self.is_branch = val;
+    /// Mark this instruction as a return instruction. This also implies that the instruction is a
+    /// block terminator.
+    pub fn returns(mut self) -> Self {
+        self.is_return = true;
+        self.terminates_block()
+    }
+
+    /// Mark this instruction as one that can load from memory.
+    pub fn can_load(mut self) -> Self {
+        self.can_load = true;
         self
     }
 
-    #[allow(clippy::wrong_self_convention)]
-    pub fn is_indirect_branch(mut self, val: bool) -> Self {
-        self.is_indirect_branch = val;
+    /// Mark this instruction as one that can store to memory.
+    pub fn can_store(mut self) -> Self {
+        self.can_store = true;
         self
     }
 
-    #[allow(clippy::wrong_self_convention)]
-    pub fn is_call(mut self, val: bool) -> Self {
-        self.is_call = val;
+    /// Mark this instruction as possibly trapping.
+    pub fn can_trap(mut self) -> Self {
+        self.can_trap = true;
         self
     }
 
-    #[allow(clippy::wrong_self_convention)]
-    pub fn is_return(mut self, val: bool) -> Self {
-        self.is_return = val;
+    /// Mark this instruction as one that has side-effects.
+    pub fn other_side_effects(mut self) -> Self {
+        self.other_side_effects = true;
         self
     }
 
-    #[allow(clippy::wrong_self_convention)]
-    pub fn is_ghost(mut self, val: bool) -> Self {
-        self.is_ghost = val;
+    /// Mark this instruction as one whose side-effects may be de-duplicated.
+    pub fn side_effects_idempotent(mut self) -> Self {
+        self.side_effects_idempotent = true;
         self
     }
 
-    pub fn can_load(mut self, val: bool) -> Self {
-        self.can_load = val;
-        self
-    }
-
-    pub fn can_store(mut self, val: bool) -> Self {
-        self.can_store = val;
-        self
-    }
-
-    pub fn can_trap(mut self, val: bool) -> Self {
-        self.can_trap = val;
-        self
-    }
-
-    pub fn other_side_effects(mut self, val: bool) -> Self {
-        self.other_side_effects = val;
-        self
-    }
-
-    fn build(self, opcode_number: OpcodeNumber) -> Instruction {
-        let operands_in = self.operands_in.unwrap_or_else(Vec::new);
-        let operands_out = self.operands_out.unwrap_or_else(Vec::new);
+    fn build(self) -> Instruction {
+        let operands_in = self.operands_in.unwrap_or_default();
+        let operands_out = self.operands_out.unwrap_or_default();
 
         let mut value_opnums = Vec::new();
         let mut imm_opnums = Vec::new();
@@ -281,15 +254,11 @@ impl InstructionBuilder {
         let polymorphic_info =
             verify_polymorphic(&operands_in, &operands_out, &self.format, &value_opnums);
 
-        // Infer from output operands whether an instruction clobbers CPU flags or not.
-        let writes_cpu_flags = operands_out.iter().any(|op| op.is_cpu_flags());
-
         let camel_name = camel_case(&self.name);
 
         Rc::new(InstructionContent {
             name: self.name,
             camel_name,
-            opcode_number,
             doc: self.doc,
             operands_in,
             operands_out,
@@ -300,16 +269,13 @@ impl InstructionBuilder {
             imm_opnums,
             is_terminator: self.is_terminator,
             is_branch: self.is_branch,
-            is_indirect_branch: self.is_indirect_branch,
             is_call: self.is_call,
             is_return: self.is_return,
-            is_ghost: self.is_ghost,
             can_load: self.can_load,
             can_store: self.can_store,
             can_trap: self.can_trap,
             other_side_effects: self.other_side_effects,
-            writes_cpu_flags,
-            clobbers_all_regs: self.clobbers_all_regs,
+            side_effects_idempotent: self.side_effects_idempotent,
         })
     }
 }
@@ -321,6 +287,7 @@ fn verify_format(inst_name: &str, operands_in: &[Operand], format: &InstructionF
     // - its number and names of input immediate operands,
     // - whether it has a value list or not.
     let mut num_values = 0;
+    let mut num_blocks = 0;
     let mut num_immediates = 0;
 
     for operand in operands_in.iter() {
@@ -335,7 +302,9 @@ fn verify_format(inst_name: &str, operands_in: &[Operand], format: &InstructionF
         if operand.is_value() {
             num_values += 1;
         }
-        if operand.is_immediate_or_entityref() {
+        if operand.kind.is_block() {
+            num_blocks += 1;
+        } else if operand.is_immediate_or_entityref() {
             if let Some(format_field) = format.imm_fields.get(num_immediates) {
                 assert_eq!(
                     format_field.kind.rust_field_name,
@@ -357,6 +326,13 @@ fn verify_format(inst_name: &str, operands_in: &[Operand], format: &InstructionF
         "inst {} doesn't have as many value input operands as its format {} declares; you may need \
          to use a different format.",
         inst_name, format.name
+    );
+
+    assert_eq!(
+        num_blocks, format.num_block_operands,
+        "inst {} doesn't have as many block input operands as its format {} declares; you may need \
+        to use a different format.",
+        inst_name, format.name,
     );
 
     assert_eq!(
@@ -399,7 +375,7 @@ fn verify_polymorphic(
             if (free_typevar.is_some() && tv == &free_typevar.unwrap())
                 || tv.singleton_type().is_some()
             {
-                match is_ctrl_typevar_candidate(tv, &operands_in, &operands_out) {
+                match is_ctrl_typevar_candidate(tv, operands_in, operands_out) {
                     Ok(_other_typevars) => {
                         return Some(PolymorphicInfo {
                             use_typevar_operand: true,
@@ -434,7 +410,7 @@ fn verify_polymorphic(
 
     // At this point, if the next unwrap() fails, it means the output type couldn't be used as a
     // controlling type variable either; panicking is the right behavior.
-    is_ctrl_typevar_candidate(tv, &operands_in, &operands_out).unwrap();
+    is_ctrl_typevar_candidate(tv, operands_in, operands_out).unwrap();
 
     Some(PolymorphicInfo {
         use_typevar_operand: false,
@@ -445,7 +421,7 @@ fn verify_polymorphic(
 /// Verify that the use of TypeVars is consistent with `ctrl_typevar` as the controlling type
 /// variable.
 ///
-/// All polymorhic inputs must either be derived from `ctrl_typevar` or be independent free type
+/// All polymorphic inputs must either be derived from `ctrl_typevar` or be independent free type
 /// variables only used once.
 ///
 /// All polymorphic results must be derived from `ctrl_typevar`.

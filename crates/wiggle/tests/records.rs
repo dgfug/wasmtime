@@ -9,66 +9,83 @@ wiggle::from_witx!({
 impl_errno!(types::Errno);
 
 impl<'a> records::Records for WasiCtx<'a> {
-    fn sum_of_pair(&mut self, an_pair: &types::PairInts) -> Result<i64, types::Errno> {
+    fn sum_of_pair(
+        &mut self,
+        _memory: &mut GuestMemory<'_>,
+        an_pair: &types::PairInts,
+    ) -> Result<i64, types::Errno> {
         Ok(an_pair.first as i64 + an_pair.second as i64)
     }
 
-    fn sum_of_pair_of_ptrs(&mut self, an_pair: &types::PairIntPtrs) -> Result<i64, types::Errno> {
-        let first = an_pair
-            .first
-            .read()
+    fn sum_of_pair_of_ptrs(
+        &mut self,
+        memory: &mut GuestMemory<'_>,
+        an_pair: &types::PairIntPtrs,
+    ) -> Result<i64, types::Errno> {
+        let first = memory
+            .read(an_pair.first)
             .expect("dereferencing GuestPtr should succeed");
-        let second = an_pair
-            .second
-            .read()
-            .expect("dereferncing GuestPtr should succeed");
+        let second = memory
+            .read(an_pair.second)
+            .expect("dereferencing GuestPtr should succeed");
         Ok(first as i64 + second as i64)
     }
 
-    fn sum_of_int_and_ptr(&mut self, an_pair: &types::PairIntAndPtr) -> Result<i64, types::Errno> {
-        let first = an_pair
-            .first
-            .read()
+    fn sum_of_int_and_ptr(
+        &mut self,
+        memory: &mut GuestMemory<'_>,
+        an_pair: &types::PairIntAndPtr,
+    ) -> Result<i64, types::Errno> {
+        let first = memory
+            .read(an_pair.first)
             .expect("dereferencing GuestPtr should succeed");
         let second = an_pair.second as i64;
         Ok(first as i64 + second)
     }
 
-    fn return_pair_ints(&mut self) -> Result<types::PairInts, types::Errno> {
+    fn return_pair_ints(
+        &mut self,
+        _memory: &mut GuestMemory<'_>,
+    ) -> Result<types::PairInts, types::Errno> {
         Ok(types::PairInts {
             first: 10,
             second: 20,
         })
     }
 
-    fn return_pair_of_ptrs<'b>(
+    fn return_pair_of_ptrs(
         &mut self,
-        first: &GuestPtr<'b, i32>,
-        second: &GuestPtr<'b, i32>,
-    ) -> Result<types::PairIntPtrs<'b>, types::Errno> {
+        _memory: &mut GuestMemory<'_>,
+        first: GuestPtr<i32>,
+        second: GuestPtr<i32>,
+    ) -> Result<types::PairIntPtrs, types::Errno> {
         Ok(types::PairIntPtrs {
-            first: *first,
-            second: *second,
+            first: first,
+            second: second,
         })
     }
 
-    fn sum_array<'b>(
+    fn sum_array(
         &mut self,
-        record_of_list: &types::RecordOfList<'b>,
+        memory: &mut GuestMemory<'_>,
+        record_of_list: &types::RecordOfList,
     ) -> Result<u16, types::Errno> {
         // my kingdom for try blocks
-        fn aux(record_of_list: &types::RecordOfList) -> Result<u16, wiggle::GuestError> {
+        fn aux(
+            memory: &mut GuestMemory<'_>,
+            record_of_list: &types::RecordOfList,
+        ) -> Result<u16, wiggle::GuestError> {
             let mut s = 0;
             for elem in record_of_list.arr.iter() {
-                let v = elem?.read()?;
+                let v = memory.read(elem?)?;
                 s += v as u16;
             }
             Ok(s)
         }
-        match aux(record_of_list) {
+        match aux(memory, record_of_list) {
             Ok(s) => Ok(s),
             Err(guest_err) => {
-                eprintln!("guest error summing array: {:?}", guest_err);
+                eprintln!("guest error summing array: {guest_err:?}");
                 Err(types::Errno::PicketLine)
             }
         }
@@ -103,28 +120,27 @@ impl SumOfPairExercise {
 
     pub fn test(&self) {
         let mut ctx = WasiCtx::new();
-        let host_memory = HostMemory::new();
+        let mut host_memory = HostMemory::new();
+        let mut memory = host_memory.guest_memory();
 
-        host_memory
-            .ptr(self.input_loc.ptr)
-            .write(self.input.first)
+        memory
+            .write(GuestPtr::new(self.input_loc.ptr), self.input.first)
             .expect("input ref_mut");
-        host_memory
-            .ptr(self.input_loc.ptr + 4)
-            .write(self.input.second)
+        memory
+            .write(GuestPtr::new(self.input_loc.ptr + 4), self.input.second)
             .expect("input ref_mut");
         let sum_err = records::sum_of_pair(
             &mut ctx,
-            &host_memory,
+            &mut memory,
             self.input_loc.ptr as i32,
             self.return_loc.ptr as i32,
-        );
+        )
+        .unwrap();
 
-        assert_eq!(sum_err, Ok(types::Errno::Ok as i32), "sum errno");
+        assert_eq!(sum_err, types::Errno::Ok as i32, "sum errno");
 
-        let return_val: i64 = host_memory
-            .ptr(self.return_loc.ptr)
-            .read()
+        let return_val: i64 = memory
+            .read(GuestPtr::new(self.return_loc.ptr))
             .expect("return ref");
 
         assert_eq!(
@@ -191,42 +207,41 @@ impl SumPairPtrsExercise {
     }
     pub fn test(&self) {
         let mut ctx = WasiCtx::new();
-        let host_memory = HostMemory::new();
+        let mut host_memory = HostMemory::new();
+        let mut memory = host_memory.guest_memory();
 
-        host_memory
-            .ptr(self.input_first_loc.ptr)
-            .write(self.input_first)
+        memory
+            .write(GuestPtr::new(self.input_first_loc.ptr), self.input_first)
             .expect("input_first ref");
-        host_memory
-            .ptr(self.input_second_loc.ptr)
-            .write(self.input_second)
+        memory
+            .write(GuestPtr::new(self.input_second_loc.ptr), self.input_second)
             .expect("input_second ref");
 
-        host_memory
-            .ptr(self.input_struct_loc.ptr)
-            .write(self.input_first_loc.ptr)
+        memory
+            .write(
+                GuestPtr::new(self.input_struct_loc.ptr),
+                self.input_first_loc.ptr,
+            )
             .expect("input_struct ref");
-        host_memory
-            .ptr(self.input_struct_loc.ptr + 4)
-            .write(self.input_second_loc.ptr)
+        memory
+            .write(
+                GuestPtr::new(self.input_struct_loc.ptr + 4),
+                self.input_second_loc.ptr,
+            )
             .expect("input_struct ref");
 
         let res = records::sum_of_pair_of_ptrs(
             &mut ctx,
-            &host_memory,
+            &mut memory,
             self.input_struct_loc.ptr as i32,
             self.return_loc.ptr as i32,
-        );
+        )
+        .unwrap();
 
-        assert_eq!(
-            res,
-            Ok(types::Errno::Ok as i32),
-            "sum of pair of ptrs errno"
-        );
+        assert_eq!(res, types::Errno::Ok as i32, "sum of pair of ptrs errno");
 
-        let doubled: i64 = host_memory
-            .ptr(self.return_loc.ptr)
-            .read()
+        let doubled: i64 = memory
+            .read(GuestPtr::new(self.return_loc.ptr))
             .expect("return ref");
 
         assert_eq!(
@@ -279,33 +294,37 @@ impl SumIntAndPtrExercise {
     }
     pub fn test(&self) {
         let mut ctx = WasiCtx::new();
-        let host_memory = HostMemory::new();
+        let mut host_memory = HostMemory::new();
+        let mut memory = host_memory.guest_memory();
 
-        host_memory
-            .ptr(self.input_first_loc.ptr)
-            .write(self.input_first)
+        memory
+            .write(GuestPtr::new(self.input_first_loc.ptr), self.input_first)
             .expect("input_first ref");
-        host_memory
-            .ptr(self.input_struct_loc.ptr)
-            .write(self.input_first_loc.ptr)
+        memory
+            .write(
+                GuestPtr::new(self.input_struct_loc.ptr),
+                self.input_first_loc.ptr,
+            )
             .expect("input_struct ref");
-        host_memory
-            .ptr(self.input_struct_loc.ptr + 4)
-            .write(self.input_second)
+        memory
+            .write(
+                GuestPtr::new(self.input_struct_loc.ptr + 4),
+                self.input_second,
+            )
             .expect("input_struct ref");
 
         let res = records::sum_of_int_and_ptr(
             &mut ctx,
-            &host_memory,
+            &mut memory,
             self.input_struct_loc.ptr as i32,
             self.return_loc.ptr as i32,
-        );
+        )
+        .unwrap();
 
-        assert_eq!(res, Ok(types::Errno::Ok as i32), "sum of int and ptr errno");
+        assert_eq!(res, types::Errno::Ok as i32, "sum of int and ptr errno");
 
-        let doubled: i64 = host_memory
-            .ptr(self.return_loc.ptr)
-            .read()
+        let doubled: i64 = memory
+            .read(GuestPtr::new(self.return_loc.ptr))
             .expect("return ref");
 
         assert_eq!(
@@ -336,15 +355,16 @@ impl ReturnPairInts {
 
     pub fn test(&self) {
         let mut ctx = WasiCtx::new();
-        let host_memory = HostMemory::new();
+        let mut host_memory = HostMemory::new();
+        let mut memory = host_memory.guest_memory();
 
-        let err = records::return_pair_ints(&mut ctx, &host_memory, self.return_loc.ptr as i32);
+        let err =
+            records::return_pair_ints(&mut ctx, &mut memory, self.return_loc.ptr as i32).unwrap();
 
-        assert_eq!(err, Ok(types::Errno::Ok as i32), "return struct errno");
+        assert_eq!(err, types::Errno::Ok as i32, "return struct errno");
 
-        let return_struct: types::PairInts = host_memory
-            .ptr(self.return_loc.ptr)
-            .read()
+        let return_struct: types::PairInts = memory
+            .read(GuestPtr::new(self.return_loc.ptr))
             .expect("return ref");
 
         assert_eq!(
@@ -401,47 +421,42 @@ impl ReturnPairPtrsExercise {
     }
     pub fn test(&self) {
         let mut ctx = WasiCtx::new();
-        let host_memory = HostMemory::new();
+        let mut host_memory = HostMemory::new();
+        let mut memory = host_memory.guest_memory();
 
-        host_memory
-            .ptr(self.input_first_loc.ptr)
-            .write(self.input_first)
+        memory
+            .write(GuestPtr::new(self.input_first_loc.ptr), self.input_first)
             .expect("input_first ref");
-        host_memory
-            .ptr(self.input_second_loc.ptr)
-            .write(self.input_second)
+        memory
+            .write(GuestPtr::new(self.input_second_loc.ptr), self.input_second)
             .expect("input_second ref");
 
         let res = records::return_pair_of_ptrs(
             &mut ctx,
-            &host_memory,
+            &mut memory,
             self.input_first_loc.ptr as i32,
             self.input_second_loc.ptr as i32,
             self.return_loc.ptr as i32,
-        );
+        )
+        .unwrap();
 
-        assert_eq!(
-            res,
-            Ok(types::Errno::Ok as i32),
-            "return pair of ptrs errno"
-        );
+        assert_eq!(res, types::Errno::Ok as i32, "return pair of ptrs errno");
 
-        let ptr_pair_int_ptrs: types::PairIntPtrs<'_> = host_memory
-            .ptr(self.return_loc.ptr)
-            .read()
+        let ptr_pair_int_ptrs: types::PairIntPtrs = memory
+            .read(GuestPtr::new(self.return_loc.ptr))
             .expect("failed to read return location");
         let ret_first_ptr = ptr_pair_int_ptrs.first;
         let ret_second_ptr = ptr_pair_int_ptrs.second;
         assert_eq!(
             self.input_first,
-            ret_first_ptr
-                .read()
+            memory
+                .read(ret_first_ptr)
                 .expect("deref extracted ptr to first element")
         );
         assert_eq!(
             self.input_second,
-            ret_second_ptr
-                .read()
+            memory
+                .read(ret_second_ptr)
                 .expect("deref extracted ptr to second element")
         );
     }
@@ -475,7 +490,7 @@ impl SumArrayExercise {
             .prop_filter(
                 "non-overlapping input struct and output pointers",
                 |(_inputs, input_struct_loc, output_loc)| {
-                    MemArea::non_overlapping_set(&[input_struct_loc.clone(), output_loc.clone()])
+                    MemArea::non_overlapping_set(&[*input_struct_loc, *output_loc])
                 },
             )
             .prop_flat_map(|(inputs, input_struct_loc, output_loc)| {
@@ -486,8 +501,8 @@ impl SumArrayExercise {
                         1,
                         &MemAreas::from([input_struct_loc, output_loc]),
                     ),
-                    Just(input_struct_loc.clone()),
-                    Just(output_loc.clone()),
+                    Just(input_struct_loc),
+                    Just(output_loc),
                 )
             })
             .prop_map(
@@ -502,45 +517,49 @@ impl SumArrayExercise {
     }
     pub fn test(&self) {
         let mut ctx = WasiCtx::new();
-        let host_memory = HostMemory::new();
+        let mut host_memory = HostMemory::new();
+        let mut memory = host_memory.guest_memory();
 
         // Write inputs to memory as an array
         for (ix, val) in self.inputs.iter().enumerate() {
             let ix = ix as u32;
-            host_memory
-                .ptr(self.input_array_loc.ptr + ix)
-                .write(*val)
+            memory
+                .write(GuestPtr::new(self.input_array_loc.ptr + ix), *val)
                 .expect("write val to array memory");
         }
 
         // Write struct that contains the array
-        host_memory
-            .ptr(self.input_struct_loc.ptr)
-            .write(self.input_array_loc.ptr)
+        memory
+            .write(
+                GuestPtr::new(self.input_struct_loc.ptr),
+                self.input_array_loc.ptr,
+            )
             .expect("write ptr to struct memory");
-        host_memory
-            .ptr(self.input_struct_loc.ptr + 4)
-            .write(self.inputs.len() as u32)
+        memory
+            .write(
+                GuestPtr::new(self.input_struct_loc.ptr + 4),
+                self.inputs.len() as u32,
+            )
             .expect("write len to struct memory");
 
         // Call wiggle-generated func
         let res = records::sum_array(
             &mut ctx,
-            &host_memory,
+            &mut memory,
             self.input_struct_loc.ptr as i32,
             self.output_loc.ptr as i32,
-        );
+        )
+        .unwrap();
 
         // should be no error - if hostcall did a GuestError it should eprintln it.
-        assert_eq!(res, Ok(types::Errno::Ok as i32), "reduce excuses errno");
+        assert_eq!(res, types::Errno::Ok as i32, "reduce excuses errno");
 
         // Sum is inputs upcasted to u16
         let expected: u16 = self.inputs.iter().map(|v| *v as u16).sum();
 
         // Wiggle stored output value in memory as u16
-        let given: u16 = host_memory
-            .ptr(self.output_loc.ptr)
-            .read()
+        let given: u16 = memory
+            .read(GuestPtr::new(self.output_loc.ptr))
             .expect("deref ptr to returned value");
 
         // Assert the two calculations match
@@ -552,4 +571,35 @@ proptest! {
     fn sum_of_array(e in SumArrayExercise::strat()) {
         e.test()
     }
+}
+
+#[test]
+fn pair_ints_offsets() {
+    assert_eq!(types::PairInts::offset_of_first(), 0);
+    assert_eq!(types::PairInts::offset_of_second(), 4);
+}
+
+#[test]
+fn pair_different_ints_offsets() {
+    assert_eq!(types::PairDifferentInts::offset_of_first(), 0);
+    assert_eq!(types::PairDifferentInts::offset_of_second(), 8);
+    assert_eq!(types::PairDifferentInts::offset_of_third(), 10);
+    assert_eq!(types::PairDifferentInts::offset_of_fourth(), 12);
+}
+
+#[test]
+fn pair_int_ptrs_offsets() {
+    assert_eq!(types::PairIntPtrs::offset_of_first(), 0);
+    assert_eq!(types::PairIntPtrs::offset_of_second(), 4);
+}
+
+#[test]
+fn pair_int_and_ptr_offsets() {
+    assert_eq!(types::PairIntAndPtr::offset_of_first(), 0);
+    assert_eq!(types::PairIntAndPtr::offset_of_second(), 4);
+}
+
+#[test]
+fn pair_record_of_list_offset() {
+    assert_eq!(types::RecordOfList::offset_of_arr(), 0);
 }

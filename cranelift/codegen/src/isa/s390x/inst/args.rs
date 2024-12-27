@@ -1,16 +1,8 @@
 //! S390x ISA definitions: instruction arguments.
 
-// Some variants are never constructed, but we still want them as options in the future.
-#![allow(dead_code)]
-
 use crate::ir::condcodes::{FloatCC, IntCC};
 use crate::ir::MemFlags;
 use crate::isa::s390x::inst::*;
-use crate::machinst::MachLabel;
-
-use regalloc::{PrettyPrint, RealRegUniverse, Reg};
-
-use std::string::String;
 
 //=============================================================================
 // Instruction sub-components (memory addresses): definitions
@@ -38,7 +30,7 @@ pub enum MemArg {
     },
 
     /// PC-relative Reference to a label.
-    Label { target: BranchTarget },
+    Label { target: MachLabel },
 
     /// PC-relative Reference to a near symbol.
     Symbol {
@@ -57,19 +49,20 @@ pub enum MemArg {
     /// Offset from the stack pointer at function entry.
     InitialSPOffset { off: i64 },
 
-    /// Offset from the "nominal stack pointer", which is where the real SP is
-    /// just after stack and spill slots are allocated in the function prologue.
+    /// Offset from the (nominal) stack pointer during this function.
+    NominalSPOffset { off: i64 },
+
+    /// Offset into the slot area of the stack, which lies just above the
+    /// outgoing argument area that's setup by the function prologue.
     /// At emission time, this is converted to `SPOffset` with a fixup added to
     /// the offset constant. The fixup is a running value that is tracked as
     /// emission iterates through instructions in linear order, and can be
     /// adjusted up and down with [Inst::VirtualSPOffsetAdj].
     ///
     /// The standard ABI is in charge of handling this (by emitting the
-    /// adjustment meta-instructions). It maintains the invariant that "nominal
-    /// SP" is where the actual SP is after the function prologue and before
-    /// clobber pushes. See the diagram in the documentation for
-    /// [crate::isa::s390x::abi](the ABI module) for more details.
-    NominalSPOffset { off: i64 },
+    /// adjustment meta-instructions). See the diagram in the documentation
+    /// for [crate::isa::aarch64::abi](the ABI module) for more details.
+    SlotOffset { off: i64 },
 }
 
 impl MemArg {
@@ -98,6 +91,25 @@ impl MemArg {
         MemArg::RegOffset { reg, off, flags }
     }
 
+    /// Add an offset to a virtual addressing mode.
+    pub fn offset(base: &MemArg, offset: i64) -> MemArg {
+        match base {
+            &MemArg::RegOffset { reg, off, flags } => MemArg::RegOffset {
+                reg,
+                off: off + offset,
+                flags,
+            },
+            &MemArg::InitialSPOffset { off } => MemArg::InitialSPOffset { off: off + offset },
+            &MemArg::NominalSPOffset { off } => MemArg::NominalSPOffset { off: off + offset },
+            &MemArg::SlotOffset { off } => MemArg::SlotOffset { off: off + offset },
+            // This routine is only defined for virtual addressing modes.
+            &MemArg::BXD12 { .. }
+            | &MemArg::BXD20 { .. }
+            | &MemArg::Label { .. }
+            | &MemArg::Symbol { .. } => unreachable!(),
+        }
+    }
+
     pub(crate) fn get_flags(&self) -> MemFlags {
         match self {
             MemArg::BXD12 { flags, .. } => *flags,
@@ -107,11 +119,8 @@ impl MemArg {
             MemArg::Symbol { flags, .. } => *flags,
             MemArg::InitialSPOffset { .. } => MemFlags::trusted(),
             MemArg::NominalSPOffset { .. } => MemFlags::trusted(),
+            MemArg::SlotOffset { .. } => MemFlags::trusted(),
         }
-    }
-
-    pub(crate) fn can_trap(&self) -> bool {
-        !self.get_flags().notrap()
     }
 }
 
@@ -143,8 +152,6 @@ impl Cond {
             IntCC::UnsignedGreaterThan => 2,
             IntCC::UnsignedLessThanOrEqual => 8 | 4,
             IntCC::UnsignedLessThan => 4,
-            IntCC::Overflow => 1,
-            IntCC::NotOverflow => 8 | 4 | 2,
         };
         Cond { mask }
     }
@@ -182,49 +189,8 @@ impl Cond {
     }
 }
 
-/// A branch target. Either unresolved (basic-block index) or resolved (offset
-/// from end of current instruction).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BranchTarget {
-    /// An unresolved reference to a Label, as passed into
-    /// `lower_branch_group()`.
-    Label(MachLabel),
-    /// A fixed PC offset.
-    ResolvedOffset(i32),
-}
-
-impl BranchTarget {
-    /// Return the target's label, if it is a label-based target.
-    pub fn as_label(self) -> Option<MachLabel> {
-        match self {
-            BranchTarget::Label(l) => Some(l),
-            _ => None,
-        }
-    }
-
-    /// Return the target's offset, if specified, or zero if label-based.
-    pub fn as_ri_offset_or_zero(self) -> u16 {
-        let off = match self {
-            BranchTarget::ResolvedOffset(off) => off >> 1,
-            _ => 0,
-        };
-        assert!(off <= 0x7fff);
-        assert!(off >= -0x8000);
-        off as u16
-    }
-
-    /// Return the target's offset, if specified, or zero if label-based.
-    pub fn as_ril_offset_or_zero(self) -> u32 {
-        let off = match self {
-            BranchTarget::ResolvedOffset(off) => off >> 1,
-            _ => 0,
-        };
-        off as u32
-    }
-}
-
 impl PrettyPrint for MemArg {
-    fn show_rru(&self, mb_rru: Option<&RealRegUniverse>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         match self {
             &MemArg::BXD12 {
                 base, index, disp, ..
@@ -233,18 +199,18 @@ impl PrettyPrint for MemArg {
                     if index != zero_reg() {
                         format!(
                             "{}({},{})",
-                            disp.show_rru(mb_rru),
-                            index.show_rru(mb_rru),
-                            base.show_rru(mb_rru)
+                            disp.pretty_print_default(),
+                            show_reg(index),
+                            show_reg(base),
                         )
                     } else {
-                        format!("{}({})", disp.show_rru(mb_rru), base.show_rru(mb_rru))
+                        format!("{}({})", disp.pretty_print_default(), show_reg(base))
                     }
                 } else {
                     if index != zero_reg() {
-                        format!("{}({},)", disp.show_rru(mb_rru), index.show_rru(mb_rru))
+                        format!("{}({},)", disp.pretty_print_default(), show_reg(index))
                     } else {
-                        format!("{}", disp.show_rru(mb_rru))
+                        format!("{}", disp.pretty_print_default())
                     }
                 }
             }
@@ -255,28 +221,29 @@ impl PrettyPrint for MemArg {
                     if index != zero_reg() {
                         format!(
                             "{}({},{})",
-                            disp.show_rru(mb_rru),
-                            index.show_rru(mb_rru),
-                            base.show_rru(mb_rru)
+                            disp.pretty_print_default(),
+                            show_reg(index),
+                            show_reg(base),
                         )
                     } else {
-                        format!("{}({})", disp.show_rru(mb_rru), base.show_rru(mb_rru))
+                        format!("{}({})", disp.pretty_print_default(), show_reg(base))
                     }
                 } else {
                     if index != zero_reg() {
-                        format!("{}({},)", disp.show_rru(mb_rru), index.show_rru(mb_rru))
+                        format!("{}({},)", disp.pretty_print_default(), show_reg(index))
                     } else {
-                        format!("{}", disp.show_rru(mb_rru))
+                        format!("{}", disp.pretty_print_default())
                     }
                 }
             }
-            &MemArg::Label { ref target } => target.show_rru(mb_rru),
+            &MemArg::Label { target } => target.to_string(),
             &MemArg::Symbol {
                 ref name, offset, ..
-            } => format!("{} + {}", name, offset),
+            } => format!("{} + {}", name.display(None), offset),
             // Eliminated by `mem_finalize()`.
             &MemArg::InitialSPOffset { .. }
             | &MemArg::NominalSPOffset { .. }
+            | &MemArg::SlotOffset { .. }
             | &MemArg::RegOffset { .. } => {
                 panic!("Unexpected pseudo mem-arg mode (stack-offset or generic reg-offset)!")
             }
@@ -285,7 +252,7 @@ impl PrettyPrint for MemArg {
 }
 
 impl PrettyPrint for Cond {
-    fn show_rru(&self, _mb_rru: Option<&RealRegUniverse>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         let s = match self.mask {
             1 => "o",
             2 => "h",
@@ -304,14 +271,5 @@ impl PrettyPrint for Cond {
             _ => unreachable!(),
         };
         s.to_string()
-    }
-}
-
-impl PrettyPrint for BranchTarget {
-    fn show_rru(&self, _mb_rru: Option<&RealRegUniverse>) -> String {
-        match self {
-            &BranchTarget::Label(label) => format!("label{:?}", label.get()),
-            &BranchTarget::ResolvedOffset(off) => format!("{}", off),
-        }
     }
 }

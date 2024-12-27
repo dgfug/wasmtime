@@ -4,7 +4,7 @@
 //! The general syntax is:
 //!
 //! <pre>
-//! test <i>&lt;command&gt;</i> </i>[options]</i>...
+//! test <i>&lt;command&gt;</i> <i>[options]</i>...
 //! </pre>
 //!
 //! The options are either a single identifier flag, or setting values like `identifier=value`.
@@ -52,7 +52,7 @@ impl<'a> Display for TestCommand<'a> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(f, "{}", self.command)?;
         for opt in &self.options {
-            write!(f, " {}", opt)?;
+            write!(f, " {opt}")?;
         }
         writeln!(f)
     }
@@ -72,8 +72,8 @@ impl<'a> TestOption<'a> {
 impl<'a> Display for TestOption<'a> {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match *self {
-            TestOption::Flag(s) => write!(f, "{}", s),
-            TestOption::Value(s, v) => write!(f, "{}={}", s, v),
+            TestOption::Flag(s) => write!(f, "{s}"),
+            TestOption::Value(s, v) => write!(f, "{s}={v}"),
         }
     }
 }

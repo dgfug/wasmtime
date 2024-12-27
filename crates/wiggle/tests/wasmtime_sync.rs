@@ -1,4 +1,5 @@
 use wasmtime::{Engine, Linker, Module, Store, Val};
+use wiggle::GuestMemory;
 
 wiggle::from_witx!({
     witx: ["$CARGO_MANIFEST_DIR/tests/atoms.witx"],
@@ -18,12 +19,18 @@ const TRIGGER_PENDING: u32 = 0;
 
 #[wiggle::async_trait]
 impl atoms::Atoms for Ctx {
-    fn int_float_args(&mut self, an_int: u32, an_float: f32) -> Result<(), types::Errno> {
-        println!("INT FLOAT ARGS: {} {}", an_int, an_float);
+    fn int_float_args(
+        &mut self,
+        _: &mut GuestMemory<'_>,
+        an_int: u32,
+        an_float: f32,
+    ) -> Result<(), types::Errno> {
+        println!("INT FLOAT ARGS: {an_int} {an_float}");
         Ok(())
     }
     async fn double_int_return_float(
         &mut self,
+        _: &mut GuestMemory<'_>,
         an_int: u32,
     ) -> Result<types::AliasToFloat, types::Errno> {
         if an_int == TRIGGER_PENDING {
@@ -132,9 +139,8 @@ fn test_async_host_func_pending() {
         )
         .unwrap_err();
     assert!(
-        format!("{}", trap).contains("Cannot wait on pending future"),
-        "expected get a pending future Trap from dummy executor, got: {}",
-        trap
+        format!("{trap:?}").contains("Cannot wait on pending future"),
+        "expected get a pending future Trap from dummy executor, got: {trap}"
     );
 }
 

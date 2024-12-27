@@ -1,13 +1,8 @@
 use super::address_transform::AddressTransform;
-use super::attr::clone_attr_string;
 use super::{Reader, TransformError};
-use anyhow::{Context, Error};
-use gimli::{
-    write, DebugLine, DebugLineOffset, DebugLineStr, DebugStr, DebugStrOffsets,
-    DebuggingInformationEntry, LineEncoding, Unit,
-};
-use more_asserts::assert_le;
-use wasmtime_environ::{DefinedFuncIndex, EntityRef};
+use anyhow::{bail, Error};
+use gimli::{write, DebugLineOffset, LineEncoding, Unit};
+use wasmtime_environ::DefinedFuncIndex;
 
 #[derive(Debug)]
 enum SavedLineProgramRow {
@@ -24,7 +19,7 @@ enum SavedLineProgramRow {
         epilogue_begin: bool,
         isa: u64,
     },
-    EndOfSequence(u64),
+    EndOfSequence,
 }
 
 #[derive(Debug)]
@@ -41,59 +36,21 @@ enum ReadLineProgramState {
 }
 
 pub(crate) fn clone_line_program<R>(
+    dwarf: &gimli::Dwarf<R>,
     unit: &Unit<R, R::Offset>,
-    root: &DebuggingInformationEntry<R>,
+    comp_name: Option<R>,
     addr_tr: &AddressTransform,
     out_encoding: gimli::Encoding,
-    debug_str: &DebugStr<R>,
-    debug_str_offsets: &DebugStrOffsets<R>,
-    debug_line_str: &DebugLineStr<R>,
-    debug_line: &DebugLine<R>,
     out_strings: &mut write::StringTable,
 ) -> Result<(write::LineProgram, DebugLineOffset, Vec<write::FileId>, u64), Error>
 where
     R: Reader,
 {
-    let offset = match root.attr_value(gimli::DW_AT_stmt_list)? {
-        Some(gimli::AttributeValue::DebugLineRef(offset)) => offset,
-        _ => {
-            return Err(TransformError("Debug line offset is not found").into());
-        }
-    };
-    let comp_dir = root.attr_value(gimli::DW_AT_comp_dir)?;
-    let comp_name = root.attr_value(gimli::DW_AT_name)?;
-    let out_comp_dir = match &comp_dir {
-        Some(comp_dir) => Some(clone_attr_string(
-            comp_dir,
-            gimli::DW_FORM_strp,
-            unit,
-            debug_str,
-            debug_str_offsets,
-            debug_line_str,
-            out_strings,
-        )?),
-        None => None,
-    };
-    let out_comp_name = clone_attr_string(
-        comp_name.as_ref().context("missing DW_AT_name attribute")?,
-        gimli::DW_FORM_strp,
-        unit,
-        debug_str,
-        debug_str_offsets,
-        debug_line_str,
-        out_strings,
-    )?;
-
-    let program = debug_line.program(
-        offset,
-        unit.header.address_size(),
-        comp_dir.and_then(|val| val.string_value(&debug_str)),
-        comp_name.and_then(|val| val.string_value(&debug_str)),
-    );
-    if let Ok(program) = program {
+    if let Some(program) = unit.line_program.clone() {
         let header = program.header();
+        let offset = header.offset();
         let file_index_base = if header.version() < 5 { 1 } else { 0 };
-        assert_le!(header.version(), 5, "not supported 6");
+        assert!(header.version() <= 5, "not supported 6");
         let line_encoding = LineEncoding {
             minimum_instruction_length: header.minimum_instruction_length(),
             maximum_operations_per_instruction: header.maximum_operations_per_instruction(),
@@ -101,23 +58,32 @@ where
             line_base: header.line_base(),
             line_range: header.line_range(),
         };
+        let out_comp_dir = match header.directory(0) {
+            Some(comp_dir) => clone_line_string(
+                dwarf.attr_string(unit, comp_dir)?,
+                gimli::DW_FORM_string,
+                out_strings,
+            )?,
+            None => write::LineString::String(Vec::new()),
+        };
+        let out_comp_name = match comp_name {
+            Some(comp_name) => clone_line_string(comp_name, gimli::DW_FORM_strp, out_strings)?,
+            None => write::LineString::String(Vec::new()),
+        };
+
         let mut out_program = write::LineProgram::new(
             out_encoding,
             line_encoding,
-            out_comp_dir.unwrap_or_else(|| write::LineString::String(Vec::new())),
+            out_comp_dir,
             out_comp_name,
             None,
         );
         let mut dirs = Vec::new();
         dirs.push(out_program.default_directory());
         for dir_attr in header.include_directories() {
-            let dir_id = out_program.add_directory(clone_attr_string(
-                dir_attr,
+            let dir_id = out_program.add_directory(clone_line_string(
+                dwarf.attr_string(unit, dir_attr.clone())?,
                 gimli::DW_FORM_string,
-                unit,
-                debug_str,
-                debug_str_offsets,
-                debug_line_str,
                 out_strings,
             )?);
             dirs.push(dir_id);
@@ -129,13 +95,9 @@ where
             let dir_index = file_entry.directory_index() + directory_index_correction;
             let dir_id = dirs[dir_index as usize];
             let file_id = out_program.add_file(
-                clone_attr_string(
-                    &file_entry.path_name(),
+                clone_line_string(
+                    dwarf.attr_string(unit, file_entry.path_name())?,
                     gimli::DW_FORM_string,
-                    unit,
-                    debug_str,
-                    debug_str_offsets,
-                    debug_line_str,
                     out_strings,
                 )?,
                 dir_id,
@@ -168,7 +130,7 @@ where
 
                 saved_rows = Vec::new();
                 state = ReadLineProgramState::SequenceEnded;
-                SavedLineProgramRow::EndOfSequence(row.address())
+                SavedLineProgramRow::EndOfSequence
             } else {
                 if state == ReadLineProgramState::SequenceEnded {
                     // Discard sequences for non-existent code.
@@ -218,7 +180,7 @@ where
                     continue; // no code generated
                 }
             };
-            let symbol = index.index();
+            let symbol = map.symbol;
             let base_addr = map.offset;
             out_program.begin_sequence(Some(write::Address::Symbol { symbol, addend: 0 }));
             // TODO track and place function declaration line here
@@ -280,4 +242,23 @@ where
     } else {
         Err(TransformError("Valid line program not found").into())
     }
+}
+
+fn clone_line_string<R>(
+    value: R,
+    form: gimli::DwForm,
+    out_strings: &mut write::StringTable,
+) -> Result<write::LineString, Error>
+where
+    R: Reader,
+{
+    let content = value.to_string_lossy()?.into_owned();
+    Ok(match form {
+        gimli::DW_FORM_strp => {
+            let id = out_strings.add(content);
+            write::LineString::StringRef(id)
+        }
+        gimli::DW_FORM_string => write::LineString::String(content.into()),
+        _ => bail!("DW_FORM_line_strp or other not supported"),
+    })
 }

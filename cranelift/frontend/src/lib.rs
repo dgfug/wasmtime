@@ -4,38 +4,36 @@
 //! corresponding to your source program written in another language.
 //!
 //! To get started, create an [`FunctionBuilderContext`](struct.FunctionBuilderContext.html) and
-//! pass it as an argument to a [`FunctionBuilder`](struct.FunctionBuilder.html).
+//! pass it as an argument to a [`FunctionBuilder`].
 //!
 //! # Mutable variables and Cranelift IR values
 //!
 //! The most interesting feature of this API is that it provides a single way to deal with all your
-//! variable problems. Indeed, the [`FunctionBuilder`](struct.FunctionBuilder.html) struct has a
+//! variable problems. Indeed, the [`FunctionBuilder`] struct has a
 //! type `Variable` that should be an index of your source language variables. Then, through
 //! calling the functions
-//! [`declare_var`](struct.FunctionBuilder.html#method.declare_var),
-//! [`def_var`](struct.FunctionBuilder.html#method.def_var) and
-//! [`use_var`](struct.FunctionBuilder.html#method.use_var), the
-//! [`FunctionBuilder`](struct.FunctionBuilder.html) will create for you all the Cranelift IR
-//! values corresponding to your variables.
+//! [`declare_var`](FunctionBuilder::declare_var), [`def_var`](FunctionBuilder::def_var) and
+//! [`use_var`](FunctionBuilder::use_var), the [`FunctionBuilder`] will create for you all the
+//! Cranelift IR values corresponding to your variables.
 //!
 //! This API has been designed to help you translate your mutable variables into
 //! [`SSA`](https://en.wikipedia.org/wiki/Static_single_assignment_form) form.
-//! [`use_var`](struct.FunctionBuilder.html#method.use_var) will return the Cranelift IR value
+//! [`use_var`](FunctionBuilder::use_var) will return the Cranelift IR value
 //! that corresponds to your mutable variable at a precise point in the program. However, if you know
 //! beforehand that one of your variables is defined only once, for instance if it is the result
 //! of an intermediate expression in an expression-based language, then you can translate it
 //! directly by the Cranelift IR value returned by the instruction builder. Using the
-//! [`use_var`](struct.FunctionBuilder.html#method.use_var) API for such an immutable variable
+//! [`use_var`](FunctionBuilder::use_var) API for such an immutable variable
 //! would also work but with a slight additional overhead (the SSA algorithm does not know
 //! beforehand if a variable is immutable or not).
 //!
 //! The moral is that you should use these three functions to handle all your mutable variables,
 //! even those that are not present in the source code but artifacts of the translation. It is up
-//! to you to keep a mapping between the mutable variables of your language and their `Variable`
-//! index that is used by Cranelift. Caution: as the `Variable` is used by Cranelift to index an
-//! array containing information about your mutable variables, when you create a new `Variable`
-//! with [`Variable::new(var_index)`] you should make sure that `var_index` is provided by a
-//! counter incremented by 1 each time you encounter a new mutable variable.
+//! to you to keep a mapping between the mutable variables of your language and their [`Variable`]
+//! index that is used by Cranelift. Caution: as the [`Variable`] is used by Cranelift to index an
+//! array containing information about your mutable variables, when you create a new [`Variable`]
+//! with `Variable::new(var_index)` you should make sure that `var_index`
+//! is provided by a counter incremented by 1 each time you encounter a new mutable variable.
 //!
 //! # Example
 //!
@@ -50,8 +48,7 @@
 //!    jump block1
 //! block1:
 //!    z = z + y;
-//!    brnz y, block3;
-//!    jump block2
+//!    brif y, block3, block2
 //! block2:
 //!    z = z - x;
 //!    return y
@@ -61,15 +58,12 @@
 //! }
 //! ```
 //!
-//! Here is how you build the corresponding Cranelift IR function using `FunctionBuilderContext`:
+//! Here is how you build the corresponding Cranelift IR function using [`FunctionBuilderContext`]:
 //!
 //! ```rust
-//! extern crate cranelift_codegen;
-//! extern crate cranelift_frontend;
-//!
 //! use cranelift_codegen::entity::EntityRef;
 //! use cranelift_codegen::ir::types::*;
-//! use cranelift_codegen::ir::{AbiParam, ExternalName, Function, InstBuilder, Signature};
+//! use cranelift_codegen::ir::{AbiParam, UserFuncName, Function, InstBuilder, Signature};
 //! use cranelift_codegen::isa::CallConv;
 //! use cranelift_codegen::settings;
 //! use cranelift_codegen::verifier::verify_function;
@@ -79,7 +73,7 @@
 //! sig.returns.push(AbiParam::new(I32));
 //! sig.params.push(AbiParam::new(I32));
 //! let mut fn_builder_ctx = FunctionBuilderContext::new();
-//! let mut func = Function::with_name_signature(ExternalName::user(0, 0), sig);
+//! let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
 //! {
 //!     let mut builder = FunctionBuilder::new(&mut func, &mut fn_builder_ctx);
 //!
@@ -122,9 +116,8 @@
 //!     }
 //!     {
 //!         let arg = builder.use_var(y);
-//!         builder.ins().brnz(arg, block3, &[]);
+//!         builder.ins().brif(arg, block3, &[], block2, &[]);
 //!     }
-//!     builder.ins().jump(block2, &[]);
 //!
 //!     builder.switch_to_block(block2);
 //!     builder.seal_block(block2);
@@ -162,26 +155,9 @@
 //! }
 //! ```
 
-#![deny(missing_docs, trivial_numeric_casts, unused_extern_crates)]
-#![warn(unused_import_braces)]
-#![cfg_attr(feature = "std", deny(unstable_features))]
-#![cfg_attr(feature = "cargo-clippy", allow(clippy::new_without_default))]
-#![cfg_attr(
-    feature = "cargo-clippy",
-    warn(
-        clippy::float_arithmetic,
-        clippy::mut_mut,
-        clippy::nonminimal_bool,
-        clippy::map_unwrap_or,
-        clippy::clippy::print_stdout,
-        clippy::unicode_not_nfc,
-        clippy::use_self
-    )
-)]
+#![deny(missing_docs)]
 #![no_std]
 
-#[allow(unused_imports)] // #[macro_use] is required for no_std
-#[macro_use]
 extern crate alloc;
 
 #[cfg(feature = "std")]
@@ -189,13 +165,41 @@ extern crate alloc;
 extern crate std;
 
 #[cfg(not(feature = "std"))]
-use hashbrown::{hash_map, HashMap};
+use hashbrown::{HashMap, HashSet};
 #[cfg(feature = "std")]
-use std::collections::{hash_map, HashMap};
+use std::collections::{HashMap, HashSet};
 
-pub use crate::frontend::{FunctionBuilder, FunctionBuilderContext};
+pub use crate::frontend::{FuncInstBuilder, FunctionBuilder, FunctionBuilderContext};
 pub use crate::switch::Switch;
 pub use crate::variable::Variable;
+
+#[cfg(test)]
+macro_rules! assert_eq_output {
+    ( $left:expr, $right:expr $(,)? ) => {{
+        let left = $left;
+        let left = left.trim();
+
+        let right = $right;
+        let right = right.trim();
+
+        assert_eq!(
+            left,
+            right,
+            "assertion failed, output not equal:\n\
+             \n\
+             =========== Diff ===========\n\
+             {}\n\
+             =========== Left ===========\n\
+             {left}\n\
+             =========== Right ===========\n\
+             {right}\n\
+             ",
+            similar::TextDiff::from_lines(left, right)
+                .unified_diff()
+                .header("left", "right")
+        )
+    }};
+}
 
 mod frontend;
 mod ssa;

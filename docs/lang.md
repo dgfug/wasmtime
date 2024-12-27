@@ -1,4 +1,4 @@
-# Using WebAssembly from your Language
+# Using the Wasmtime API
 
 Wasmtime can be used as a library to embed WebAssembly execution support
 within applications. Wasmtime is written in Rust, but bindings are available
@@ -10,3 +10,5 @@ through a C API for a number of other languages too:
 * [.NET](lang-dotnet.md)
 * [Go](lang-go.md)
 * [Bash](lang-bash.md)
+* [Ruby](lang-ruby.md)
+* [Elixir](lang-elixir.md)

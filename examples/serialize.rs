@@ -3,7 +3,6 @@
 
 // You can execute this example with `cargo run --example serialize`
 
-use anyhow::Result;
 use wasmtime::*;
 
 fn serialize() -> Result<Vec<u8>> {
@@ -53,7 +52,7 @@ fn deserialize(buffer: &[u8]) -> Result<()> {
 
     // Next we poke around a bit to extract the `run` function from the module.
     println!("Extracting export...");
-    let run = instance.get_typed_func::<(), (), _>(&mut store, "run")?;
+    let run = instance.get_typed_func::<(), ()>(&mut store, "run")?;
 
     // And last but not least we can call it!
     println!("Calling export...");

@@ -5,24 +5,19 @@
 
 use crate::utils::read_to_string;
 use anyhow::{Context, Result};
+use clap::Parser;
 use cranelift_reader::parse_functions;
 use std::path::{Path, PathBuf};
-use structopt::StructOpt;
 
 /// Outputs .clif file
-#[derive(StructOpt)]
+#[derive(Parser)]
 pub struct Options {
     /// Specify input file(s) to be used. Use '-' for stdin.
-    #[structopt(required(true), parse(from_os_str))]
+    #[arg(required = true)]
     files: Vec<PathBuf>,
-
-    /// Enable debug output on stderr/stdout
-    #[structopt(short = "d")]
-    debug: bool,
 }
 
 pub fn run(options: &Options) -> Result<()> {
-    crate::handle_debug_flag(options.debug);
     for (i, f) in options.files.iter().enumerate() {
         if i != 0 {
             println!();
@@ -41,7 +36,7 @@ fn cat_one(path: &Path) -> Result<()> {
         if idx != 0 {
             println!();
         }
-        print!("{}", func);
+        print!("{func}");
     }
 
     Ok(())

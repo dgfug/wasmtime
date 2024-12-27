@@ -1,39 +1,22 @@
 //! S390x ISA definitions: registers.
 
-use crate::settings;
-use regalloc::{RealRegUniverse, Reg, RegClass, RegClassInfo, Writable, NUM_REG_CLASSES};
+use alloc::string::String;
+use regalloc2::PReg;
+
+use crate::isa::s390x::inst::{RegPair, WritableRegPair};
+use crate::machinst::*;
 
 //=============================================================================
 // Registers, the Universe thereof, and printing
 
-#[rustfmt::skip]
-const GPR_INDICES: [u8; 16] = [
-    // r0 and r1 reserved
-    30, 31,
-    // r2 - r5 call-clobbered
-    16, 17, 18, 19,
-    // r6 - r14 call-saved (order reversed)
-    28, 27, 26, 25, 24, 23, 22, 21, 20,
-    // r15 (SP)
-    29,
-];
-
-#[rustfmt::skip]
-const FPR_INDICES: [u8; 16] = [
-    // f0 - f7 as pairs
-    0, 4, 1, 5, 2, 6, 3, 7,
-    // f8 - f15 as pairs
-    8, 12, 9, 13, 10, 14, 11, 15,
-];
-
 /// Get a reference to a GPR (integer register).
 pub fn gpr(num: u8) -> Reg {
+    Reg::from(gpr_preg(num))
+}
+
+pub(crate) const fn gpr_preg(num: u8) -> PReg {
     assert!(num < 16);
-    Reg::new_real(
-        RegClass::I64,
-        /* enc = */ num,
-        /* index = */ GPR_INDICES[num as usize],
-    )
+    PReg::new(num as usize, RegClass::Int)
 }
 
 /// Get a writable reference to a GPR.
@@ -41,19 +24,27 @@ pub fn writable_gpr(num: u8) -> Writable<Reg> {
     Writable::from_reg(gpr(num))
 }
 
-/// Get a reference to a FPR (floating-point register).
-pub fn fpr(num: u8) -> Reg {
-    assert!(num < 16);
-    Reg::new_real(
-        RegClass::F64,
-        /* enc = */ num,
-        /* index = */ FPR_INDICES[num as usize],
-    )
+/// Get a reference to a VR (vector register).
+pub fn vr(num: u8) -> Reg {
+    Reg::from(vr_preg(num))
 }
 
-/// Get a writable reference to a V-register.
-pub fn writable_fpr(num: u8) -> Writable<Reg> {
-    Writable::from_reg(fpr(num))
+pub(crate) const fn vr_preg(num: u8) -> PReg {
+    assert!(num < 32);
+    PReg::new(num as usize, RegClass::Float)
+}
+
+/// Get a writable reference to a VR.
+#[allow(dead_code)] // used by tests.
+pub fn writable_vr(num: u8) -> Writable<Reg> {
+    Writable::from_reg(vr(num))
+}
+
+/// Test whether a vector register is overlapping an FPR.
+pub fn is_fpr(r: Reg) -> bool {
+    let r = r.to_real_reg().unwrap();
+    assert!(r.class() == RegClass::Float);
+    return r.hw_enc() < 16;
 }
 
 /// Get a reference to the stack-pointer register.
@@ -87,82 +78,92 @@ pub fn zero_reg() -> Reg {
     gpr(0)
 }
 
-/// Create the register universe for AArch64.
-pub fn create_reg_universe(_flags: &settings::Flags) -> RealRegUniverse {
-    let mut regs = vec![];
-    let mut allocable_by_class = [None; NUM_REG_CLASSES];
+pub fn show_reg(reg: Reg) -> String {
+    if let Some(rreg) = reg.to_real_reg() {
+        match rreg.class() {
+            RegClass::Int => format!("%r{}", rreg.hw_enc()),
+            RegClass::Float => format!("%v{}", rreg.hw_enc()),
+            RegClass::Vector => unreachable!(),
+        }
+    } else {
+        format!("%{reg:?}")
+    }
+}
 
-    // Numbering Scheme: we put FPRs first, then GPRs. The GPRs exclude several registers:
-    // r0 (we cannot use this for addressing // FIXME regalloc)
-    // r1 (spilltmp)
-    // r15 (stack pointer)
+pub fn maybe_show_fpr(reg: Reg) -> Option<String> {
+    if let Some(rreg) = reg.to_real_reg() {
+        if is_fpr(reg) {
+            return Some(format!("%f{}", rreg.hw_enc()));
+        }
+    }
+    None
+}
 
-    // FPRs.
-    let mut base = regs.len();
-    regs.push((fpr(0).to_real_reg(), "%f0".into()));
-    regs.push((fpr(2).to_real_reg(), "%f2".into()));
-    regs.push((fpr(4).to_real_reg(), "%f4".into()));
-    regs.push((fpr(6).to_real_reg(), "%f6".into()));
-    regs.push((fpr(1).to_real_reg(), "%f1".into()));
-    regs.push((fpr(3).to_real_reg(), "%f3".into()));
-    regs.push((fpr(5).to_real_reg(), "%f5".into()));
-    regs.push((fpr(7).to_real_reg(), "%f7".into()));
-    regs.push((fpr(8).to_real_reg(), "%f8".into()));
-    regs.push((fpr(10).to_real_reg(), "%f10".into()));
-    regs.push((fpr(12).to_real_reg(), "%f12".into()));
-    regs.push((fpr(14).to_real_reg(), "%f14".into()));
-    regs.push((fpr(9).to_real_reg(), "%f9".into()));
-    regs.push((fpr(11).to_real_reg(), "%f11".into()));
-    regs.push((fpr(13).to_real_reg(), "%f13".into()));
-    regs.push((fpr(15).to_real_reg(), "%f15".into()));
+pub fn pretty_print_reg(reg: Reg) -> String {
+    show_reg(reg)
+}
 
-    allocable_by_class[RegClass::F64.rc_to_usize()] = Some(RegClassInfo {
-        first: base,
-        last: regs.len() - 1,
-        suggested_scratch: Some(fpr(1).get_index()),
-    });
-
-    // Caller-saved GPRs in the SystemV s390x ABI.
-    base = regs.len();
-    regs.push((gpr(2).to_real_reg(), "%r2".into()));
-    regs.push((gpr(3).to_real_reg(), "%r3".into()));
-    regs.push((gpr(4).to_real_reg(), "%r4".into()));
-    regs.push((gpr(5).to_real_reg(), "%r5".into()));
-
-    // Callee-saved GPRs in the SystemV s390x ABI.
-    // We start from r14 downwards in an attempt to allow the
-    // prolog to use as short a STMG as possible.
-    regs.push((gpr(14).to_real_reg(), "%r14".into()));
-    regs.push((gpr(13).to_real_reg(), "%r13".into()));
-    regs.push((gpr(12).to_real_reg(), "%r12".into()));
-    regs.push((gpr(11).to_real_reg(), "%r11".into()));
-    regs.push((gpr(10).to_real_reg(), "%r10".into()));
-    regs.push((gpr(9).to_real_reg(), "%r9".into()));
-    regs.push((gpr(8).to_real_reg(), "%r8".into()));
-    regs.push((gpr(7).to_real_reg(), "%r7".into()));
-    regs.push((gpr(6).to_real_reg(), "%r6".into()));
-
-    allocable_by_class[RegClass::I64.rc_to_usize()] = Some(RegClassInfo {
-        first: base,
-        last: regs.len() - 1,
-        suggested_scratch: Some(gpr(13).get_index()),
-    });
-
-    // Other regs, not available to the allocator.
-    let allocable = regs.len();
-    regs.push((gpr(15).to_real_reg(), "%r15".into()));
-    regs.push((gpr(0).to_real_reg(), "%r0".into()));
-    regs.push((gpr(1).to_real_reg(), "%r1".into()));
-
-    // Assert sanity: the indices in the register structs must match their
-    // actual indices in the array.
-    for (i, reg) in regs.iter().enumerate() {
-        assert_eq!(i, reg.0.get_index());
+pub fn pretty_print_regpair(pair: RegPair) -> String {
+    let hi = pair.hi;
+    let lo = pair.lo;
+    if let Some(hi_reg) = hi.to_real_reg() {
+        if let Some(lo_reg) = lo.to_real_reg() {
+            assert!(
+                hi_reg.hw_enc() + 1 == lo_reg.hw_enc(),
+                "Invalid regpair: {} {}",
+                show_reg(hi),
+                show_reg(lo)
+            );
+            return show_reg(hi);
+        }
     }
 
-    RealRegUniverse {
-        regs,
-        allocable,
-        allocable_by_class,
+    format!("{}/{}", show_reg(hi), show_reg(lo))
+}
+
+pub fn pretty_print_reg_mod(rd: Writable<Reg>, ri: Reg) -> String {
+    let output = rd.to_reg();
+    let input = ri;
+    if output == input {
+        show_reg(output)
+    } else {
+        format!("{}<-{}", show_reg(output), show_reg(input))
     }
+}
+
+pub fn pretty_print_regpair_mod(rd: WritableRegPair, ri: RegPair) -> String {
+    let rd_hi = rd.hi.to_reg();
+    let rd_lo = rd.lo.to_reg();
+    let ri_hi = ri.hi;
+    let ri_lo = ri.lo;
+    if rd_hi == ri_hi {
+        show_reg(rd_hi)
+    } else {
+        format!(
+            "{}/{}<-{}/{}",
+            show_reg(rd_hi),
+            show_reg(rd_lo),
+            show_reg(ri_hi),
+            show_reg(ri_lo)
+        )
+    }
+}
+
+pub fn pretty_print_regpair_mod_lo(rd: WritableRegPair, ri: Reg) -> String {
+    let rd_hi = rd.hi.to_reg();
+    let rd_lo = rd.lo.to_reg();
+    if rd_lo == ri {
+        show_reg(rd_hi)
+    } else {
+        format!(
+            "{}/{}<-_/{}",
+            show_reg(rd_hi),
+            show_reg(rd_lo),
+            show_reg(ri),
+        )
+    }
+}
+
+pub fn pretty_print_fpr(reg: Reg) -> (String, Option<String>) {
+    (show_reg(reg), maybe_show_fpr(reg))
 }

@@ -3,11 +3,10 @@
 use crate::isa::aarch64::inst::OperandSize;
 use crate::isa::aarch64::inst::ScalarSize;
 use crate::isa::aarch64::inst::VectorSize;
-use crate::settings;
-
-use regalloc::{
-    PrettyPrint, RealRegUniverse, Reg, RegClass, RegClassInfo, Writable, NUM_REG_CLASSES,
-};
+use crate::machinst::RealReg;
+use crate::machinst::{Reg, RegClass, Writable};
+use regalloc2::PReg;
+use regalloc2::VReg;
 
 use std::string::{String, ToString};
 
@@ -19,40 +18,16 @@ use std::string::{String, ToString};
 /// https://searchfox.org/mozilla-central/source/js/src/jit/arm64/Assembler-arm64.h#103
 pub const PINNED_REG: u8 = 21;
 
-#[rustfmt::skip]
-const XREG_INDICES: [u8; 31] = [
-    // X0 - X7
-    32, 33, 34, 35, 36, 37, 38, 39,
-    // X8 - X15
-    40, 41, 42, 43, 44, 45, 46, 47,
-    // X16, X17
-    58, 59,
-    // X18
-    60,
-    // X19, X20
-    48, 49,
-    // X21, put aside because it's the pinned register.
-    57,
-    // X22 - X28
-    50, 51, 52, 53, 54, 55, 56,
-    // X29 (FP)
-    61,
-    // X30 (LR)
-    62,
-];
-
-const ZERO_REG_INDEX: u8 = 63;
-
-const SP_REG_INDEX: u8 = 64;
-
-/// Get a reference to an X-register (integer register).
+/// Get a reference to an X-register (integer register). Do not use
+/// this for xsp / xzr; we have two special registers for those.
 pub fn xreg(num: u8) -> Reg {
+    Reg::from(xreg_preg(num))
+}
+
+/// Get the given X-register as a PReg.
+pub(crate) const fn xreg_preg(num: u8) -> PReg {
     assert!(num < 31);
-    Reg::new_real(
-        RegClass::I64,
-        /* enc = */ num,
-        /* index = */ XREG_INDICES[num as usize],
-    )
+    PReg::new(num as usize, RegClass::Int)
 }
 
 /// Get a writable reference to an X-register.
@@ -62,24 +37,25 @@ pub fn writable_xreg(num: u8) -> Writable<Reg> {
 
 /// Get a reference to a V-register (vector/FP register).
 pub fn vreg(num: u8) -> Reg {
+    Reg::from(vreg_preg(num))
+}
+
+/// Get the given V-register as a PReg.
+pub(crate) const fn vreg_preg(num: u8) -> PReg {
     assert!(num < 32);
-    Reg::new_real(RegClass::V128, /* enc = */ num, /* index = */ num)
+    PReg::new(num as usize, RegClass::Float)
 }
 
 /// Get a writable reference to a V-register.
+#[cfg(test)] // Used only in test code.
 pub fn writable_vreg(num: u8) -> Writable<Reg> {
     Writable::from_reg(vreg(num))
 }
 
 /// Get a reference to the zero-register.
 pub fn zero_reg() -> Reg {
-    // This should be the same as what xreg(31) returns, except that
-    // we use the special index into the register index space.
-    Reg::new_real(
-        RegClass::I64,
-        /* enc = */ 31,
-        /* index = */ ZERO_REG_INDEX,
-    )
+    let preg = PReg::new(31, RegClass::Int);
+    Reg::from(VReg::new(preg.index(), RegClass::Int))
 }
 
 /// Get a writable reference to the zero-register (this discards a result).
@@ -89,16 +65,19 @@ pub fn writable_zero_reg() -> Writable<Reg> {
 
 /// Get a reference to the stack-pointer register.
 pub fn stack_reg() -> Reg {
-    // XSP (stack) and XZR (zero) are logically different registers which have
-    // the same hardware encoding, and whose meaning, in real aarch64
-    // instructions, is context-dependent.  For convenience of
-    // universe-construction and for correct printing, we make them be two
-    // different real registers.
-    Reg::new_real(
-        RegClass::I64,
-        /* enc = */ 31,
-        /* index = */ SP_REG_INDEX,
-    )
+    // XSP (stack) and XZR (zero) are logically different registers
+    // which have the same hardware encoding, and whose meaning, in
+    // real aarch64 instructions, is context-dependent. For extra
+    // correctness assurances and for correct printing, we make them
+    // be two different real registers from a regalloc perspective.
+    //
+    // We represent XZR as if it were xreg(31); XSP is xreg(31 +
+    // 32). The PReg bit-packing allows 6 bits (64 registers) so we
+    // make use of this extra space to distinguish xzr and xsp. We
+    // mask off the 6th bit (hw_enc & 31) to get the actual hardware
+    // register encoding.
+    let preg = PReg::new(31 + 32, RegClass::Int);
+    Reg::from(VReg::new(preg.index(), RegClass::Int))
 }
 
 /// Get a writable reference to the stack-pointer register.
@@ -109,6 +88,11 @@ pub fn writable_stack_reg() -> Writable<Reg> {
 /// Get a reference to the link register (x30).
 pub fn link_reg() -> Reg {
     xreg(30)
+}
+
+/// Get a reference to the pinned register (x21).
+pub fn pinned_reg() -> Reg {
+    xreg(PINNED_REG)
 }
 
 /// Get a writable reference to the link register.
@@ -158,159 +142,99 @@ pub fn writable_tmp2_reg() -> Writable<Reg> {
     Writable::from_reg(tmp2_reg())
 }
 
-/// Create the register universe for AArch64.
-pub fn create_reg_universe(flags: &settings::Flags) -> RealRegUniverse {
-    let mut regs = vec![];
-    let mut allocable_by_class = [None; NUM_REG_CLASSES];
+// PrettyPrint cannot be implemented for Reg; we need to invoke
+// backend-specific functions from higher level (inst, arg, ...)
+// types.
 
-    // Numbering Scheme: we put V-regs first, then X-regs. The X-regs exclude several registers:
-    // x18 (globally reserved for platform-specific purposes), x29 (frame pointer), x30 (link
-    // register), x31 (stack pointer or zero register, depending on context).
-
-    let v_reg_base = 0u8; // in contiguous real-register index space
-    let v_reg_count = 32;
-    for i in 0u8..v_reg_count {
-        let reg = Reg::new_real(
-            RegClass::V128,
-            /* enc = */ i,
-            /* index = */ v_reg_base + i,
-        )
-        .to_real_reg();
-        let name = format!("v{}", i);
-        regs.push((reg, name));
-    }
-    let v_reg_last = v_reg_base + v_reg_count - 1;
-
-    // Add the X registers. N.B.: the order here must match the order implied
-    // by XREG_INDICES, ZERO_REG_INDEX, and SP_REG_INDEX above.
-
-    let x_reg_base = 32u8; // in contiguous real-register index space
-    let mut x_reg_count = 0;
-
-    let uses_pinned_reg = flags.enable_pinned_reg();
-
-    for i in 0u8..32u8 {
-        // See above for excluded registers.
-        if i == 16 || i == 17 || i == 18 || i == 29 || i == 30 || i == 31 || i == PINNED_REG {
-            continue;
+fn show_ireg(reg: RealReg) -> String {
+    match reg.hw_enc() {
+        29 => "fp".to_string(),
+        30 => "lr".to_string(),
+        31 => "xzr".to_string(),
+        63 => "sp".to_string(),
+        x => {
+            debug_assert!(x < 29);
+            format!("x{x}")
         }
-        let reg = Reg::new_real(
-            RegClass::I64,
-            /* enc = */ i,
-            /* index = */ x_reg_base + x_reg_count,
-        )
-        .to_real_reg();
-        let name = format!("x{}", i);
-        regs.push((reg, name));
-        x_reg_count += 1;
-    }
-    let x_reg_last = x_reg_base + x_reg_count - 1;
-
-    allocable_by_class[RegClass::I64.rc_to_usize()] = Some(RegClassInfo {
-        first: x_reg_base as usize,
-        last: x_reg_last as usize,
-        suggested_scratch: Some(XREG_INDICES[19] as usize),
-    });
-    allocable_by_class[RegClass::V128.rc_to_usize()] = Some(RegClassInfo {
-        first: v_reg_base as usize,
-        last: v_reg_last as usize,
-        suggested_scratch: Some(/* V31: */ 31),
-    });
-
-    // Other regs, not available to the allocator.
-    let allocable = if uses_pinned_reg {
-        // The pinned register is not allocatable in this case, so record the length before adding
-        // it.
-        let len = regs.len();
-        regs.push((xreg(PINNED_REG).to_real_reg(), "x21/pinned_reg".to_string()));
-        len
-    } else {
-        regs.push((xreg(PINNED_REG).to_real_reg(), "x21".to_string()));
-        regs.len()
-    };
-
-    regs.push((xreg(16).to_real_reg(), "x16".to_string()));
-    regs.push((xreg(17).to_real_reg(), "x17".to_string()));
-    regs.push((xreg(18).to_real_reg(), "x18".to_string()));
-    regs.push((fp_reg().to_real_reg(), "fp".to_string()));
-    regs.push((link_reg().to_real_reg(), "lr".to_string()));
-    regs.push((zero_reg().to_real_reg(), "xzr".to_string()));
-    regs.push((stack_reg().to_real_reg(), "sp".to_string()));
-
-    // FIXME JRS 2020Feb06: unfortunately this pushes the number of real regs
-    // to 65, which is potentially inconvenient from a compiler performance
-    // standpoint.  We could possibly drop back to 64 by "losing" a vector
-    // register in future.
-
-    // Assert sanity: the indices in the register structs must match their
-    // actual indices in the array.
-    for (i, reg) in regs.iter().enumerate() {
-        assert_eq!(i, reg.0.get_index());
-    }
-
-    RealRegUniverse {
-        regs,
-        allocable,
-        allocable_by_class,
     }
 }
 
-/// If `ireg` denotes an I64-classed reg, make a best-effort attempt to show
+fn show_vreg(reg: RealReg) -> String {
+    format!("v{}", reg.hw_enc() & 31)
+}
+
+fn show_reg(reg: Reg) -> String {
+    if let Some(rreg) = reg.to_real_reg() {
+        match rreg.class() {
+            RegClass::Int => show_ireg(rreg),
+            RegClass::Float => show_vreg(rreg),
+            RegClass::Vector => unreachable!(),
+        }
+    } else {
+        format!("%{reg:?}")
+    }
+}
+
+pub fn pretty_print_reg(reg: Reg) -> String {
+    show_reg(reg)
+}
+
+fn show_reg_sized(reg: Reg, size: OperandSize) -> String {
+    match reg.class() {
+        RegClass::Int => show_ireg_sized(reg, size),
+        RegClass::Float => show_reg(reg),
+        RegClass::Vector => unreachable!(),
+    }
+}
+
+pub fn pretty_print_reg_sized(reg: Reg, size: OperandSize) -> String {
+    show_reg_sized(reg, size)
+}
+
+/// If `ireg` denotes an Int-classed reg, make a best-effort attempt to show
 /// its name at the 32-bit size.
-pub fn show_ireg_sized(reg: Reg, mb_rru: Option<&RealRegUniverse>, size: OperandSize) -> String {
-    let mut s = reg.show_rru(mb_rru);
-    if reg.get_class() != RegClass::I64 || !size.is32() {
+pub fn show_ireg_sized(reg: Reg, size: OperandSize) -> String {
+    let mut s = show_reg(reg);
+    if reg.class() != RegClass::Int || !size.is32() {
         // We can't do any better.
         return s;
     }
 
-    if reg.is_real() {
-        // Change (eg) "x42" into "w42" as appropriate
-        if reg.get_class() == RegClass::I64 && size.is32() && s.starts_with("x") {
-            s = "w".to_string() + &s[1..];
-        }
-    } else {
-        // Add a "w" suffix to RegClass::I64 vregs used in a 32-bit role
-        if reg.get_class() == RegClass::I64 && size.is32() {
-            s.push('w');
-        }
+    // Change (eg) "x42" into "w42" as appropriate
+    if reg.class() == RegClass::Int && size.is32() && s.starts_with("x") {
+        s = "w".to_string() + &s[1..];
     }
+
     s
 }
 
 /// Show a vector register used in a scalar context.
-pub fn show_vreg_scalar(reg: Reg, mb_rru: Option<&RealRegUniverse>, size: ScalarSize) -> String {
-    let mut s = reg.show_rru(mb_rru);
-    if reg.get_class() != RegClass::V128 {
+pub fn show_vreg_scalar(reg: Reg, size: ScalarSize) -> String {
+    let mut s = show_reg(reg);
+    if reg.class() != RegClass::Float {
         // We can't do any better.
         return s;
     }
 
-    if reg.is_real() {
-        // Change (eg) "v0" into "d0".
-        if s.starts_with("v") {
-            let replacement = match size {
-                ScalarSize::Size8 => "b",
-                ScalarSize::Size16 => "h",
-                ScalarSize::Size32 => "s",
-                ScalarSize::Size64 => "d",
-                ScalarSize::Size128 => "q",
-            };
-            s.replace_range(0..1, replacement);
-        }
-    } else {
-        // Add a "d" suffix to RegClass::V128 vregs.
-        if reg.get_class() == RegClass::V128 {
-            s.push('d');
-        }
+    // Change (eg) "v0" into "d0".
+    if s.starts_with("v") {
+        let replacement = match size {
+            ScalarSize::Size8 => "b",
+            ScalarSize::Size16 => "h",
+            ScalarSize::Size32 => "s",
+            ScalarSize::Size64 => "d",
+            ScalarSize::Size128 => "q",
+        };
+        s.replace_range(0..1, replacement);
     }
+
     s
 }
 
 /// Show a vector register.
-pub fn show_vreg_vector(reg: Reg, mb_rru: Option<&RealRegUniverse>, size: VectorSize) -> String {
-    assert_eq!(RegClass::V128, reg.get_class());
-    let mut s = reg.show_rru(mb_rru);
+pub fn show_vreg_vector(reg: Reg, size: VectorSize) -> String {
+    assert_eq!(RegClass::Float, reg.class());
+    let mut s = show_reg(reg);
 
     let suffix = match size {
         VectorSize::Size8x8 => ".8b",
@@ -327,25 +251,31 @@ pub fn show_vreg_vector(reg: Reg, mb_rru: Option<&RealRegUniverse>, size: Vector
 }
 
 /// Show an indexed vector element.
-pub fn show_vreg_element(
-    reg: Reg,
-    mb_rru: Option<&RealRegUniverse>,
-    idx: u8,
-    size: VectorSize,
-) -> String {
-    assert_eq!(RegClass::V128, reg.get_class());
-    let mut s = reg.show_rru(mb_rru);
-
+pub fn show_vreg_element(reg: Reg, idx: u8, size: ScalarSize) -> String {
+    assert_eq!(RegClass::Float, reg.class());
+    let s = show_reg(reg);
     let suffix = match size {
-        VectorSize::Size8x8 => "b",
-        VectorSize::Size8x16 => "b",
-        VectorSize::Size16x4 => "h",
-        VectorSize::Size16x8 => "h",
-        VectorSize::Size32x2 => "s",
-        VectorSize::Size32x4 => "s",
-        VectorSize::Size64x2 => "d",
+        ScalarSize::Size8 => ".b",
+        ScalarSize::Size16 => ".h",
+        ScalarSize::Size32 => ".s",
+        ScalarSize::Size64 => ".d",
+        _ => panic!("Unexpected vector element size: {size:?}"),
     };
+    format!("{s}{suffix}[{idx}]")
+}
 
-    s.push_str(&format!(".{}[{}]", suffix, idx));
-    s
+pub fn pretty_print_ireg(reg: Reg, size: OperandSize) -> String {
+    show_ireg_sized(reg, size)
+}
+
+pub fn pretty_print_vreg_scalar(reg: Reg, size: ScalarSize) -> String {
+    show_vreg_scalar(reg, size)
+}
+
+pub fn pretty_print_vreg_vector(reg: Reg, size: VectorSize) -> String {
+    show_vreg_vector(reg, size)
+}
+
+pub fn pretty_print_vreg_element(reg: Reg, idx: usize, size: ScalarSize) -> String {
+    show_vreg_element(reg, idx as u8, size)
 }

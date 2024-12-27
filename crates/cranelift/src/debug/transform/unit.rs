@@ -1,20 +1,25 @@
 use super::address_transform::AddressTransform;
 use super::attr::{clone_die_attributes, FileAttributeContext};
+use super::debug_transform_logging::{
+    dbi_log, log_begin_input_die, log_end_output_die, log_end_output_die_skipped,
+    log_get_cu_summary,
+};
 use super::expression::compile_expression;
 use super::line_program::clone_line_program;
 use super::range_info_builder::RangeInfoBuilder;
 use super::refs::{PendingDebugInfoRefs, PendingUnitRefs, UnitRefsMap};
-use super::utils::{add_internal_types, append_vmctx_info, get_function_frame_info};
-use super::{DebugInputContext, Reader, TransformError};
-use crate::debug::ModuleMemoryOffset;
-use crate::CompiledFunctions;
+use super::synthetic::ModuleSyntheticUnit;
+use super::utils::append_vmctx_info;
+use super::DebugInputContext;
+use crate::debug::{Compilation, Reader};
 use anyhow::{Context, Error};
 use cranelift_codegen::ir::Endianness;
 use cranelift_codegen::isa::TargetIsa;
 use gimli::write;
-use gimli::{AttributeValue, DebuggingInformationEntry, Unit};
+use gimli::{AttributeValue, DebuggingInformationEntry, Dwarf, Unit};
 use std::collections::HashSet;
-use wasmtime_environ::DefinedFuncIndex;
+use wasmtime_environ::StaticModuleIndex;
+use wasmtime_versioned_export_macros::versioned_stringify_ident;
 
 struct InheritedAttr<T> {
     stack: Vec<(usize, T)>,
@@ -44,38 +49,31 @@ impl<T> InheritedAttr<T> {
     }
 }
 
-fn get_base_type_name<R>(
-    type_entry: &DebuggingInformationEntry<R>,
-    unit: &Unit<R, R::Offset>,
-    context: &DebugInputContext<R>,
-) -> Result<String, Error>
-where
-    R: Reader,
-{
+fn get_base_type_name(
+    type_entry: &DebuggingInformationEntry<Reader<'_>>,
+    unit: &Unit<Reader<'_>, usize>,
+    dwarf: &Dwarf<Reader<'_>>,
+) -> Result<String, Error> {
     // FIXME remove recursion.
     if let Some(AttributeValue::UnitRef(ref offset)) = type_entry.attr_value(gimli::DW_AT_type)? {
         let mut entries = unit.entries_at_offset(*offset)?;
         entries.next_entry()?;
         if let Some(die) = entries.current() {
-            if let Some(AttributeValue::DebugStrRef(str_offset)) =
-                die.attr_value(gimli::DW_AT_name)?
-            {
-                return Ok(String::from(
-                    context.debug_str.get_str(str_offset)?.to_string()?,
-                ));
+            if let Some(value) = die.attr_value(gimli::DW_AT_name)? {
+                return Ok(String::from(dwarf.attr_string(unit, value)?.to_string()?));
             }
             match die.tag() {
                 gimli::DW_TAG_const_type => {
-                    return Ok(format!("const {}", get_base_type_name(die, unit, context)?));
+                    return Ok(format!("const {}", get_base_type_name(die, unit, dwarf)?));
                 }
                 gimli::DW_TAG_pointer_type => {
-                    return Ok(format!("{}*", get_base_type_name(die, unit, context)?));
+                    return Ok(format!("{}*", get_base_type_name(die, unit, dwarf)?));
                 }
                 gimli::DW_TAG_reference_type => {
-                    return Ok(format!("{}&", get_base_type_name(die, unit, context)?));
+                    return Ok(format!("{}&", get_base_type_name(die, unit, dwarf)?));
                 }
                 gimli::DW_TAG_array_type => {
-                    return Ok(format!("{}[]", get_base_type_name(die, unit, context)?));
+                    return Ok(format!("{}[]", get_base_type_name(die, unit, dwarf)?));
                 }
                 _ => (),
             }
@@ -106,26 +104,23 @@ enum WebAssemblyPtrKind {
 ///
 /// Notice that "resolve_vmctx_memory_ptr" is external/builtin
 /// subprogram that is not part of Wasm code.
-fn replace_pointer_type<R>(
+fn replace_pointer_type(
     parent_id: write::UnitEntryId,
     kind: WebAssemblyPtrKind,
     comp_unit: &mut write::Unit,
-    wp_die_id: write::UnitEntryId,
-    pointer_type_entry: &DebuggingInformationEntry<R>,
-    unit: &Unit<R, R::Offset>,
-    context: &DebugInputContext<R>,
+    wasm_ptr_die_ref: write::Reference,
+    pointer_type_entry: &DebuggingInformationEntry<Reader<'_>>,
+    unit: &Unit<Reader<'_>, usize>,
+    dwarf: &Dwarf<Reader<'_>>,
     out_strings: &mut write::StringTable,
     pending_die_refs: &mut PendingUnitRefs,
-) -> Result<write::UnitEntryId, Error>
-where
-    R: Reader,
-{
+) -> Result<write::UnitEntryId, Error> {
     const WASM_PTR_LEN: u8 = 4;
 
     macro_rules! add_tag {
         ($parent_id:ident, $tag:expr => $die:ident as $die_id:ident { $($a:path = $v:expr),* }) => {
             let $die_id = comp_unit.add($parent_id, $tag);
-            #[allow(unused_variables)]
+            #[allow(unused_variables, reason = "sometimes not used below")]
             let $die = comp_unit.get_mut($die_id);
             $( $die.set($a, $v); )*
         };
@@ -137,11 +132,11 @@ where
     let name = match kind {
         WebAssemblyPtrKind::Pointer => format!(
             "WebAssemblyPtrWrapper<{}>",
-            get_base_type_name(pointer_type_entry, unit, context)?
+            get_base_type_name(pointer_type_entry, unit, dwarf)?
         ),
         WebAssemblyPtrKind::Reference => format!(
             "WebAssemblyRefWrapper<{}>",
-            get_base_type_name(pointer_type_entry, unit, context)?
+            get_base_type_name(pointer_type_entry, unit, dwarf)?
         ),
     };
     add_tag!(parent_id, gimli::DW_TAG_structure_type => wrapper_die as wrapper_die_id {
@@ -186,19 +181,19 @@ where
     //  .. DW_AT_location = 0
     add_tag!(wrapper_die_id, gimli::DW_TAG_member => m_die as m_die_id {
         gimli::DW_AT_name = write::AttributeValue::StringRef(out_strings.add("__ptr")),
-        gimli::DW_AT_type = write::AttributeValue::UnitRef(wp_die_id),
+        gimli::DW_AT_type = write::AttributeValue::DebugInfoRef(wasm_ptr_die_ref),
         gimli::DW_AT_data_member_location = write::AttributeValue::Data1(0)
     });
 
     // Build wrapper_die's DW_TAG_subprogram for `ptr()`:
-    //  .. DW_AT_linkage_name = "resolve_vmctx_memory_ptr"
+    //  .. DW_AT_linkage_name = "wasmtime_resolve_vmctx_memory_ptr"
     //  .. DW_AT_name = "ptr"
     //  .. DW_AT_type = <ptr_type>
     //  .. DW_TAG_formal_parameter
     //  ..  .. DW_AT_type = <wrapper_ptr_type>
     //  ..  .. DW_AT_artificial = 1
     add_tag!(wrapper_die_id, gimli::DW_TAG_subprogram => deref_op_die as deref_op_die_id {
-        gimli::DW_AT_linkage_name = write::AttributeValue::StringRef(out_strings.add("resolve_vmctx_memory_ptr")),
+        gimli::DW_AT_linkage_name = write::AttributeValue::StringRef(out_strings.add(versioned_stringify_ident!(wasmtime_resolve_vmctx_memory_ptr))),
         gimli::DW_AT_name = write::AttributeValue::StringRef(out_strings.add("ptr")),
         gimli::DW_AT_type = write::AttributeValue::UnitRef(ptr_type_id)
     });
@@ -208,14 +203,14 @@ where
     });
 
     // Build wrapper_die's DW_TAG_subprogram for `operator*`:
-    //  .. DW_AT_linkage_name = "resolve_vmctx_memory_ptr"
+    //  .. DW_AT_linkage_name = "wasmtime_resolve_vmctx_memory_ptr"
     //  .. DW_AT_name = "operator*"
     //  .. DW_AT_type = <ref_type>
     //  .. DW_TAG_formal_parameter
     //  ..  .. DW_AT_type = <wrapper_ptr_type>
     //  ..  .. DW_AT_artificial = 1
     add_tag!(wrapper_die_id, gimli::DW_TAG_subprogram => deref_op_die as deref_op_die_id {
-        gimli::DW_AT_linkage_name = write::AttributeValue::StringRef(out_strings.add("resolve_vmctx_memory_ptr")),
+        gimli::DW_AT_linkage_name = write::AttributeValue::StringRef(out_strings.add(versioned_stringify_ident!(wasmtime_resolve_vmctx_memory_ptr))),
         gimli::DW_AT_name = write::AttributeValue::StringRef(out_strings.add("operator*")),
         gimli::DW_AT_type = write::AttributeValue::UnitRef(ref_type_id)
     });
@@ -225,14 +220,14 @@ where
     });
 
     // Build wrapper_die's DW_TAG_subprogram for `operator->`:
-    //  .. DW_AT_linkage_name = "resolve_vmctx_memory_ptr"
+    //  .. DW_AT_linkage_name = "wasmtime_resolve_vmctx_memory_ptr"
     //  .. DW_AT_name = "operator->"
     //  .. DW_AT_type = <ptr_type>
     //  .. DW_TAG_formal_parameter
     //  ..  .. DW_AT_type = <wrapper_ptr_type>
     //  ..  .. DW_AT_artificial = 1
     add_tag!(wrapper_die_id, gimli::DW_TAG_subprogram => deref_op_die as deref_op_die_id {
-        gimli::DW_AT_linkage_name = write::AttributeValue::StringRef(out_strings.add("resolve_vmctx_memory_ptr")),
+        gimli::DW_AT_linkage_name = write::AttributeValue::StringRef(out_strings.add(versioned_stringify_ident!(wasmtime_resolve_vmctx_memory_ptr))),
         gimli::DW_AT_name = write::AttributeValue::StringRef(out_strings.add("operator->")),
         gimli::DW_AT_type = write::AttributeValue::UnitRef(ptr_type_id)
     });
@@ -244,114 +239,138 @@ where
     Ok(wrapper_die_id)
 }
 
-pub(crate) fn clone_unit<'a, R>(
-    dwarf: &gimli::Dwarf<R>,
-    unit: Unit<R, R::Offset>,
-    context: &DebugInputContext<R>,
-    addr_tr: &'a AddressTransform,
-    funcs: &'a CompiledFunctions,
-    memory_offset: &ModuleMemoryOffset,
+fn is_dead_code(entry: &DebuggingInformationEntry<Reader<'_>>) -> bool {
+    const TOMBSTONE: u64 = u32::MAX as u64;
+
+    match entry.attr_value(gimli::DW_AT_low_pc) {
+        Ok(Some(AttributeValue::Addr(addr))) => addr == TOMBSTONE,
+        _ => false,
+    }
+}
+
+pub(crate) fn clone_unit(
+    compilation: &mut Compilation<'_>,
+    module: StaticModuleIndex,
+    skeleton_unit: &Unit<Reader<'_>, usize>,
+    split_unit: Option<&Unit<Reader<'_>, usize>>,
+    split_dwarf: Option<&Dwarf<Reader<'_>>>,
+    context: &DebugInputContext,
+    addr_tr: &AddressTransform,
     out_encoding: gimli::Encoding,
+    out_module_synthetic_unit: &ModuleSyntheticUnit,
     out_units: &mut write::UnitTable,
     out_strings: &mut write::StringTable,
-    translated: &mut HashSet<DefinedFuncIndex>,
+    translated: &mut HashSet<usize>,
     isa: &dyn TargetIsa,
-) -> Result<Option<(write::UnitId, UnitRefsMap, PendingDebugInfoRefs)>, Error>
-where
-    R: Reader,
-{
+) -> Result<Option<(write::UnitId, UnitRefsMap, PendingDebugInfoRefs)>, Error> {
     let mut die_ref_map = UnitRefsMap::new();
     let mut pending_die_refs = PendingUnitRefs::new();
     let mut pending_di_refs = PendingDebugInfoRefs::new();
     let mut stack = Vec::new();
 
+    let skeleton_dwarf = &compilation.translations[module].debuginfo.dwarf;
+
     // Iterate over all of this compilation unit's entries.
+    let dwarf = split_dwarf.unwrap_or(skeleton_dwarf);
+    let unit = split_unit.unwrap_or(skeleton_unit);
     let mut entries = unit.entries();
-    let (mut comp_unit, unit_id, file_map, file_index_base, cu_low_pc, wp_die_id, vmctx_die_id) =
-        if let Some((depth_delta, entry)) = entries.next_dfs()? {
-            assert_eq!(depth_delta, 0);
-            let (out_line_program, debug_line_offset, file_map, file_index_base) =
-                clone_line_program(
-                    &unit,
-                    entry,
-                    addr_tr,
-                    out_encoding,
-                    context.debug_str,
-                    context.debug_str_offsets,
-                    context.debug_line_str,
-                    context.debug_line,
-                    out_strings,
-                )?;
+    dbi_log!("Cloning CU {:?}", log_get_cu_summary(unit));
 
-            if entry.tag() == gimli::DW_TAG_compile_unit {
-                let unit_id = out_units.add(write::Unit::new(out_encoding, out_line_program));
-                let comp_unit = out_units.get_mut(unit_id);
+    let (mut out_unit, out_unit_id, file_map, file_index_base) = if let Some((depth_delta, entry)) =
+        entries.next_dfs()?
+    {
+        assert_eq!(depth_delta, 0);
+        let (out_line_program, debug_line_offset, file_map, file_index_base) = clone_line_program(
+            skeleton_dwarf,
+            skeleton_unit,
+            unit.name,
+            addr_tr,
+            out_encoding,
+            out_strings,
+        )?;
 
-                let root_id = comp_unit.root();
-                die_ref_map.insert(entry.offset(), root_id);
+        if entry.tag() == gimli::DW_TAG_compile_unit {
+            log_begin_input_die(dwarf, unit, entry, 0);
+            let out_unit_id = out_units.add(write::Unit::new(out_encoding, out_line_program));
+            let out_unit = out_units.get_mut(out_unit_id);
 
-                let cu_low_pc = if let Some(AttributeValue::Addr(addr)) =
-                    entry.attr_value(gimli::DW_AT_low_pc)?
-                {
-                    addr
-                } else if let Some(AttributeValue::DebugAddrIndex(i)) =
-                    entry.attr_value(gimli::DW_AT_low_pc)?
-                {
-                    context.debug_addr.get_address(4, unit.addr_base, i)?
-                } else {
-                    // FIXME? return Err(TransformError("No low_pc for unit header").into());
-                    0
-                };
+            let out_root_id = out_unit.root();
+            die_ref_map.insert(entry.offset(), out_root_id);
 
-                clone_die_attributes(
-                    dwarf,
-                    &unit,
-                    entry,
-                    context,
-                    addr_tr,
-                    None,
-                    comp_unit,
-                    root_id,
-                    None,
-                    None,
-                    cu_low_pc,
-                    out_strings,
-                    &mut pending_die_refs,
-                    &mut pending_di_refs,
-                    FileAttributeContext::Root(Some(debug_line_offset)),
-                    isa,
-                )?;
-
-                let (wp_die_id, vmctx_die_id) =
-                    add_internal_types(comp_unit, root_id, out_strings, memory_offset);
-
-                stack.push(root_id);
-                (
-                    comp_unit,
-                    unit_id,
-                    file_map,
-                    file_index_base,
-                    cu_low_pc,
-                    wp_die_id,
-                    vmctx_die_id,
-                )
-            } else {
-                return Err(TransformError("Unexpected unit header").into());
+            clone_die_attributes(
+                dwarf,
+                &unit,
+                entry,
+                addr_tr,
+                None,
+                out_unit,
+                out_root_id,
+                None,
+                None,
+                out_strings,
+                &mut pending_die_refs,
+                &mut pending_di_refs,
+                FileAttributeContext::Root(Some(debug_line_offset)),
+                isa,
+            )?;
+            if split_unit.is_some() {
+                if let Some((_, skeleton_entry)) = skeleton_unit.entries().next_dfs()? {
+                    clone_die_attributes(
+                        skeleton_dwarf,
+                        skeleton_unit,
+                        skeleton_entry,
+                        addr_tr,
+                        None,
+                        out_unit,
+                        out_root_id,
+                        None,
+                        None,
+                        out_strings,
+                        &mut pending_die_refs,
+                        &mut pending_di_refs,
+                        FileAttributeContext::Root(Some(debug_line_offset)),
+                        isa,
+                    )?;
+                }
             }
+
+            log_end_output_die(entry, unit, out_root_id, out_unit, out_strings, 0);
+            stack.push(out_root_id);
+            (out_unit, out_unit_id, file_map, file_index_base)
         } else {
-            return Ok(None); // empty
-        };
+            // Can happen when the DWARF is split and we dont have the package/dwo files.
+            // This is a better user experience than errorring.
+            dbi_log!("... skipped: split DW_TAG_compile_unit entry missing");
+            return Ok(None); // empty:
+        }
+    } else {
+        dbi_log!("... skipped: empty CU (no DW_TAG_compile_unit entry)");
+        return Ok(None); // empty
+    };
+    let mut current_depth = 0;
     let mut skip_at_depth = None;
     let mut current_frame_base = InheritedAttr::new();
     let mut current_value_range = InheritedAttr::new();
     let mut current_scope_ranges = InheritedAttr::new();
     while let Some((depth_delta, entry)) = entries.next_dfs()? {
+        current_depth += depth_delta;
+        log_begin_input_die(dwarf, unit, entry, current_depth);
+
+        // If `skip_at_depth` is `Some` then we previously decided to skip over
+        // a node and all it's children. Let A be the last node processed, B be
+        // the first node skipped, C be previous node, and D the current node.
+        // Then `cached` is the difference from A to B, `depth` is the difference
+        // from B to C, and `depth_delta` is the differenc from C to D.
         let depth_delta = if let Some((depth, cached)) = skip_at_depth {
+            // `new_depth` = B to D
             let new_depth = depth + depth_delta;
+            // if D is below B continue to skip
             if new_depth > 0 {
                 skip_at_depth = Some((new_depth, cached));
+                log_end_output_die_skipped(entry, unit, "unreachable", current_depth);
                 continue;
             }
+            // otherwise process D with `depth_delta` being the difference from A to D
             skip_at_depth = None;
             new_depth + cached
         } else {
@@ -361,9 +380,13 @@ where
         if !context
             .reachable
             .contains(&entry.offset().to_unit_section_offset(&unit))
+            || is_dead_code(&entry)
         {
             // entry is not reachable: discarding all its info.
+            // Here B = C so `depth` is 0. A is the previous node so `cached` =
+            // `depth_delta`.
             skip_at_depth = Some((0, depth_delta));
+            log_end_output_die_skipped(entry, unit, "unreachable", current_depth);
             continue;
         }
 
@@ -372,15 +395,13 @@ where
         current_scope_ranges.update(new_stack_len);
         current_value_range.update(new_stack_len);
         let range_builder = if entry.tag() == gimli::DW_TAG_subprogram {
-            let range_builder = RangeInfoBuilder::from_subprogram_die(
-                dwarf, &unit, entry, context, addr_tr, cu_low_pc,
-            )?;
-            if let RangeInfoBuilder::Function(func_index) = range_builder {
-                if let Some(frame_info) = get_function_frame_info(memory_offset, funcs, func_index)
-                {
-                    current_value_range.push(new_stack_len, frame_info);
-                }
-                translated.insert(func_index);
+            let range_builder =
+                RangeInfoBuilder::from_subprogram_die(dwarf, &unit, entry, addr_tr)?;
+            if let RangeInfoBuilder::Function(func) = range_builder {
+                let frame_info = compilation.function_frame_info(module, func);
+                current_value_range.push(new_stack_len, frame_info);
+                let (symbol, _) = compilation.function(module, func);
+                translated.insert(symbol);
                 current_scope_ranges.push(new_stack_len, range_builder.get_ranges(addr_tr));
                 Some(range_builder)
             } else {
@@ -391,8 +412,7 @@ where
             let high_pc = entry.attr_value(gimli::DW_AT_high_pc)?;
             let ranges = entry.attr_value(gimli::DW_AT_ranges)?;
             if high_pc.is_some() || ranges.is_some() {
-                let range_builder =
-                    RangeInfoBuilder::from(dwarf, &unit, entry, context, cu_low_pc)?;
+                let range_builder = RangeInfoBuilder::from(dwarf, &unit, entry)?;
                 current_scope_ranges.push(new_stack_len, range_builder.get_ranges(addr_tr));
                 Some(range_builder)
             } else {
@@ -427,38 +447,37 @@ where
             let die_id = replace_pointer_type(
                 *parent,
                 pointer_kind,
-                comp_unit,
-                wp_die_id,
+                out_unit,
+                out_module_synthetic_unit.wasm_ptr_die_ref(),
                 entry,
-                &unit,
-                context,
+                unit,
+                dwarf,
                 out_strings,
                 &mut pending_die_refs,
             )?;
             stack.push(die_id);
             assert_eq!(stack.len(), new_stack_len);
             die_ref_map.insert(entry.offset(), die_id);
+            log_end_output_die(entry, unit, die_id, out_unit, out_strings, current_depth);
             continue;
         }
 
-        let die_id = comp_unit.add(*parent, entry.tag());
+        let out_die_id = out_unit.add(*parent, entry.tag());
 
-        stack.push(die_id);
+        stack.push(out_die_id);
         assert_eq!(stack.len(), new_stack_len);
-        die_ref_map.insert(entry.offset(), die_id);
+        die_ref_map.insert(entry.offset(), out_die_id);
 
         clone_die_attributes(
             dwarf,
             &unit,
             entry,
-            context,
             addr_tr,
             current_value_range.top(),
-            &mut comp_unit,
-            die_id,
+            &mut out_unit,
+            out_die_id,
             range_builder,
             current_scope_ranges.top(),
-            cu_low_pc,
             out_strings,
             &mut pending_die_refs,
             &mut pending_di_refs,
@@ -476,7 +495,7 @@ where
         // using the DW_AT_endianity attribute, so that the debugger will
         // be able to correctly access them.
         if entry.tag() == gimli::DW_TAG_base_type && isa.endianness() == Endianness::Big {
-            let current_scope = comp_unit.get_mut(die_id);
+            let current_scope = out_unit.get_mut(out_die_id);
             current_scope.set(
                 gimli::DW_AT_endianity,
                 write::AttributeValue::Endianity(gimli::DW_END_little),
@@ -485,9 +504,9 @@ where
 
         if entry.tag() == gimli::DW_TAG_subprogram && !current_scope_ranges.is_empty() {
             append_vmctx_info(
-                comp_unit,
-                die_id,
-                vmctx_die_id,
+                out_unit,
+                out_die_id,
+                out_module_synthetic_unit.vmctx_ptr_die_ref(),
                 addr_tr,
                 current_value_range.top(),
                 current_scope_ranges.top().context("range")?,
@@ -495,7 +514,16 @@ where
                 isa,
             )?;
         }
+
+        log_end_output_die(
+            entry,
+            unit,
+            out_die_id,
+            out_unit,
+            out_strings,
+            current_depth,
+        );
     }
-    die_ref_map.patch(pending_die_refs, comp_unit);
-    Ok(Some((unit_id, die_ref_map, pending_di_refs)))
+    die_ref_map.patch(pending_die_refs, out_unit);
+    Ok(Some((out_unit_id, die_ref_map, pending_di_refs)))
 }

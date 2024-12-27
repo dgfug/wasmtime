@@ -1,7 +1,6 @@
 use super::HashMap;
 use crate::frontend::FunctionBuilder;
 use alloc::vec::Vec;
-use core::convert::TryFrom;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::*;
 
@@ -14,13 +13,13 @@ type EntryIndex = u128;
 ///
 /// ```rust
 /// # use cranelift_codegen::ir::types::*;
-/// # use cranelift_codegen::ir::{ExternalName, Function, Signature, InstBuilder};
+/// # use cranelift_codegen::ir::{UserFuncName, Function, Signature, InstBuilder};
 /// # use cranelift_codegen::isa::CallConv;
 /// # use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Switch};
 /// #
 /// # let mut sig = Signature::new(CallConv::SystemV);
 /// # let mut fn_builder_ctx = FunctionBuilderContext::new();
-/// # let mut func = Function::with_name_signature(ExternalName::user(0, 0), sig);
+/// # let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
 /// # let mut builder = FunctionBuilder::new(&mut func, &mut fn_builder_ctx);
 /// #
 /// # let entry = builder.create_block();
@@ -55,11 +54,7 @@ impl Switch {
     /// Set a switch entry
     pub fn set_entry(&mut self, index: EntryIndex, block: Block) {
         let prev = self.cases.insert(index, block);
-        assert!(
-            prev.is_none(),
-            "Tried to set the same entry {} twice",
-            index
-        );
+        assert!(prev.is_none(), "Tried to set the same entry {index} twice");
     }
 
     /// Get a reference to all existing entries
@@ -108,27 +103,25 @@ impl Switch {
     }
 
     /// Binary search for the right `ContiguousCaseRange`.
-    fn build_search_tree(
+    fn build_search_tree<'a>(
         bx: &mut FunctionBuilder,
         val: Value,
         otherwise: Block,
-        contiguous_case_ranges: Vec<ContiguousCaseRange>,
-    ) -> Vec<(EntryIndex, Block, Vec<Block>)> {
-        let mut cases_and_jt_blocks = Vec::new();
+        contiguous_case_ranges: &'a [ContiguousCaseRange],
+    ) {
+        // If no switch cases were added to begin with, we can just emit `jump otherwise`.
+        if contiguous_case_ranges.is_empty() {
+            bx.ins().jump(otherwise, &[]);
+            return;
+        }
 
         // Avoid allocation in the common case
         if contiguous_case_ranges.len() <= 3 {
-            Self::build_search_branches(
-                bx,
-                val,
-                otherwise,
-                contiguous_case_ranges,
-                &mut cases_and_jt_blocks,
-            );
-            return cases_and_jt_blocks;
+            Self::build_search_branches(bx, val, otherwise, contiguous_case_ranges);
+            return;
         }
 
-        let mut stack: Vec<(Option<Block>, Vec<ContiguousCaseRange>)> = Vec::new();
+        let mut stack = Vec::new();
         stack.push((None, contiguous_case_ranges));
 
         while let Some((block, contiguous_case_ranges)) = stack.pop() {
@@ -137,17 +130,10 @@ impl Switch {
             }
 
             if contiguous_case_ranges.len() <= 3 {
-                Self::build_search_branches(
-                    bx,
-                    val,
-                    otherwise,
-                    contiguous_case_ranges,
-                    &mut cases_and_jt_blocks,
-                );
+                Self::build_search_branches(bx, val, otherwise, contiguous_case_ranges);
             } else {
                 let split_point = contiguous_case_ranges.len() / 2;
-                let mut left = contiguous_case_ranges;
-                let right = left.split_off(split_point);
+                let (left, right) = contiguous_case_ranges.split_at(split_point);
 
                 let left_block = bx.create_block();
                 let right_block = bx.create_block();
@@ -155,8 +141,8 @@ impl Switch {
                 let first_index = right[0].first_index;
                 let should_take_right_side =
                     icmp_imm_u128(bx, IntCC::UnsignedGreaterThanOrEqual, val, first_index);
-                bx.ins().brnz(should_take_right_side, right_block, &[]);
-                bx.ins().jump(left_block, &[]);
+                bx.ins()
+                    .brif(should_take_right_side, right_block, &[], left_block, &[]);
 
                 bx.seal_block(left_block);
                 bx.seal_block(right_block);
@@ -165,124 +151,113 @@ impl Switch {
                 stack.push((Some(right_block), right));
             }
         }
-
-        cases_and_jt_blocks
     }
 
     /// Linear search for the right `ContiguousCaseRange`.
-    fn build_search_branches(
+    fn build_search_branches<'a>(
         bx: &mut FunctionBuilder,
         val: Value,
         otherwise: Block,
-        contiguous_case_ranges: Vec<ContiguousCaseRange>,
-        cases_and_jt_blocks: &mut Vec<(EntryIndex, Block, Vec<Block>)>,
+        contiguous_case_ranges: &'a [ContiguousCaseRange],
     ) {
-        let mut was_branch = false;
-        let ins_fallthrough_jump = |was_branch: bool, bx: &mut FunctionBuilder| {
-            if was_branch {
-                let block = bx.create_block();
-                bx.ins().jump(block, &[]);
-                bx.seal_block(block);
-                bx.switch_to_block(block);
-            }
-        };
-        for ContiguousCaseRange {
-            first_index,
-            blocks,
-        } in contiguous_case_ranges.into_iter().rev()
-        {
-            match (blocks.len(), first_index) {
-                (1, 0) => {
-                    ins_fallthrough_jump(was_branch, bx);
-                    bx.ins().brz(val, blocks[0], &[]);
-                }
-                (1, _) => {
-                    ins_fallthrough_jump(was_branch, bx);
-                    let is_good_val = icmp_imm_u128(bx, IntCC::Equal, val, first_index);
-                    bx.ins().brnz(is_good_val, blocks[0], &[]);
-                }
-                (_, 0) => {
-                    // if `first_index` is 0, then `icmp_imm uge val, first_index` is trivially true
-                    let jt_block = bx.create_block();
-                    bx.ins().jump(jt_block, &[]);
-                    bx.seal_block(jt_block);
-                    cases_and_jt_blocks.push((first_index, jt_block, blocks));
-                    // `jump otherwise` below must not be hit, because the current block has been
-                    // filled above. This is the last iteration anyway, as 0 is the smallest
-                    // unsigned int, so just return here.
-                    return;
-                }
-                (_, _) => {
-                    ins_fallthrough_jump(was_branch, bx);
-                    let jt_block = bx.create_block();
-                    let is_good_val =
-                        icmp_imm_u128(bx, IntCC::UnsignedGreaterThanOrEqual, val, first_index);
-                    bx.ins().brnz(is_good_val, jt_block, &[]);
-                    bx.seal_block(jt_block);
-                    cases_and_jt_blocks.push((first_index, jt_block, blocks));
-                }
-            }
-            was_branch = true;
-        }
-
-        bx.ins().jump(otherwise, &[]);
-    }
-
-    /// For every item in `cases_and_jt_blocks` this will create a jump table in the specified block.
-    fn build_jump_tables(
-        bx: &mut FunctionBuilder,
-        val: Value,
-        otherwise: Block,
-        cases_and_jt_blocks: Vec<(EntryIndex, Block, Vec<Block>)>,
-    ) {
-        for (first_index, jt_block, blocks) in cases_and_jt_blocks.into_iter().rev() {
-            // There are currently no 128bit systems supported by rustc, but once we do ensure that
-            // we don't silently ignore a part of the jump table for 128bit integers on 128bit systems.
-            assert!(
-                u32::try_from(blocks.len()).is_ok(),
-                "Jump tables bigger than 2^32-1 are not yet supported"
-            );
-
-            let mut jt_data = JumpTableData::new();
-            for block in blocks {
-                jt_data.push_entry(block);
-            }
-            let jump_table = bx.create_jump_table(jt_data);
-
-            bx.switch_to_block(jt_block);
-            let discr = if first_index == 0 {
-                val
+        for (ix, range) in contiguous_case_ranges.iter().enumerate().rev() {
+            let alternate = if ix == 0 {
+                otherwise
             } else {
-                if let Ok(first_index) = u64::try_from(first_index) {
-                    bx.ins().iadd_imm(val, (first_index as i64).wrapping_neg())
-                } else {
-                    let (lsb, msb) = (first_index as u64, (first_index >> 64) as u64);
-                    let lsb = bx.ins().iconst(types::I64, lsb as i64);
-                    let msb = bx.ins().iconst(types::I64, msb as i64);
-                    let index = bx.ins().iconcat(lsb, msb);
-                    bx.ins().isub(val, index)
-                }
+                bx.create_block()
             };
 
-            let discr = if bx.func.dfg.value_type(discr).bits() > 64 {
+            if range.first_index == 0 {
+                assert_eq!(alternate, otherwise);
+
+                if let Some(block) = range.single_block() {
+                    bx.ins().brif(val, otherwise, &[], block, &[]);
+                } else {
+                    Self::build_jump_table(bx, val, otherwise, 0, &range.blocks);
+                }
+            } else {
+                if let Some(block) = range.single_block() {
+                    let is_good_val = icmp_imm_u128(bx, IntCC::Equal, val, range.first_index);
+                    bx.ins().brif(is_good_val, block, &[], alternate, &[]);
+                } else {
+                    let is_good_val = icmp_imm_u128(
+                        bx,
+                        IntCC::UnsignedGreaterThanOrEqual,
+                        val,
+                        range.first_index,
+                    );
+                    let jt_block = bx.create_block();
+                    bx.ins().brif(is_good_val, jt_block, &[], alternate, &[]);
+                    bx.seal_block(jt_block);
+                    bx.switch_to_block(jt_block);
+                    Self::build_jump_table(bx, val, otherwise, range.first_index, &range.blocks);
+                }
+            }
+
+            if alternate != otherwise {
+                bx.seal_block(alternate);
+                bx.switch_to_block(alternate);
+            }
+        }
+    }
+
+    fn build_jump_table(
+        bx: &mut FunctionBuilder,
+        val: Value,
+        otherwise: Block,
+        first_index: EntryIndex,
+        blocks: &[Block],
+    ) {
+        // There are currently no 128bit systems supported by rustc, but once we do ensure that
+        // we don't silently ignore a part of the jump table for 128bit integers on 128bit systems.
+        assert!(
+            u32::try_from(blocks.len()).is_ok(),
+            "Jump tables bigger than 2^32-1 are not yet supported"
+        );
+
+        let jt_data = JumpTableData::new(
+            bx.func.dfg.block_call(otherwise, &[]),
+            &blocks
+                .iter()
+                .map(|block| bx.func.dfg.block_call(*block, &[]))
+                .collect::<Vec<_>>(),
+        );
+        let jump_table = bx.create_jump_table(jt_data);
+
+        let discr = if first_index == 0 {
+            val
+        } else {
+            if let Ok(first_index) = u64::try_from(first_index) {
+                bx.ins().iadd_imm(val, (first_index as i64).wrapping_neg())
+            } else {
+                let (lsb, msb) = (first_index as u64, (first_index >> 64) as u64);
+                let lsb = bx.ins().iconst(types::I64, lsb as i64);
+                let msb = bx.ins().iconst(types::I64, msb as i64);
+                let index = bx.ins().iconcat(lsb, msb);
+                bx.ins().isub(val, index)
+            }
+        };
+
+        let discr = match bx.func.dfg.value_type(discr).bits() {
+            bits if bits > 32 => {
                 // Check for overflow of cast to u32. This is the max supported jump table entries.
                 let new_block = bx.create_block();
                 let bigger_than_u32 =
                     bx.ins()
                         .icmp_imm(IntCC::UnsignedGreaterThan, discr, u32::MAX as i64);
-                bx.ins().brnz(bigger_than_u32, otherwise, &[]);
-                bx.ins().jump(new_block, &[]);
+                bx.ins()
+                    .brif(bigger_than_u32, otherwise, &[], new_block, &[]);
                 bx.seal_block(new_block);
                 bx.switch_to_block(new_block);
 
-                // Cast to u64, as br_table is not implemented for i128
-                bx.ins().isplit(discr).0
-            } else {
-                discr
-            };
+                // Cast to i32, as br_table is not implemented for i64/i128
+                bx.ins().ireduce(types::I32, discr)
+            }
+            bits if bits < 32 => bx.ins().uextend(types::I32, discr),
+            _ => discr,
+        };
 
-            bx.ins().br_table(discr, otherwise, jump_table);
-        }
+        bx.ins().br_table(discr, jump_table);
     }
 
     /// Build the switch
@@ -293,22 +268,25 @@ impl Switch {
     /// * The value to switch on
     /// * The default block
     pub fn emit(self, bx: &mut FunctionBuilder, val: Value, otherwise: Block) {
-        // FIXME icmp(_imm) doesn't have encodings for i8 and i16 on x86(_64) yet
-        let val = match bx.func.dfg.value_type(val) {
-            types::I8 | types::I16 => bx.ins().uextend(types::I32, val),
-            _ => val,
-        };
+        // Validate that the type of `val` is sufficiently wide to address all cases.
+        let max = self.cases.keys().max().copied().unwrap_or(0);
+        let val_ty = bx.func.dfg.value_type(val);
+        let val_ty_max = val_ty.bounds(false).1;
+        if max > val_ty_max {
+            panic!("The index type {val_ty} does not fit the maximum switch entry of {max}");
+        }
 
         let contiguous_case_ranges = self.collect_contiguous_case_ranges();
-        let cases_and_jt_blocks =
-            Self::build_search_tree(bx, val, otherwise, contiguous_case_ranges);
-        Self::build_jump_tables(bx, val, otherwise, cases_and_jt_blocks);
+        Self::build_search_tree(bx, val, otherwise, &contiguous_case_ranges);
     }
 }
 
 fn icmp_imm_u128(bx: &mut FunctionBuilder, cond: IntCC, x: Value, y: u128) -> Value {
-    if let Ok(index) = u64::try_from(y) {
-        bx.ins().icmp_imm(cond, x, index as i64)
+    if bx.func.dfg.value_type(x) != types::I128 {
+        assert!(u64::try_from(y).is_ok());
+        bx.ins().icmp_imm(cond, x, y as i64)
+    } else if let Ok(index) = i64::try_from(y) {
+        bx.ins().icmp_imm(cond, x, index)
     } else {
         let (lsb, msb) = (y as u64, (y >> 64) as u64);
         let lsb = bx.ins().iconst(types::I64, lsb as i64);
@@ -344,6 +322,15 @@ impl ContiguousCaseRange {
             blocks: Vec::new(),
         }
     }
+
+    /// Returns `Some` block when there is only a single block in this range.
+    fn single_block(&self) -> Option<Block> {
+        if self.blocks.len() == 1 {
+            Some(self.blocks[0])
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -351,7 +338,6 @@ mod tests {
     use super::*;
     use crate::frontend::FunctionBuilderContext;
     use alloc::string::ToString;
-    use cranelift_codegen::ir::Function;
 
     macro_rules! setup {
         ($default:expr, [$($index:expr,)*]) => {{
@@ -363,6 +349,7 @@ mod tests {
                 bx.switch_to_block(block);
                 let val = bx.ins().iconst(types::I8, 0);
                 let mut switch = Switch::new();
+                let _ = &mut switch;
                 $(
                     let block = bx.create_block();
                     switch.set_entry($index, block);
@@ -378,161 +365,157 @@ mod tests {
     }
 
     #[test]
-    fn switch_zero() {
-        let func = setup!(0, [0,]);
-        assert_eq!(
+    fn switch_empty() {
+        let func = setup!(42, []);
+        assert_eq_output!(
             func,
             "block0:
     v0 = iconst.i8 0
-    v1 = uextend.i32 v0
-    brz v1, block1
-    jump block0"
+    jump block42"
+        );
+    }
+
+    #[test]
+    fn switch_zero() {
+        let func = setup!(0, [0,]);
+        assert_eq_output!(
+            func,
+            "block0:
+    v0 = iconst.i8 0
+    brif v0, block0, block1  ; v0 = 0"
         );
     }
 
     #[test]
     fn switch_single() {
         let func = setup!(0, [1,]);
-        assert_eq!(
+        assert_eq_output!(
             func,
             "block0:
     v0 = iconst.i8 0
-    v1 = uextend.i32 v0
-    v2 = icmp_imm eq v1, 1
-    brnz v2, block1
-    jump block0"
+    v1 = icmp_imm eq v0, 1  ; v0 = 0
+    brif v1, block1, block0"
         );
     }
 
     #[test]
     fn switch_bool() {
         let func = setup!(0, [0, 1,]);
-        assert_eq!(
+        assert_eq_output!(
             func,
-            "    jt0 = jump_table [block1, block2]
-
-block0:
+            "block0:
     v0 = iconst.i8 0
-    v1 = uextend.i32 v0
-    jump block3
-
-block3:
-    br_table.i32 v1, block0, jt0"
+    v1 = uextend.i32 v0  ; v0 = 0
+    br_table v1, block0, [block1, block2]"
         );
     }
 
     #[test]
     fn switch_two_gap() {
         let func = setup!(0, [0, 2,]);
-        assert_eq!(
+        assert_eq_output!(
             func,
             "block0:
     v0 = iconst.i8 0
-    v1 = uextend.i32 v0
-    v2 = icmp_imm eq v1, 2
-    brnz v2, block2
-    jump block3
+    v1 = icmp_imm eq v0, 2  ; v0 = 0
+    brif v1, block2, block3
 
 block3:
-    brz.i32 v1, block1
-    jump block0"
+    brif.i8 v0, block0, block1  ; v0 = 0"
         );
     }
 
     #[test]
     fn switch_many() {
         let func = setup!(0, [0, 1, 5, 7, 10, 11, 12,]);
-        assert_eq!(
+        assert_eq_output!(
             func,
-            "    jt0 = jump_table [block1, block2]
-    jt1 = jump_table [block5, block6, block7]
-
-block0:
+            "block0:
     v0 = iconst.i8 0
-    v1 = uextend.i32 v0
-    v2 = icmp_imm uge v1, 7
-    brnz v2, block9
-    jump block8
+    v1 = icmp_imm uge v0, 7  ; v0 = 0
+    brif v1, block9, block8
 
 block9:
-    v3 = icmp_imm.i32 uge v1, 10
-    brnz v3, block10
-    jump block11
+    v2 = icmp_imm.i8 uge v0, 10  ; v0 = 0
+    brif v2, block11, block10
 
 block11:
-    v4 = icmp_imm.i32 eq v1, 7
-    brnz v4, block4
-    jump block0
-
-block8:
-    v5 = icmp_imm.i32 eq v1, 5
-    brnz v5, block3
-    jump block12
-
-block12:
-    br_table.i32 v1, block0, jt0
+    v3 = iadd_imm.i8 v0, -10  ; v0 = 0
+    v4 = uextend.i32 v3
+    br_table v4, block0, [block5, block6, block7]
 
 block10:
-    v6 = iadd_imm.i32 v1, -10
-    br_table v6, block0, jt1"
+    v5 = icmp_imm.i8 eq v0, 7  ; v0 = 0
+    brif v5, block4, block0
+
+block8:
+    v6 = icmp_imm.i8 eq v0, 5  ; v0 = 0
+    brif v6, block3, block12
+
+block12:
+    v7 = uextend.i32 v0  ; v0 = 0
+    br_table v7, block0, [block1, block2]"
         );
     }
 
     #[test]
     fn switch_min_index_value() {
-        let func = setup!(0, [::core::i64::MIN as u64 as u128, 1,]);
-        assert_eq!(
+        let func = setup!(0, [i8::MIN as u8 as u128, 1,]);
+        assert_eq_output!(
             func,
             "block0:
     v0 = iconst.i8 0
-    v1 = uextend.i32 v0
-    v2 = icmp_imm eq v1, 0x8000_0000_0000_0000
-    brnz v2, block1
-    jump block3
+    v1 = icmp_imm eq v0, -128  ; v0 = 0
+    brif v1, block1, block3
 
 block3:
-    v3 = icmp_imm.i32 eq v1, 1
-    brnz v3, block2
-    jump block0"
+    v2 = icmp_imm.i8 eq v0, 1  ; v0 = 0
+    brif v2, block2, block0"
         );
     }
 
     #[test]
     fn switch_max_index_value() {
-        let func = setup!(0, [::core::i64::MAX as u64 as u128, 1,]);
-        assert_eq!(
+        let func = setup!(0, [i8::MAX as u8 as u128, 1,]);
+        assert_eq_output!(
             func,
             "block0:
     v0 = iconst.i8 0
-    v1 = uextend.i32 v0
-    v2 = icmp_imm eq v1, 0x7fff_ffff_ffff_ffff
-    brnz v2, block1
-    jump block3
+    v1 = icmp_imm eq v0, 127  ; v0 = 0
+    brif v1, block1, block3
 
 block3:
-    v3 = icmp_imm.i32 eq v1, 1
-    brnz v3, block2
-    jump block0"
+    v2 = icmp_imm.i8 eq v0, 1  ; v0 = 0
+    brif v2, block2, block0"
         )
     }
 
     #[test]
     fn switch_optimal_codegen() {
-        let func = setup!(0, [-1i64 as u64 as u128, 0, 1,]);
-        assert_eq!(
+        let func = setup!(0, [-1i8 as u8 as u128, 0, 1,]);
+        assert_eq_output!(
             func,
-            "    jt0 = jump_table [block2, block3]
-
-block0:
+            "block0:
     v0 = iconst.i8 0
-    v1 = uextend.i32 v0
-    v2 = icmp_imm eq v1, -1
-    brnz v2, block1
-    jump block4
+    v1 = icmp_imm eq v0, -1  ; v0 = 0
+    brif v1, block1, block4
 
 block4:
-    br_table.i32 v1, block0, jt0"
+    v2 = uextend.i32 v0  ; v0 = 0
+    br_table v2, block0, [block2, block3]"
         );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "The index type i8 does not fit the maximum switch entry of 4683743612477887600"
+    )]
+    fn switch_rejects_small_inputs() {
+        // This is a regression test for a bug that we found where we would emit a cmp
+        // with a type that was not able to fully represent a large index.
+        //
+        // See: https://github.com/bytecodealliance/wasmtime/pull/4502#issuecomment-1191961677
+        setup!(1, [0x4100_0000_00bf_d470,]);
     }
 
     #[test]
@@ -541,7 +524,7 @@ block4:
 
         for case in cases {
             for typ in &[types::I8, types::I16, types::I32, types::I64, types::I128] {
-                eprintln!("Testing {:?} with keys: {:?}", typ, case);
+                eprintln!("Testing {typ:?} with keys: {case:?}");
                 do_case(case, *typ);
             }
         }
@@ -602,16 +585,16 @@ block4:
             .trim_start_matches("function u0:0() fast {\n")
             .trim_end_matches("\n}\n")
             .to_string();
-        assert_eq!(
+        assert_eq_output!(
             func,
-            "    jt0 = jump_table [block2, block1]
-
-block0:
+            "block0:
     v0 = iconst.i64 0
-    jump block4
+    v1 = icmp_imm ugt v0, 0xffff_ffff  ; v0 = 0
+    brif v1, block3, block4
 
 block4:
-    br_table.i64 v0, block3, jt0"
+    v2 = ireduce.i32 v0  ; v0 = 0
+    br_table v2, block3, [block2, block1]"
         );
     }
 
@@ -623,7 +606,8 @@ block4:
             let mut bx = FunctionBuilder::new(&mut func, &mut func_ctx);
             let block0 = bx.create_block();
             bx.switch_to_block(block0);
-            let val = bx.ins().iconst(types::I128, 0);
+            let val = bx.ins().iconst(types::I64, 0);
+            let val = bx.ins().uextend(types::I128, val);
             let mut switch = Switch::new();
             let block1 = bx.create_block();
             switch.set_entry(1, block1);
@@ -637,22 +621,56 @@ block4:
             .trim_start_matches("function u0:0() fast {\n")
             .trim_end_matches("\n}\n")
             .to_string();
-        assert_eq!(
+        assert_eq_output!(
             func,
-            "    jt0 = jump_table [block2, block1]
-
-block0:
-    v0 = iconst.i128 0
-    jump block4
+            "block0:
+    v0 = iconst.i64 0
+    v1 = uextend.i128 v0  ; v0 = 0
+    v2 = icmp_imm ugt v1, 0xffff_ffff
+    brif v2, block3, block4
 
 block4:
-    v1 = icmp_imm.i128 ugt v0, 0xffff_ffff
-    brnz v1, block3
-    jump block5
+    v3 = ireduce.i32 v1
+    br_table v3, block3, [block2, block1]"
+        );
+    }
 
-block5:
-    v2, v3 = isplit.i128 v0
-    br_table v2, block3, jt0"
+    #[test]
+    fn switch_128bit_max_u64() {
+        let mut func = Function::new();
+        let mut func_ctx = FunctionBuilderContext::new();
+        {
+            let mut bx = FunctionBuilder::new(&mut func, &mut func_ctx);
+            let block0 = bx.create_block();
+            bx.switch_to_block(block0);
+            let val = bx.ins().iconst(types::I64, 0);
+            let val = bx.ins().uextend(types::I128, val);
+            let mut switch = Switch::new();
+            let block1 = bx.create_block();
+            switch.set_entry(u64::MAX.into(), block1);
+            let block2 = bx.create_block();
+            switch.set_entry(0, block2);
+            let block3 = bx.create_block();
+            switch.emit(&mut bx, val, block3);
+        }
+        let func = func
+            .to_string()
+            .trim_start_matches("function u0:0() fast {\n")
+            .trim_end_matches("\n}\n")
+            .to_string();
+        assert_eq_output!(
+            func,
+            "block0:
+    v0 = iconst.i64 0
+    v1 = uextend.i128 v0  ; v0 = 0
+    v2 = iconst.i64 -1
+    v3 = iconst.i64 0
+    v4 = iconcat v2, v3  ; v2 = -1, v3 = 0
+    v5 = icmp eq v1, v4
+    brif v5, block1, block4
+
+block4:
+    brif.i128 v1, block3, block2"
         );
     }
 }

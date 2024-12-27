@@ -3,18 +3,16 @@
 This document shows an example of how to embed Wasmtime using the [Rust
 API][apidoc] to execute a simple wasm program. Be sure to also check out the
 [full API documentation][apidoc] for a full listing of what the [`wasmtime`
-crate][wasmtime] has to offer and the [book examples for
-Rust](./examples-rust-embed.md) for more information.
+crate][wasmtime] has to offer.
 
 [apidoc]: https://bytecodealliance.github.io/wasmtime/api/wasmtime/
 [wasmtime]: https://crates.io/crates/wasmtime
 
 ## Creating the WebAssembly to execute
 
-Creation of a WebAssembly file is generally covered by the [Writing
-WebAssembly chapter](./wasm.md), so we'll just assume that you've already got a
-wasm file on hand for the rest of this tutorial. To make things simple we'll
-also just assume you've got a `hello.wat` file which looks like this:
+We'll just assume that you've already got a wasm file on hand for the rest of
+this tutorial. To make things simple we'll also just assume you've got a
+`hello.wat` file which looks like this:
 
 ```wat
 (module
@@ -38,12 +36,11 @@ $ cd wasmtime_hello
 
 Next you'll want to add `hello.wat` to the root of your project.
 
-We will be using the `wasmtime` crate to run the wasm file, so next up we need a
-dependency in `Cargo.toml`:
+We will be using the `wasmtime` crate to run the wasm file. Please execute the command `cargo add wasmtime` to use the latest version of the crate. The `dependencies` block in the `Cargo.toml` file will appear as follows:
 
 ```toml
 [dependencies]
-wasmtime = "0.18.0"
+wasmtime = "19.0.0"
 ```
 
 Next up let's write the code that we need to execute this wasm file. The
@@ -86,7 +83,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // There's a few ways we can call the `answer` `Func` value. The easiest
     // is to statically assert its signature with `typed` (in this case
     // asserting it takes no arguments and returns one i32) and then call it.
-    let answer = answer.typed::<(), i32, _>(&store)?;
+    let answer = answer.typed::<(), i32>(&store)?;
 
     // And finally we can call our function! Note that the error propagation
     // with `?` is done to handle the case where the wasm function traps.
@@ -164,7 +161,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // First we create our simple "double" function which will only multiply its
     // input by two and return it.
-    linker.func_wrap("", "double", |param: i32| param * 2);
+    linker.func_wrap("", "double", |param: i32| param * 2)?;
 
     // Next we define a `log` function. Note that we're using a
     // Wasmtime-provided `Caller` argument to access the state on the `Store`,
@@ -172,7 +169,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     linker.func_wrap("", "log", |mut caller: Caller<'_, Log>, param: u32| {
         println!("log: {}", param);
         caller.data_mut().integers_logged.push(param);
-    });
+    })?;
 
     // As above, instantiation always happens within a `Store`. This means to
     // actually instantiate with our `Linker` we'll need to create a store. Note
@@ -184,7 +181,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let instance = linker.instantiate(&mut store, &module)?;
 
     // Like before, we can get the run function and execute it.
-    let run = instance.get_typed_func::<(), (), _>(&mut store, "run")?;
+    let run = instance.get_typed_func::<(), ()>(&mut store, "run")?;
     run.call(&mut store, ())?;
 
     // We can also inspect what integers were logged:

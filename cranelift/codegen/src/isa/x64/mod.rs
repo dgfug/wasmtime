@@ -1,88 +1,97 @@
 //! X86_64-bit Instruction Set Architecture.
 
-use self::inst::EmitInfo;
+pub use self::inst::{args, EmitInfo, EmitState, Inst};
 
-use super::TargetIsa;
-use crate::ir::{condcodes::IntCC, Function};
+use super::{OwnedTargetIsa, TargetIsa};
+use crate::dominator_tree::DominatorTree;
+use crate::ir::{types, Function, Type};
 #[cfg(feature = "unwind")]
 use crate::isa::unwind::systemv;
-use crate::isa::x64::{inst::regs::create_reg_universe_systemv, settings as x64_settings};
-use crate::isa::Builder as IsaBuilder;
+use crate::isa::x64::settings as x64_settings;
+use crate::isa::{Builder as IsaBuilder, FunctionAlignment};
 use crate::machinst::{
-    compile, MachBackend, MachCompileResult, MachTextSectionBuilder, TargetIsaAdapter,
+    compile, CompiledCode, CompiledCodeStencil, MachInst, MachTextSectionBuilder, Reg, SigSet,
     TextSectionBuilder, VCode,
 };
 use crate::result::CodegenResult;
 use crate::settings::{self as shared_settings, Flags};
+use crate::{Final, MachBufferFinalized};
 use alloc::{boxed::Box, vec::Vec};
-
-use regalloc::{PrettyPrint, RealRegUniverse, Reg};
+use core::fmt;
+use cranelift_control::ControlPlane;
 use target_lexicon::Triple;
 
 mod abi;
 pub mod encoding;
 mod inst;
 mod lower;
-mod settings;
+mod pcc;
+pub mod settings;
+
+pub use inst::unwind::systemv::create_cie;
 
 /// An X64 backend.
 pub(crate) struct X64Backend {
     triple: Triple,
     flags: Flags,
     x64_flags: x64_settings::Flags,
-    reg_universe: RealRegUniverse,
 }
 
 impl X64Backend {
     /// Create a new X64 backend with the given (shared) flags.
     fn new_with_flags(triple: Triple, flags: Flags, x64_flags: x64_settings::Flags) -> Self {
-        let reg_universe = create_reg_universe_systemv(&flags);
         Self {
             triple,
             flags,
             x64_flags,
-            reg_universe,
         }
     }
 
-    fn compile_vcode(&self, func: &Function, flags: Flags) -> CodegenResult<VCode<inst::Inst>> {
+    fn compile_vcode(
+        &self,
+        func: &Function,
+        domtree: &DominatorTree,
+        ctrl_plane: &mut ControlPlane,
+    ) -> CodegenResult<(VCode<inst::Inst>, regalloc2::Output)> {
         // This performs lowering to VCode, register-allocates the code, computes
         // block layout and finalizes branches. The result is ready for binary emission.
-        let emit_info = EmitInfo::new(flags.clone(), self.x64_flags.clone());
-        let abi = Box::new(abi::X64ABICallee::new(&func, flags)?);
-        compile::compile::<Self>(&func, self, abi, emit_info)
+        let emit_info = EmitInfo::new(self.flags.clone(), self.x64_flags.clone());
+        let sigs = SigSet::new::<abi::X64ABIMachineSpec>(func, &self.flags)?;
+        let abi = abi::X64Callee::new(func, self, &self.x64_flags, &sigs)?;
+        compile::compile::<Self>(func, domtree, self, abi, emit_info, sigs, ctrl_plane)
     }
 }
 
-impl MachBackend for X64Backend {
+impl TargetIsa for X64Backend {
     fn compile_function(
         &self,
         func: &Function,
+        domtree: &DominatorTree,
         want_disasm: bool,
-    ) -> CodegenResult<MachCompileResult> {
-        let flags = self.flags();
-        let vcode = self.compile_vcode(func, flags.clone())?;
+        ctrl_plane: &mut ControlPlane,
+    ) -> CodegenResult<CompiledCodeStencil> {
+        let (vcode, regalloc_result) = self.compile_vcode(func, domtree, ctrl_plane)?;
 
-        let (buffer, bb_starts, bb_edges) = vcode.emit();
-        let buffer = buffer.finish();
-        let frame_size = vcode.frame_size();
-        let value_labels_ranges = vcode.value_labels_ranges();
-        let stackslot_offsets = vcode.stackslot_offsets().clone();
+        let emit_result = vcode.emit(&regalloc_result, want_disasm, &self.flags, ctrl_plane);
+        let frame_size = emit_result.frame_size;
+        let value_labels_ranges = emit_result.value_labels_ranges;
+        let buffer = emit_result.buffer;
+        let sized_stackslot_offsets = emit_result.sized_stackslot_offsets;
+        let dynamic_stackslot_offsets = emit_result.dynamic_stackslot_offsets;
 
-        let disasm = if want_disasm {
-            Some(vcode.show_rru(Some(&create_reg_universe_systemv(flags))))
-        } else {
-            None
-        };
+        if let Some(disasm) = emit_result.disasm.as_ref() {
+            crate::trace!("disassembly:\n{}", disasm);
+        }
 
-        Ok(MachCompileResult {
+        Ok(CompiledCodeStencil {
             buffer,
             frame_size,
-            disasm,
+            vcode: emit_result.disasm,
             value_labels_ranges,
-            stackslot_offsets,
-            bb_starts,
-            bb_edges,
+            sized_stackslot_offsets,
+            dynamic_stackslot_offsets,
+            bb_starts: emit_result.bb_offsets,
+            bb_edges: emit_result.bb_edges,
         })
     }
 
@@ -94,50 +103,25 @@ impl MachBackend for X64Backend {
         self.x64_flags.iter().collect()
     }
 
+    fn dynamic_vector_bytes(&self, _dyn_ty: Type) -> u32 {
+        16
+    }
+
     fn name(&self) -> &'static str {
         "x64"
     }
 
-    fn triple(&self) -> Triple {
-        self.triple.clone()
-    }
-
-    fn reg_universe(&self) -> &RealRegUniverse {
-        &self.reg_universe
-    }
-
-    fn unsigned_add_overflow_condition(&self) -> IntCC {
-        // Unsigned `<`; this corresponds to the carry flag set on x86, which
-        // indicates an add has overflowed.
-        IntCC::UnsignedLessThan
+    fn triple(&self) -> &Triple {
+        &self.triple
     }
 
     #[cfg(feature = "unwind")]
     fn emit_unwind_info(
         &self,
-        result: &MachCompileResult,
-        kind: crate::machinst::UnwindInfoKind,
+        result: &CompiledCode,
+        kind: crate::isa::unwind::UnwindInfoKind,
     ) -> CodegenResult<Option<crate::isa::unwind::UnwindInfo>> {
-        use crate::isa::unwind::UnwindInfo;
-        use crate::machinst::UnwindInfoKind;
-        Ok(match kind {
-            UnwindInfoKind::SystemV => {
-                let mapper = self::inst::unwind::systemv::RegisterMapper;
-                Some(UnwindInfo::SystemV(
-                    crate::isa::unwind::systemv::create_unwind_info_from_insts(
-                        &result.buffer.unwind_info[..],
-                        result.buffer.data.len(),
-                        &mapper,
-                    )?,
-                ))
-            }
-            UnwindInfoKind::Windows => Some(UnwindInfo::WindowsX64(
-                crate::isa::unwind::winx64::create_unwind_info_from_insts::<
-                    self::inst::unwind::winx64::RegisterMapper,
-                >(&result.buffer.unwind_info[..])?,
-            )),
-            _ => None,
-        })
+        emit_unwind_info(&result.buffer, kind)
     }
 
     #[cfg(feature = "unwind")]
@@ -146,12 +130,92 @@ impl MachBackend for X64Backend {
     }
 
     #[cfg(feature = "unwind")]
-    fn map_reg_to_dwarf(&self, reg: Reg) -> Result<u16, systemv::RegisterMappingError> {
+    fn map_regalloc_reg_to_dwarf(&self, reg: Reg) -> Result<u16, systemv::RegisterMappingError> {
         inst::unwind::systemv::map_reg(reg).map(|reg| reg.0)
     }
 
-    fn text_section_builder(&self, num_funcs: u32) -> Box<dyn TextSectionBuilder> {
+    fn text_section_builder(&self, num_funcs: usize) -> Box<dyn TextSectionBuilder> {
         Box::new(MachTextSectionBuilder::<inst::Inst>::new(num_funcs))
+    }
+
+    fn function_alignment(&self) -> FunctionAlignment {
+        Inst::function_alignment()
+    }
+
+    fn page_size_align_log2(&self) -> u8 {
+        debug_assert_eq!(1 << 12, 0x1000);
+        12
+    }
+
+    #[cfg(feature = "disas")]
+    fn to_capstone(&self) -> Result<capstone::Capstone, capstone::Error> {
+        use capstone::prelude::*;
+        Capstone::new()
+            .x86()
+            .mode(arch::x86::ArchMode::Mode64)
+            .syntax(arch::x86::ArchSyntax::Att)
+            .detail(true)
+            .build()
+    }
+
+    fn has_native_fma(&self) -> bool {
+        self.x64_flags.use_fma()
+    }
+
+    fn has_x86_blendv_lowering(&self, ty: Type) -> bool {
+        // The `blendvpd`, `blendvps`, and `pblendvb` instructions are all only
+        // available from SSE 4.1 and onwards. Otherwise the i16x8 type has no
+        // equivalent instruction which only looks at the top bit for a select
+        // operation, so that always returns `false`
+        self.x64_flags.use_sse41() && ty != types::I16X8
+    }
+
+    fn has_x86_pshufb_lowering(&self) -> bool {
+        self.x64_flags.use_ssse3()
+    }
+
+    fn has_x86_pmulhrsw_lowering(&self) -> bool {
+        self.x64_flags.use_ssse3()
+    }
+
+    fn has_x86_pmaddubsw_lowering(&self) -> bool {
+        self.x64_flags.use_ssse3()
+    }
+}
+
+/// Emit unwind info for an x86 target.
+pub fn emit_unwind_info(
+    buffer: &MachBufferFinalized<Final>,
+    kind: crate::isa::unwind::UnwindInfoKind,
+) -> CodegenResult<Option<crate::isa::unwind::UnwindInfo>> {
+    use crate::isa::unwind::{UnwindInfo, UnwindInfoKind};
+    Ok(match kind {
+        UnwindInfoKind::SystemV => {
+            let mapper = self::inst::unwind::systemv::RegisterMapper;
+            Some(UnwindInfo::SystemV(
+                crate::isa::unwind::systemv::create_unwind_info_from_insts(
+                    &buffer.unwind_info[..],
+                    buffer.data().len(),
+                    &mapper,
+                )?,
+            ))
+        }
+        UnwindInfoKind::Windows => Some(UnwindInfo::WindowsX64(
+            crate::isa::unwind::winx64::create_unwind_info_from_insts::<
+                self::inst::unwind::winx64::RegisterMapper,
+            >(&buffer.unwind_info[..])?,
+        )),
+        _ => None,
+    })
+}
+
+impl fmt::Display for X64Backend {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("MachBackend")
+            .field("name", &self.name())
+            .field("triple", &self.triple())
+            .field("flags", &format!("{}", self.flags()))
+            .finish()
     }
 }
 
@@ -167,9 +231,9 @@ pub(crate) fn isa_builder(triple: Triple) -> IsaBuilder {
 fn isa_constructor(
     triple: Triple,
     shared_flags: Flags,
-    builder: shared_settings::Builder,
-) -> Box<dyn TargetIsa> {
+    builder: &shared_settings::Builder,
+) -> CodegenResult<OwnedTargetIsa> {
     let isa_flags = x64_settings::Flags::new(&shared_flags, builder);
     let backend = X64Backend::new_with_flags(triple, shared_flags, isa_flags);
-    Box::new(TargetIsaAdapter::new(backend))
+    Ok(backend.wrapped())
 }

@@ -2,8 +2,8 @@
 
 use crate::keys::Keys;
 use crate::EntityRef;
-use alloc::vec::Vec;
 use core::marker::PhantomData;
+use cranelift_bitset::CompoundBitSet;
 
 /// A set of `K` for densely indexed entity references.
 ///
@@ -14,9 +14,25 @@ pub struct EntitySet<K>
 where
     K: EntityRef,
 {
-    elems: Vec<u8>,
-    len: usize,
+    bitset: CompoundBitSet,
     unused: PhantomData<K>,
+}
+
+impl<K: EntityRef> Default for EntitySet<K> {
+    fn default() -> Self {
+        Self {
+            bitset: CompoundBitSet::default(),
+            unused: PhantomData,
+        }
+    }
+}
+
+impl<K: EntityRef> Extend<K> for EntitySet<K> {
+    fn extend<T: IntoIterator<Item = K>>(&mut self, iter: T) {
+        for k in iter {
+            self.insert(k);
+        }
+    }
 }
 
 /// Shared `EntitySet` implementation for all value types.
@@ -26,115 +42,61 @@ where
 {
     /// Create a new empty set.
     pub fn new() -> Self {
-        Self {
-            elems: Vec::new(),
-            len: 0,
-            unused: PhantomData,
-        }
+        Self::default()
     }
 
     /// Creates a new empty set with the specified capacity.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            elems: Vec::with_capacity((capacity + 7) / 8),
-            ..Self::new()
+            bitset: CompoundBitSet::with_capacity(capacity),
+            unused: PhantomData,
         }
+    }
+
+    /// Ensure that the set has enough capacity to hold `capacity` total
+    /// elements.
+    pub fn ensure_capacity(&mut self, capacity: usize) {
+        self.bitset.ensure_capacity(capacity);
     }
 
     /// Get the element at `k` if it exists.
     pub fn contains(&self, k: K) -> bool {
         let index = k.index();
-        if index < self.len {
-            (self.elems[index / 8] & (1 << (index % 8))) != 0
-        } else {
-            false
-        }
+        self.bitset.contains(index)
     }
 
     /// Is this set completely empty?
     pub fn is_empty(&self) -> bool {
-        if self.len != 0 {
-            false
-        } else {
-            self.elems.iter().all(|&e| e == 0)
-        }
-    }
-
-    /// Returns the cardinality of the set.  More precisely, it returns the number of calls to
-    /// `insert` with different key values, that have happened since the the set was most recently
-    /// `clear`ed or created with `new`.
-    pub fn cardinality(&self) -> usize {
-        let mut n: usize = 0;
-        for byte_ix in 0..self.len / 8 {
-            n += self.elems[byte_ix].count_ones() as usize;
-        }
-        for bit_ix in (self.len / 8) * 8..self.len {
-            if (self.elems[bit_ix / 8] & (1 << (bit_ix % 8))) != 0 {
-                n += 1;
-            }
-        }
-        n
+        self.bitset.is_empty()
     }
 
     /// Remove all entries from this set.
     pub fn clear(&mut self) {
-        self.len = 0;
-        self.elems.clear()
+        self.bitset.clear()
     }
 
     /// Iterate over all the keys in this set.
     pub fn keys(&self) -> Keys<K> {
-        Keys::with_len(self.len)
-    }
-
-    /// Resize the set to have `n` entries by adding default entries as needed.
-    pub fn resize(&mut self, n: usize) {
-        self.elems.resize((n + 7) / 8, 0);
-        self.len = n
+        Keys::with_len(self.bitset.max().map_or(0, |x| x + 1))
     }
 
     /// Insert the element at `k`.
     pub fn insert(&mut self, k: K) -> bool {
         let index = k.index();
-        if index >= self.len {
-            self.resize(index + 1)
-        }
-        let result = !self.contains(k);
-        self.elems[index / 8] |= 1 << (index % 8);
-        result
+        self.bitset.insert(index)
     }
 
     /// Removes and returns the entity from the set if it exists.
     pub fn pop(&mut self) -> Option<K> {
-        if self.len == 0 {
-            return None;
-        }
-
-        // Clear the last known entity in the list.
-        let last_index = self.len - 1;
-        self.elems[last_index / 8] &= !(1 << (last_index % 8));
-
-        // Set the length to the next last stored entity or zero if we pop'ed
-        // the last entity.
-        self.len = self
-            .elems
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, &byte)| byte != 0)
-            // Map `i` from byte index to bit level index.
-            // `(i + 1) * 8` = Last bit in byte.
-            // `last - byte.leading_zeros()` = last set bit in byte.
-            // `as usize` won't ever truncate as the potential range is `0..=8`.
-            .map_or(0, |(i, byte)| ((i + 1) * 8) - byte.leading_zeros() as usize);
-
-        Some(K::new(last_index))
+        let index = self.bitset.pop()?;
+        Some(K::new(index))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
     use core::u32;
 
     // `EntityRef` impl for testing.
@@ -173,7 +135,6 @@ mod tests {
         let v: Vec<E> = m.keys().collect();
         assert_eq!(v, [r0, r1, r2]);
 
-        m.resize(20);
         assert!(!m.contains(E(3)));
         assert!(!m.contains(E(4)));
         assert!(!m.contains(E(8)));
@@ -234,7 +195,7 @@ mod tests {
         for &block in &blocks {
             m.insert(block);
         }
-        assert_eq!(m.len, 13);
+        assert_eq!(m.bitset.max(), Some(12));
         blocks.sort();
 
         for &block in blocks.iter().rev() {

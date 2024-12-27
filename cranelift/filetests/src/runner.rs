@@ -5,7 +5,6 @@
 
 use crate::concurrent::{ConcurrentRunner, Reply};
 use crate::runone;
-use cranelift_codegen::timing;
 use std::error::Error;
 use std::ffi::OsStr;
 use std::fmt::{self, Display};
@@ -13,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time;
 
 /// Timeout in seconds when we're not making progress.
-const TIMEOUT_PANIC: usize = 10;
+const TIMEOUT_PANIC: usize = 60;
 
 /// Timeout for reporting slow tests without panicking.
 const TIMEOUT_SLOW: usize = 3;
@@ -48,8 +47,8 @@ impl Display for QueueEntry {
         let p = self.path.to_string_lossy();
         match self.state {
             State::Done(Ok(dur)) => write!(f, "{}.{:03} {}", dur.as_secs(), dur.subsec_millis(), p),
-            State::Done(Err(ref e)) => write!(f, "FAIL {}: {:?}", p, e),
-            _ => write!(f, "{}", p),
+            State::Done(Err(ref e)) => write!(f, "FAIL {p}: {e:?}"),
+            _ => write!(f, "{p}"),
         }
     }
 }
@@ -127,7 +126,7 @@ impl TestRunner {
         // This recursive search tries to minimize statting in a directory hierarchy containing
         // mostly test cases.
         //
-        // - Directory entries with a "clif" extension are presumed to be test case files.
+        // - Directory entries with a "clif" or "wat" extension are presumed to be test case files.
         // - Directory entries with no extension are presumed to be subdirectories.
         // - Anything else is ignored.
         //
@@ -160,7 +159,7 @@ impl TestRunner {
                                 // Recognize directories and tests by extension.
                                 // Yes, this means we ignore directories with '.' in their name.
                                 match path.extension().and_then(OsStr::to_str) {
-                                    Some("clif") => self.push_test(path),
+                                    Some("clif" | "wat") => self.push_test(path),
                                     Some(_) => {}
                                     None => self.push_dir(path),
                                 }
@@ -298,9 +297,9 @@ impl TestRunner {
                     None => break,
                 }
             }
-            conc.join();
+            let pass_times = conc.join();
             if self.report_times {
-                println!("{}", timing::take_current());
+                println!("{pass_times}");
             }
         }
     }
@@ -350,13 +349,12 @@ impl TestRunner {
             } => dur > cut,
             _ => false,
         }) {
-            println!("slow: {}", t)
+            println!("slow: {t}")
         }
     }
 
     /// Scan pushed directories for tests and run them.
-    pub fn run(&mut self) -> anyhow::Result<time::Duration> {
-        let started = time::Instant::now();
+    pub fn run(&mut self) -> anyhow::Result<()> {
         self.scan_dirs(IsPass::NotPass);
         self.schedule_jobs();
         self.report_slow_tests();
@@ -364,26 +362,22 @@ impl TestRunner {
 
         println!("{} tests", self.tests.len());
         match self.errors {
-            0 => Ok(started.elapsed()),
+            0 => Ok(()),
             1 => anyhow::bail!("1 failure"),
             n => anyhow::bail!("{} failures", n),
         }
     }
 
     /// Scan pushed directories for tests and run specified passes from commandline on them.
-    pub fn run_passes(
-        &mut self,
-        passes: &[String],
-        target: &str,
-    ) -> anyhow::Result<time::Duration> {
-        let started = time::Instant::now();
+    pub fn run_passes(&mut self, passes: &[String], target: &str) -> anyhow::Result<()> {
         self.scan_dirs(IsPass::Pass);
         self.schedule_pass_job(passes, target);
         self.report_slow_tests();
+        self.drain_threads();
 
         println!("{} tests", self.tests.len());
         match self.errors {
-            0 => Ok(started.elapsed()),
+            0 => Ok(()),
             1 => anyhow::bail!("1 failure"),
             n => anyhow::bail!("{} failures", n),
         }

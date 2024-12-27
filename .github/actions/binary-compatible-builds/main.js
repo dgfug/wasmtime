@@ -12,14 +12,18 @@ function set_env(name, val) {
 // possible. For now 10.9 is the limit.
 if (process.platform == 'darwin') {
   set_env("MACOSX_DEPLOYMENT_TARGET", "10.9");
-  set_env("python", "python3");
   return;
 }
 
 // On Windows we build against the static CRT to reduce dll dependencies
 if (process.platform == 'win32') {
   set_env("RUSTFLAGS", "-Ctarget-feature=+crt-static");
-  set_env("python", "python");
+  return;
+}
+
+// Android doesn't use a container as it's controlled by the installation of the
+// SDK/NDK.
+if (process.env.INPUT_NAME && process.env.INPUT_NAME.indexOf("android") >= 0) {
   return;
 }
 
@@ -28,7 +32,26 @@ if (process.platform == 'win32') {
 // commands in there with the `$CENTOS` env var.
 
 if (process.env.CENTOS !== undefined) {
-  const args = ['exec', '-w', process.cwd(), '-i', 'centos'];
+  const args = ['exec', '--workdir', process.cwd(), '--interactive'];
+  // Forward any rust-looking env vars from the environment into the container
+  // itself.
+  for (let key in process.env) {
+    if (key.startsWith('CARGO') || key.startsWith('RUST')) {
+      args.push('--env');
+      args.push(key);
+    }
+  }
+  args.push('build-container')
+
+  // Start the container by appending to `$PATH` with the `/rust/bin` path that
+  // is mounted below.
+  args.push('bash');
+  args.push('-c');
+  args.push('export PATH=$PATH:/rust/bin; export RUSTFLAGS="$RUSTFLAGS $EXTRA_RUSTFLAGS"; exec "$@"');
+  args.push('bash');
+
+  // Add in whatever we're running which will get executed in the sub-shell with
+  // an augmented PATH.
   for (const arg of process.argv.slice(2)) {
     args.push(arg);
   }
@@ -36,40 +59,23 @@ if (process.env.CENTOS !== undefined) {
   return;
 }
 
-// Add our rust mount onto PATH, but also add some stuff to PATH from
-// the packages that we install.
-let path = process.env.PATH;
-path = `${path}:/rust/bin`;
-path = `/opt/rh/devtoolset-8/root/usr/bin:${path}`;
+const name = process.env.INPUT_NAME.replace(/-min$/, '');
 
-// Spawn a container daemonized in the background which we'll connect to via
-// `docker exec`. This'll have access to the current directory.
+child_process.execFileSync('docker', [
+  'build',
+  '--tag', 'build-image',
+  `${process.cwd()}/ci/docker/${name}`
+], stdio);
+
 child_process.execFileSync('docker', [
   'run',
-  '-di',
-  '--name', 'centos',
+  '--detach',
+  '--interactive',
+  '--name', 'build-container',
   '-v', `${process.cwd()}:${process.cwd()}`,
   '-v', `${child_process.execSync('rustc --print sysroot').toString().trim()}:/rust:ro`,
-  '--env', `PATH=${path}`,
-  // FIXME(rust-lang/rust#80703) this shouldn't be necessary
-  '--env', `LD_LIBRARY_PATH=/rust/lib`,
-  'centos:7',
+  'build-image',
 ], stdio);
 
 // Use ourselves to run future commands
 set_env("CENTOS", __filename);
-
-// See https://edwards.sdsu.edu/research/c11-on-centos-6/ for where these
-const exec = s => {
-  child_process.execSync(`docker exec centos ${s}`, stdio);
-};
-exec('yum install -y centos-release-scl cmake xz epel-release');
-exec('yum install -y python3 patchelf unzip');
-exec('yum install -y devtoolset-8-gcc devtoolset-8-binutils devtoolset-8-gcc-c++');
-exec('yum install -y git');
-
-// Delete `libstdc++.so` to force gcc to link against `libstdc++.a` instead.
-// This is a hack and not the right way to do this, but it ends up doing the
-// right thing for now.
-exec('rm -f /opt/rh/devtoolset-8/root/usr/lib/gcc/x86_64-redhat-linux/8/libstdc++.so');
-set_env("python", "python3");

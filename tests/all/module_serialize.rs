@@ -1,5 +1,5 @@
-use anyhow::{bail, Result};
-use std::fs;
+use anyhow::bail;
+use std::fs::{self, OpenOptions};
 use wasmtime::*;
 
 fn serialize(engine: &Engine, wat: &str) -> Result<Vec<u8>> {
@@ -43,6 +43,7 @@ fn test_version_mismatch() -> Result<()> {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn test_module_serialize_simple() -> Result<()> {
     let buffer = serialize(
         &Engine::default(),
@@ -51,7 +52,7 @@ fn test_module_serialize_simple() -> Result<()> {
 
     let mut store = Store::default();
     let instance = unsafe { deserialize_and_instantiate(&mut store, &buffer)? };
-    let run = instance.get_typed_func::<(), i32, _>(&mut store, "run")?;
+    let run = instance.get_typed_func::<(), i32>(&mut store, "run")?;
     let result = run.call(&mut store, ())?;
 
     assert_eq!(42, result);
@@ -59,6 +60,7 @@ fn test_module_serialize_simple() -> Result<()> {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn test_module_serialize_fail() -> Result<()> {
     let buffer = serialize(
         &Engine::default(),
@@ -66,7 +68,7 @@ fn test_module_serialize_fail() -> Result<()> {
     )?;
 
     let mut config = Config::new();
-    config.cranelift_opt_level(OptLevel::None);
+    config.memory_reservation(0);
     let mut store = Store::new(&Engine::new(&config)?, ());
     match unsafe { deserialize_and_instantiate(&mut store, &buffer) } {
         Ok(_) => bail!("expected failure at deserialization"),
@@ -76,6 +78,7 @@ fn test_module_serialize_fail() -> Result<()> {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn test_deserialize_from_file() -> Result<()> {
     serialize_and_call("(module (func (export \"run\") (result i32) i32.const 42))")?;
     serialize_and_call(
@@ -98,8 +101,55 @@ fn test_deserialize_from_file() -> Result<()> {
         fs::write(&path, &buffer)?;
         let module = unsafe { Module::deserialize_file(store.engine(), &path)? };
         let instance = Instance::new(&mut store, &module, &[])?;
-        let func = instance.get_typed_func::<(), i32, _>(&mut store, "run")?;
+        let func = instance.get_typed_func::<(), i32>(&mut store, "run")?;
         assert_eq!(func.call(&mut store, ())?, 42);
+
+        // Try an already opened file as well.
+        let mut open_options = OpenOptions::new();
+        open_options.read(true);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::prelude::*;
+            use windows_sys::Win32::Storage::FileSystem::*;
+            open_options.access_mode(FILE_GENERIC_READ | FILE_GENERIC_EXECUTE);
+        }
+
+        let file = open_options.open(&path)?;
+        let module = unsafe { Module::deserialize_open_file(store.engine(), file)? };
+        let instance = Instance::new(&mut store, &module, &[])?;
+        let func = instance.get_typed_func::<(), i32>(&mut store, "run")?;
+        assert_eq!(func.call(&mut store, ())?, 42);
+
         Ok(())
     }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn deserialize_from_serialized() -> Result<()> {
+    let engine = Engine::default();
+    let buffer1 = serialize(
+        &engine,
+        "(module (func (export \"run\") (result i32) i32.const 42))",
+    )?;
+    let buffer2 = unsafe { Module::deserialize(&engine, &buffer1)?.serialize()? };
+    assert!(buffer1 == buffer2);
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn detect_precompiled() -> Result<()> {
+    let engine = Engine::default();
+    let buffer = serialize(
+        &engine,
+        "(module (func (export \"run\") (result i32) i32.const 42))",
+    )?;
+    assert_eq!(engine.detect_precompiled(&[]), None);
+    assert_eq!(engine.detect_precompiled(&buffer[..5]), None);
+    assert_eq!(
+        engine.detect_precompiled(&buffer),
+        Some(Precompiled::Module)
+    );
+    Ok(())
 }

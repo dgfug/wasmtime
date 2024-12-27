@@ -1,21 +1,20 @@
 //! IBM Z 64-bit Instruction Set Architecture.
 
-use crate::ir::condcodes::IntCC;
-use crate::ir::Function;
+use crate::dominator_tree::DominatorTree;
+use crate::ir::{Function, Type};
 use crate::isa::s390x::settings as s390x_settings;
 #[cfg(feature = "unwind")]
 use crate::isa::unwind::systemv::RegisterMappingError;
-use crate::isa::Builder as IsaBuilder;
+use crate::isa::{Builder as IsaBuilder, FunctionAlignment, TargetIsa};
 use crate::machinst::{
-    compile, MachBackend, MachCompileResult, MachTextSectionBuilder, TargetIsaAdapter,
+    compile, CompiledCode, CompiledCodeStencil, MachInst, MachTextSectionBuilder, Reg, SigSet,
     TextSectionBuilder, VCode,
 };
 use crate::result::CodegenResult;
 use crate::settings as shared_settings;
-
 use alloc::{boxed::Box, vec::Vec};
-
-use regalloc::{PrettyPrint, RealRegUniverse, Reg};
+use core::fmt;
+use cranelift_control::ControlPlane;
 use target_lexicon::{Architecture, Triple};
 
 // New backend:
@@ -24,8 +23,6 @@ pub(crate) mod inst;
 mod lower;
 mod settings;
 
-use inst::create_reg_universe;
-
 use self::inst::EmitInfo;
 
 /// A IBM Z backend.
@@ -33,7 +30,6 @@ pub struct S390xBackend {
     triple: Triple,
     flags: shared_settings::Flags,
     isa_flags: s390x_settings::Flags,
-    reg_universe: RealRegUniverse,
 }
 
 impl S390xBackend {
@@ -43,12 +39,10 @@ impl S390xBackend {
         flags: shared_settings::Flags,
         isa_flags: s390x_settings::Flags,
     ) -> S390xBackend {
-        let reg_universe = create_reg_universe(&flags);
         S390xBackend {
             triple,
             flags,
             isa_flags,
-            reg_universe,
         }
     }
 
@@ -57,43 +51,47 @@ impl S390xBackend {
     fn compile_vcode(
         &self,
         func: &Function,
-        flags: shared_settings::Flags,
-    ) -> CodegenResult<VCode<inst::Inst>> {
-        let emit_info = EmitInfo::new(flags.clone(), self.isa_flags.clone());
-        let abi = Box::new(abi::S390xABICallee::new(func, flags)?);
-        compile::compile::<S390xBackend>(func, self, abi, emit_info)
+        domtree: &DominatorTree,
+        ctrl_plane: &mut ControlPlane,
+    ) -> CodegenResult<(VCode<inst::Inst>, regalloc2::Output)> {
+        let emit_info = EmitInfo::new(self.isa_flags.clone());
+        let sigs = SigSet::new::<abi::S390xMachineDeps>(func, &self.flags)?;
+        let abi = abi::S390xCallee::new(func, self, &self.isa_flags, &sigs)?;
+        compile::compile::<S390xBackend>(func, domtree, self, abi, emit_info, sigs, ctrl_plane)
     }
 }
 
-impl MachBackend for S390xBackend {
+impl TargetIsa for S390xBackend {
     fn compile_function(
         &self,
         func: &Function,
+        domtree: &DominatorTree,
         want_disasm: bool,
-    ) -> CodegenResult<MachCompileResult> {
+        ctrl_plane: &mut ControlPlane,
+    ) -> CodegenResult<CompiledCodeStencil> {
         let flags = self.flags();
-        let vcode = self.compile_vcode(func, flags.clone())?;
-        let (buffer, bb_starts, bb_edges) = vcode.emit();
-        let frame_size = vcode.frame_size();
-        let value_labels_ranges = vcode.value_labels_ranges();
-        let stackslot_offsets = vcode.stackslot_offsets().clone();
+        let (vcode, regalloc_result) = self.compile_vcode(func, domtree, ctrl_plane)?;
 
-        let disasm = if want_disasm {
-            Some(vcode.show_rru(Some(&create_reg_universe(flags))))
-        } else {
-            None
-        };
+        let emit_result = vcode.emit(&regalloc_result, want_disasm, flags, ctrl_plane);
+        let frame_size = emit_result.frame_size;
+        let value_labels_ranges = emit_result.value_labels_ranges;
+        let buffer = emit_result.buffer;
+        let sized_stackslot_offsets = emit_result.sized_stackslot_offsets;
+        let dynamic_stackslot_offsets = emit_result.dynamic_stackslot_offsets;
 
-        let buffer = buffer.finish();
+        if let Some(disasm) = emit_result.disasm.as_ref() {
+            log::debug!("disassembly:\n{}", disasm);
+        }
 
-        Ok(MachCompileResult {
+        Ok(CompiledCodeStencil {
             buffer,
             frame_size,
-            disasm,
+            vcode: emit_result.disasm,
             value_labels_ranges,
-            stackslot_offsets,
-            bb_starts,
-            bb_edges,
+            sized_stackslot_offsets,
+            dynamic_stackslot_offsets,
+            bb_starts: emit_result.bb_offsets,
+            bb_edges: emit_result.bb_edges,
         })
     }
 
@@ -101,8 +99,8 @@ impl MachBackend for S390xBackend {
         "s390x"
     }
 
-    fn triple(&self) -> Triple {
-        self.triple.clone()
+    fn triple(&self) -> &Triple {
+        &self.triple
     }
 
     fn flags(&self) -> &shared_settings::Flags {
@@ -113,34 +111,25 @@ impl MachBackend for S390xBackend {
         self.isa_flags.iter().collect()
     }
 
-    fn reg_universe(&self) -> &RealRegUniverse {
-        &self.reg_universe
-    }
-
-    fn unsigned_add_overflow_condition(&self) -> IntCC {
-        // The ADD LOGICAL family of instructions set the condition code
-        // differently from normal comparisons, in a way that cannot be
-        // represented by any of the standard IntCC values.  So we use a
-        // dummy value here, which gets remapped to the correct condition
-        // code mask during lowering.
-        IntCC::UnsignedGreaterThan
+    fn dynamic_vector_bytes(&self, _dyn_ty: Type) -> u32 {
+        16
     }
 
     #[cfg(feature = "unwind")]
     fn emit_unwind_info(
         &self,
-        result: &MachCompileResult,
-        kind: crate::machinst::UnwindInfoKind,
+        result: &CompiledCode,
+        kind: crate::isa::unwind::UnwindInfoKind,
     ) -> CodegenResult<Option<crate::isa::unwind::UnwindInfo>> {
         use crate::isa::unwind::UnwindInfo;
-        use crate::machinst::UnwindInfoKind;
+        use crate::isa::unwind::UnwindInfoKind;
         Ok(match kind {
             UnwindInfoKind::SystemV => {
                 let mapper = self::inst::unwind::systemv::RegisterMapper;
                 Some(UnwindInfo::SystemV(
                     crate::isa::unwind::systemv::create_unwind_info_from_insts(
                         &result.buffer.unwind_info[..],
-                        result.buffer.data.len(),
+                        result.buffer.data().len(),
                         &mapper,
                     )?,
                 ))
@@ -155,12 +144,64 @@ impl MachBackend for S390xBackend {
     }
 
     #[cfg(feature = "unwind")]
-    fn map_reg_to_dwarf(&self, reg: Reg) -> Result<u16, RegisterMappingError> {
+    fn map_regalloc_reg_to_dwarf(&self, reg: Reg) -> Result<u16, RegisterMappingError> {
         inst::unwind::systemv::map_reg(reg).map(|reg| reg.0)
     }
 
-    fn text_section_builder(&self, num_funcs: u32) -> Box<dyn TextSectionBuilder> {
+    fn text_section_builder(&self, num_funcs: usize) -> Box<dyn TextSectionBuilder> {
         Box::new(MachTextSectionBuilder::<inst::Inst>::new(num_funcs))
+    }
+
+    fn function_alignment(&self) -> FunctionAlignment {
+        inst::Inst::function_alignment()
+    }
+
+    fn page_size_align_log2(&self) -> u8 {
+        debug_assert_eq!(1 << 12, 0x1000);
+        12
+    }
+
+    #[cfg(feature = "disas")]
+    fn to_capstone(&self) -> Result<capstone::Capstone, capstone::Error> {
+        use capstone::prelude::*;
+        let mut cs = Capstone::new()
+            .sysz()
+            .mode(arch::sysz::ArchMode::Default)
+            .build()?;
+
+        cs.set_skipdata(true)?;
+
+        Ok(cs)
+    }
+
+    fn has_native_fma(&self) -> bool {
+        true
+    }
+
+    fn has_x86_blendv_lowering(&self, _: Type) -> bool {
+        false
+    }
+
+    fn has_x86_pshufb_lowering(&self) -> bool {
+        false
+    }
+
+    fn has_x86_pmulhrsw_lowering(&self) -> bool {
+        false
+    }
+
+    fn has_x86_pmaddubsw_lowering(&self) -> bool {
+        false
+    }
+}
+
+impl fmt::Display for S390xBackend {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("MachBackend")
+            .field("name", &self.name())
+            .field("triple", &self.triple())
+            .field("flags", &format!("{}", self.flags()))
+            .finish()
     }
 }
 
@@ -173,129 +214,7 @@ pub fn isa_builder(triple: Triple) -> IsaBuilder {
         constructor: |triple, shared_flags, builder| {
             let isa_flags = s390x_settings::Flags::new(&shared_flags, builder);
             let backend = S390xBackend::new_with_flags(triple, shared_flags, isa_flags);
-            Box::new(TargetIsaAdapter::new(backend))
+            Ok(backend.wrapped())
         },
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use crate::cursor::{Cursor, FuncCursor};
-    use crate::ir::types::*;
-    use crate::ir::{AbiParam, ExternalName, Function, InstBuilder, Signature};
-    use crate::isa::CallConv;
-    use crate::settings;
-    use crate::settings::Configurable;
-    use core::str::FromStr;
-    use target_lexicon::Triple;
-
-    #[test]
-    fn test_compile_function() {
-        let name = ExternalName::testcase("test0");
-        let mut sig = Signature::new(CallConv::SystemV);
-        sig.params.push(AbiParam::new(I32));
-        sig.returns.push(AbiParam::new(I32));
-        let mut func = Function::with_name_signature(name, sig);
-
-        let bb0 = func.dfg.make_block();
-        let arg0 = func.dfg.append_block_param(bb0, I32);
-
-        let mut pos = FuncCursor::new(&mut func);
-        pos.insert_block(bb0);
-        let v0 = pos.ins().iconst(I32, 0x1234);
-        let v1 = pos.ins().iadd(arg0, v0);
-        pos.ins().return_(&[v1]);
-
-        let mut shared_flags_builder = settings::builder();
-        shared_flags_builder.set("opt_level", "none").unwrap();
-        let shared_flags = settings::Flags::new(shared_flags_builder);
-        let isa_flags = s390x_settings::Flags::new(&shared_flags, s390x_settings::builder());
-        let backend = S390xBackend::new_with_flags(
-            Triple::from_str("s390x").unwrap(),
-            shared_flags,
-            isa_flags,
-        );
-        let result = backend
-            .compile_function(&mut func, /* want_disasm = */ false)
-            .unwrap();
-        let code = &result.buffer.data[..];
-
-        // ahi %r2, 0x1234
-        // br %r14
-        let golden = vec![0xa7, 0x2a, 0x12, 0x34, 0x07, 0xfe];
-
-        assert_eq!(code, &golden[..]);
-    }
-
-    #[test]
-    fn test_branch_lowering() {
-        let name = ExternalName::testcase("test0");
-        let mut sig = Signature::new(CallConv::SystemV);
-        sig.params.push(AbiParam::new(I32));
-        sig.returns.push(AbiParam::new(I32));
-        let mut func = Function::with_name_signature(name, sig);
-
-        let bb0 = func.dfg.make_block();
-        let arg0 = func.dfg.append_block_param(bb0, I32);
-        let bb1 = func.dfg.make_block();
-        let bb2 = func.dfg.make_block();
-        let bb3 = func.dfg.make_block();
-
-        let mut pos = FuncCursor::new(&mut func);
-        pos.insert_block(bb0);
-        let v0 = pos.ins().iconst(I32, 0x1234);
-        let v1 = pos.ins().iadd(arg0, v0);
-        pos.ins().brnz(v1, bb1, &[]);
-        pos.ins().jump(bb2, &[]);
-        pos.insert_block(bb1);
-        pos.ins().brnz(v1, bb2, &[]);
-        pos.ins().jump(bb3, &[]);
-        pos.insert_block(bb2);
-        let v2 = pos.ins().iadd(v1, v0);
-        pos.ins().brnz(v2, bb2, &[]);
-        pos.ins().jump(bb1, &[]);
-        pos.insert_block(bb3);
-        let v3 = pos.ins().isub(v1, v0);
-        pos.ins().return_(&[v3]);
-
-        let mut shared_flags_builder = settings::builder();
-        shared_flags_builder.set("opt_level", "none").unwrap();
-        let shared_flags = settings::Flags::new(shared_flags_builder);
-        let isa_flags = s390x_settings::Flags::new(&shared_flags, s390x_settings::builder());
-        let backend = S390xBackend::new_with_flags(
-            Triple::from_str("s390x").unwrap(),
-            shared_flags,
-            isa_flags,
-        );
-        let result = backend
-            .compile_function(&mut func, /* want_disasm = */ false)
-            .unwrap();
-        let code = &result.buffer.data[..];
-
-        // FIXME: the branching logic should be optimized more
-
-        // ahi %r2, 4660
-        // chi %r2, 0
-        // jglh label1 ; jg label2
-        // jg label6
-        // jg label3
-        // ahik %r3, %r2, 4660
-        // chi %r3, 0
-        // jglh label4 ; jg label5
-        // jg label3
-        // jg label6
-        // chi %r2, 0
-        // jglh label7 ; jg label8
-        // jg label3
-        // ahi %r2, -4660
-        // br %r14
-        let golden = vec![
-            167, 42, 18, 52, 167, 46, 0, 0, 192, 100, 0, 0, 0, 11, 236, 50, 18, 52, 0, 216, 167,
-            62, 0, 0, 192, 100, 255, 255, 255, 251, 167, 46, 0, 0, 192, 100, 255, 255, 255, 246,
-            167, 42, 237, 204, 7, 254,
-        ];
-
-        assert_eq!(code, &golden[..]);
     }
 }

@@ -1,4 +1,4 @@
-test compile
+test compile precise-output
 set unwind_info=false
 target aarch64
 
@@ -12,29 +12,57 @@ block0(v0: i128, v1: i128):
   return v2
 }
 
-; check: movz x3, #128
-; nextln: sub x5, x3, x2
-; nextln: orn w4, wzr, w2
-; nextln: lsl x6, x1, #1
-; nextln: lsr x3, x0, x2
-; nextln: lsl x6, x6, x4
-; nextln: lsr x4, x1, x2
-; nextln: ands xzr, x2, #64
-; nextln: orr x2, x3, x6
-; nextln: csel x3, xzr, x4, ne
-; nextln: csel x4, x4, x2, ne
-; nextln: orn w2, wzr, w5
-; nextln: lsr x6, x0, #1
-; nextln: lsl x1, x1, x5
-; nextln: lsr x2, x6, x2
-; nextln: lsl x0, x0, x5
-; nextln: ands xzr, x5, #64
-; nextln: orr x1, x1, x2
-; nextln: csel x1, x0, x1, ne
-; nextln: csel x0, xzr, x0, ne
-; nextln: orr x0, x0, x4
-; nextln: orr x1, x1, x3
-; nextln: ret
+; VCode:
+; block0:
+;   movz x5, #128
+;   sub x7, x5, x2
+;   lsr x9, x0, x2
+;   lsr x11, x1, x2
+;   orn w13, wzr, w2
+;   lsl x15, x1, #1
+;   lsl x3, x15, x13
+;   orr x3, x9, x3
+;   ands xzr, x2, #64
+;   csel x6, x11, x3, ne
+;   csel x8, xzr, x11, ne
+;   lsl x10, x0, x7
+;   lsl x12, x1, x7
+;   orn w14, wzr, w7
+;   lsr x0, x0, #1
+;   lsr x2, x0, x14
+;   orr x4, x12, x2
+;   ands xzr, x7, #64
+;   csel x7, xzr, x10, ne
+;   csel x9, x10, x4, ne
+;   orr x1, x8, x9
+;   orr x0, x6, x7
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   mov x5, #0x80
+;   sub x7, x5, x2
+;   lsr x9, x0, x2
+;   lsr x11, x1, x2
+;   mvn w13, w2
+;   lsl x15, x1, #1
+;   lsl x3, x15, x13
+;   orr x3, x9, x3
+;   tst x2, #0x40
+;   csel x6, x11, x3, ne
+;   csel x8, xzr, x11, ne
+;   lsl x10, x0, x7
+;   lsl x12, x1, x7
+;   mvn w14, w7
+;   lsr x0, x0, #1
+;   lsr x2, x0, x14
+;   orr x4, x12, x2
+;   tst x7, #0x40
+;   csel x7, xzr, x10, ne
+;   csel x9, x10, x4, ne
+;   orr x1, x8, x9
+;   orr x0, x6, x7
+;   ret
 
 function %f0(i64, i64) -> i64 {
 block0(v0: i64, v1: i64):
@@ -42,8 +70,15 @@ block0(v0: i64, v1: i64):
   return v2
 }
 
-; check:  ror x0, x0, x1
-; nextln:  ret
+; VCode:
+; block0:
+;   ror x0, x0, x1
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   ror x0, x0, x1
+;   ret
 
 function %f1(i32, i32) -> i32 {
 block0(v0: i32, v1: i32):
@@ -51,8 +86,15 @@ block0(v0: i32, v1: i32):
   return v2
 }
 
-; check:  ror w0, w0, w1
-; nextln:  ret
+; VCode:
+; block0:
+;   ror w0, w0, w1
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   ror w0, w0, w1
+;   ret
 
 function %f2(i16, i16) -> i16 {
 block0(v0: i16, v1: i16):
@@ -60,14 +102,27 @@ block0(v0: i16, v1: i16):
   return v2
 }
 
-; check:  uxth w0, w0
-; nextln:  and w1, w1, #15
-; nextln:  sub w2, w1, #16
-; nextln:  sub w2, wzr, w2
-; nextln:  lsr w1, w0, w1
-; nextln:  lsl w0, w0, w2
-; nextln:  orr w0, w0, w1
-; nextln:  ret
+; VCode:
+; block0:
+;   uxth w3, w0
+;   and w5, w1, #15
+;   sub w7, w5, #16
+;   sub w9, wzr, w7
+;   lsr w11, w3, w5
+;   lsl w13, w3, w9
+;   orr w0, w13, w11
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   uxth w3, w0
+;   and w5, w1, #0xf
+;   sub w7, w5, #0x10
+;   neg w9, w7
+;   lsr w11, w3, w5
+;   lsl w13, w3, w9
+;   orr w0, w13, w11
+;   ret
 
 function %f3(i8, i8) -> i8 {
 block0(v0: i8, v1: i8):
@@ -75,18 +130,27 @@ block0(v0: i8, v1: i8):
   return v2
 }
 
-; check:  uxtb w0, w0
-; nextln:  and w1, w1, #7
-; nextln:  sub w2, w1, #8
-; nextln:  sub w2, wzr, w2
-; nextln:  lsr w1, w0, w1
-; nextln:  lsl w0, w0, w2
-; nextln:  orr w0, w0, w1
-; nextln:  ret
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; ROL, variable
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; VCode:
+; block0:
+;   uxtb w3, w0
+;   and w5, w1, #7
+;   sub w7, w5, #8
+;   sub w9, wzr, w7
+;   lsr w11, w3, w5
+;   lsl w13, w3, w9
+;   orr w0, w13, w11
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   uxtb w3, w0
+;   and w5, w1, #7
+;   sub w7, w5, #8
+;   neg w9, w7
+;   lsr w11, w3, w5
+;   lsl w13, w3, w9
+;   orr w0, w13, w11
+;   ret
 
 function %i128_rotl(i128, i128) -> i128 {
 block0(v0: i128, v1: i128):
@@ -94,32 +158,57 @@ block0(v0: i128, v1: i128):
   return v2
 }
 
-; check: movz x3, #128
-; nextln: sub x5, x3, x2
-; nextln: orn w4, wzr, w2
-; nextln: lsr x6, x0, #1
-; nextln: lsl x3, x1, x2
-; nextln: lsr x6, x6, x4
-; nextln: lsl x4, x0, x2
-; nextln: ands xzr, x2, #64
-; nextln: orr x2, x3, x6
-; nextln: csel x3, x4, x2, ne
-; nextln: csel x4, xzr, x4, ne
-; nextln: orn w2, wzr, w5
-; nextln: lsl x6, x1, #1
-; nextln: lsr x0, x0, x5
-; nextln: lsl x2, x6, x2
-; nextln: lsr x1, x1, x5
-; nextln: ands xzr, x5, #64
-; nextln: orr x2, x0, x2
-; nextln: csel x0, xzr, x1, ne
-; nextln: csel x1, x1, x2, ne
-; nextln: orr x1, x1, x4
-; nextln: orr x0, x0, x3
-; nextln: mov x2, x0
-; nextln: mov x0, x1
-; nextln: mov x1, x2
-; nextln: ret
+; VCode:
+; block0:
+;   movz x5, #128
+;   sub x7, x5, x2
+;   lsl x9, x0, x2
+;   lsl x11, x1, x2
+;   orn w13, wzr, w2
+;   lsr x15, x0, #1
+;   lsr x3, x15, x13
+;   orr x3, x11, x3
+;   ands xzr, x2, #64
+;   csel x6, xzr, x9, ne
+;   csel x8, x9, x3, ne
+;   lsr x10, x0, x7
+;   lsr x12, x1, x7
+;   orn w14, wzr, w7
+;   lsl x0, x1, #1
+;   lsl x2, x0, x14
+;   orr x4, x10, x2
+;   ands xzr, x7, #64
+;   csel x7, x12, x4, ne
+;   csel x9, xzr, x12, ne
+;   orr x0, x6, x7
+;   orr x1, x8, x9
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   mov x5, #0x80
+;   sub x7, x5, x2
+;   lsl x9, x0, x2
+;   lsl x11, x1, x2
+;   mvn w13, w2
+;   lsr x15, x0, #1
+;   lsr x3, x15, x13
+;   orr x3, x11, x3
+;   tst x2, #0x40
+;   csel x6, xzr, x9, ne
+;   csel x8, x9, x3, ne
+;   lsr x10, x0, x7
+;   lsr x12, x1, x7
+;   mvn w14, w7
+;   lsl x0, x1, #1
+;   lsl x2, x0, x14
+;   orr x4, x10, x2
+;   tst x7, #0x40
+;   csel x7, x12, x4, ne
+;   csel x9, xzr, x12, ne
+;   orr x0, x6, x7
+;   orr x1, x8, x9
+;   ret
 
 function %f4(i64, i64) -> i64 {
 block0(v0: i64, v1: i64):
@@ -127,9 +216,17 @@ block0(v0: i64, v1: i64):
   return v2
 }
 
-; check:  sub x1, xzr, x1
-; nextln:  ror x0, x0, x1
-; nextln:  ret
+; VCode:
+; block0:
+;   sub x3, xzr, x1
+;   ror x0, x0, x3
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   neg x3, x1
+;   ror x0, x0, x3
+;   ret
 
 function %f5(i32, i32) -> i32 {
 block0(v0: i32, v1: i32):
@@ -137,9 +234,17 @@ block0(v0: i32, v1: i32):
   return v2
 }
 
-; check:  sub w1, wzr, w1
-; nextln:  ror w0, w0, w1
-; nextln:  ret
+; VCode:
+; block0:
+;   sub w3, wzr, w1
+;   ror w0, w0, w3
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   neg w3, w1
+;   ror w0, w0, w3
+;   ret
 
 function %f6(i16, i16) -> i16 {
 block0(v0: i16, v1: i16):
@@ -147,15 +252,29 @@ block0(v0: i16, v1: i16):
   return v2
 }
 
-; check:  uxth w0, w0
-; nextln:  sub w1, wzr, w1
-; nextln:  and w1, w1, #15
-; nextln:  sub w2, w1, #16
-; nextln:  sub w2, wzr, w2
-; nextln:  lsr w1, w0, w1
-; nextln:  lsl w0, w0, w2
-; nextln:  orr w0, w0, w1
-; nextln:  ret
+; VCode:
+; block0:
+;   sub w3, wzr, w1
+;   uxth w5, w0
+;   and w7, w3, #15
+;   sub w9, w7, #16
+;   sub w11, wzr, w9
+;   lsr w13, w5, w7
+;   lsl w15, w5, w11
+;   orr w0, w15, w13
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   neg w3, w1
+;   uxth w5, w0
+;   and w7, w3, #0xf
+;   sub w9, w7, #0x10
+;   neg w11, w9
+;   lsr w13, w5, w7
+;   lsl w15, w5, w11
+;   orr w0, w15, w13
+;   ret
 
 function %f7(i8, i8) -> i8 {
 block0(v0: i8, v1: i8):
@@ -163,19 +282,29 @@ block0(v0: i8, v1: i8):
   return v2
 }
 
-; check:  uxtb w0, w0
-; nextln:  sub w1, wzr, w1
-; nextln:  and w1, w1, #7
-; nextln:  sub w2, w1, #8
-; nextln:  sub w2, wzr, w2
-; nextln:  lsr w1, w0, w1
-; nextln:  lsl w0, w0, w2
-; nextln:  orr w0, w0, w1
-; nextln:  ret
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; LSR, variable
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; VCode:
+; block0:
+;   sub w3, wzr, w1
+;   uxtb w5, w0
+;   and w7, w3, #7
+;   sub w9, w7, #8
+;   sub w11, wzr, w9
+;   lsr w13, w5, w7
+;   lsl w15, w5, w11
+;   orr w0, w15, w13
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   neg w3, w1
+;   uxtb w5, w0
+;   and w7, w3, #7
+;   sub w9, w7, #8
+;   neg w11, w9
+;   lsr w13, w5, w7
+;   lsl w15, w5, w11
+;   orr w0, w15, w13
+;   ret
 
 function %f8(i64, i64) -> i64 {
 block0(v0: i64, v1: i64):
@@ -183,8 +312,15 @@ block0(v0: i64, v1: i64):
   return v2
 }
 
-; check:  lsr x0, x0, x1
-; nextln:  ret
+; VCode:
+; block0:
+;   lsr x0, x0, x1
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lsr x0, x0, x1
+;   ret
 
 function %f9(i32, i32) -> i32 {
 block0(v0: i32, v1: i32):
@@ -192,8 +328,15 @@ block0(v0: i32, v1: i32):
   return v2
 }
 
-; check:  lsr w0, w0, w1
-; nextln:  ret
+; VCode:
+; block0:
+;   lsr w0, w0, w1
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lsr w0, w0, w1
+;   ret
 
 function %f10(i16, i16) -> i16 {
 block0(v0: i16, v1: i16):
@@ -201,10 +344,19 @@ block0(v0: i16, v1: i16):
   return v2
 }
 
-; check:  uxth w0, w0
-; nextln:  and w1, w1, #15
-; nextln:  lsr w0, w0, w1
-; nextln:  ret
+; VCode:
+; block0:
+;   uxth w3, w0
+;   and w5, w1, #15
+;   lsr w0, w3, w5
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   uxth w3, w0
+;   and w5, w1, #0xf
+;   lsr w0, w3, w5
+;   ret
 
 function %f11(i8, i8) -> i8 {
 block0(v0: i8, v1: i8):
@@ -212,14 +364,19 @@ block0(v0: i8, v1: i8):
   return v2
 }
 
-; check:  uxtb w0, w0
-; nextln:  and w1, w1, #7
-; nextln:  lsr w0, w0, w1
-; nextln:  ret
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; LSL, variable
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; VCode:
+; block0:
+;   uxtb w3, w0
+;   and w5, w1, #7
+;   lsr w0, w3, w5
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   uxtb w3, w0
+;   and w5, w1, #7
+;   lsr w0, w3, w5
+;   ret
 
 function %f12(i64, i64) -> i64 {
 block0(v0: i64, v1: i64):
@@ -227,8 +384,15 @@ block0(v0: i64, v1: i64):
   return v2
 }
 
-; check:  lsl x0, x0, x1
-; nextln:  ret
+; VCode:
+; block0:
+;   lsl x0, x0, x1
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lsl x0, x0, x1
+;   ret
 
 function %f13(i32, i32) -> i32 {
 block0(v0: i32, v1: i32):
@@ -236,8 +400,15 @@ block0(v0: i32, v1: i32):
   return v2
 }
 
-; check:  lsl w0, w0, w1
-; nextln:  ret
+; VCode:
+; block0:
+;   lsl w0, w0, w1
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lsl w0, w0, w1
+;   ret
 
 function %f14(i16, i16) -> i16 {
 block0(v0: i16, v1: i16):
@@ -245,9 +416,17 @@ block0(v0: i16, v1: i16):
   return v2
 }
 
-; check:  and w1, w1, #15
-; nextln:  lsl w0, w0, w1
-; nextln:  ret
+; VCode:
+; block0:
+;   and w3, w1, #15
+;   lsl w0, w0, w3
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   and w3, w1, #0xf
+;   lsl w0, w0, w3
+;   ret
 
 function %f15(i8, i8) -> i8 {
 block0(v0: i8, v1: i8):
@@ -255,13 +434,17 @@ block0(v0: i8, v1: i8):
   return v2
 }
 
-; check:  and w1, w1, #7
-; nextln:  lsl w0, w0, w1
-; nextln:  ret
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; ASR, variable
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; VCode:
+; block0:
+;   and w3, w1, #7
+;   lsl w0, w0, w3
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   and w3, w1, #7
+;   lsl w0, w0, w3
+;   ret
 
 function %f16(i64, i64) -> i64 {
 block0(v0: i64, v1: i64):
@@ -269,8 +452,15 @@ block0(v0: i64, v1: i64):
   return v2
 }
 
-; check:  asr x0, x0, x1
-; nextln:  ret
+; VCode:
+; block0:
+;   asr x0, x0, x1
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   asr x0, x0, x1
+;   ret
 
 function %f17(i32, i32) -> i32 {
 block0(v0: i32, v1: i32):
@@ -278,8 +468,15 @@ block0(v0: i32, v1: i32):
   return v2
 }
 
-; check:  asr w0, w0, w1
-; nextln:  ret
+; VCode:
+; block0:
+;   asr w0, w0, w1
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   asr w0, w0, w1
+;   ret
 
 function %f18(i16, i16) -> i16 {
 block0(v0: i16, v1: i16):
@@ -287,9 +484,19 @@ block0(v0: i16, v1: i16):
   return v2
 }
 
-; check:  and w1, w1, #15
-; nextln:  asr w0, w0, w1
-; nextln:  ret
+; VCode:
+; block0:
+;   sxth w3, w0
+;   and w5, w1, #15
+;   asr w0, w3, w5
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   sxth w3, w0
+;   and w5, w1, #0xf
+;   asr w0, w3, w5
+;   ret
 
 function %f19(i8, i8) -> i8 {
 block0(v0: i8, v1: i8):
@@ -297,13 +504,19 @@ block0(v0: i8, v1: i8):
   return v2
 }
 
-; check:  and w1, w1, #7
-; nextln:  asr w0, w0, w1
-; nextln:  ret
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; immediate forms
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; VCode:
+; block0:
+;   sxtb w3, w0
+;   and w5, w1, #7
+;   asr w0, w3, w5
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   sxtb w3, w0
+;   and w5, w1, #7
+;   asr w0, w3, w5
+;   ret
 
 function %f20(i64) -> i64 {
 block0(v0: i64):
@@ -312,8 +525,15 @@ block0(v0: i64):
   return v2
 }
 
-; check:  ror x0, x0, #17
-; nextln:  ret
+; VCode:
+; block0:
+;   ror x0, x0, #17
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   ror x0, x0, #0x11
+;   ret
 
 function %f21(i64) -> i64 {
 block0(v0: i64):
@@ -322,8 +542,15 @@ block0(v0: i64):
   return v2
 }
 
-; check:  ror x0, x0, #47
-; nextln:  ret
+; VCode:
+; block0:
+;   ror x0, x0, #47
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   ror x0, x0, #0x2f
+;   ret
 
 function %f22(i32) -> i32 {
 block0(v0: i32):
@@ -332,8 +559,15 @@ block0(v0: i32):
   return v2
 }
 
-; check:  ror w0, w0, #15
-; nextln:  ret
+; VCode:
+; block0:
+;   ror w0, w0, #15
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   ror w0, w0, #0xf
+;   ret
 
 function %f23(i16) -> i16 {
 block0(v0: i16):
@@ -342,11 +576,21 @@ block0(v0: i16):
   return v2
 }
 
-; check: uxth w0, w0
-; nextln: lsr w1, w0, #6
-; nextln: lsl w0, w0, #10
-; nextln: orr w0, w0, w1
-; nextln: ret
+; VCode:
+; block0:
+;   uxth w2, w0
+;   lsr w4, w2, #6
+;   lsl w6, w2, #10
+;   orr w0, w6, w4
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   uxth w2, w0
+;   lsr w4, w2, #6
+;   lsl w6, w2, #0xa
+;   orr w0, w6, w4
+;   ret
 
 function %f24(i8) -> i8 {
 block0(v0: i8):
@@ -355,11 +599,21 @@ block0(v0: i8):
   return v2
 }
 
-; check:  uxtb w0, w0
-; nextln:  lsr w1, w0, #5
-; nextln:  lsl w0, w0, #3
-; nextln:  orr w0, w0, w1
-; nextln:  ret
+; VCode:
+; block0:
+;   uxtb w2, w0
+;   lsr w4, w2, #5
+;   lsl w6, w2, #3
+;   orr w0, w6, w4
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   uxtb w2, w0
+;   lsr w4, w2, #5
+;   lsl w6, w2, #3
+;   orr w0, w6, w4
+;   ret
 
 function %f25(i64) -> i64 {
 block0(v0: i64):
@@ -368,8 +622,15 @@ block0(v0: i64):
   return v2
 }
 
-; check:  lsr x0, x0, #17
-; nextln:  ret
+; VCode:
+; block0:
+;   lsr x0, x0, #17
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lsr x0, x0, #0x11
+;   ret
 
 function %f26(i64) -> i64 {
 block0(v0: i64):
@@ -378,8 +639,15 @@ block0(v0: i64):
   return v2
 }
 
-; check:  asr x0, x0, #17
-; nextln:  ret
+; VCode:
+; block0:
+;   asr x0, x0, #17
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   asr x0, x0, #0x11
+;   ret
 
 function %f27(i64) -> i64 {
 block0(v0: i64):
@@ -388,5 +656,13 @@ block0(v0: i64):
   return v2
 }
 
-; check:  lsl x0, x0, #17
-; nextln:  ret
+; VCode:
+; block0:
+;   lsl x0, x0, #17
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lsl x0, x0, #0x11
+;   ret
+

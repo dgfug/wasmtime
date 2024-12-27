@@ -8,26 +8,24 @@
 //! - ensuring alignment of constants within the pool,
 //! - bucketing constants by size.
 
-use crate::ir::immediates::{IntoBytes, V128Imm};
+use crate::ir::immediates::{Ieee128, IntoBytes, V128Imm};
 use crate::ir::Constant;
-use crate::HashMap;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::fmt;
-use core::iter::FromIterator;
 use core::slice::Iter;
 use core::str::{from_utf8, FromStr};
 use cranelift_entity::EntityRef;
 
 #[cfg(feature = "enable-serde")]
-use serde::{Deserialize, Serialize};
+use serde_derive::{Deserialize, Serialize};
 
 /// This type describes the actual constant data. Note that the bytes stored in this structure are
 /// expected to be in little-endian order; this is due to ease-of-use when interacting with
 /// WebAssembly values, which are [little-endian by design].
 ///
 /// [little-endian by design]: https://github.com/WebAssembly/design/blob/master/Portability.md
-#[derive(Clone, Hash, Eq, PartialEq, Debug, Default)]
+#[derive(Clone, Hash, Eq, PartialEq, Debug, Default, PartialOrd, Ord)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
 pub struct ConstantData(Vec<u8>);
 
@@ -53,6 +51,22 @@ impl From<&[u8]> for ConstantData {
 impl From<V128Imm> for ConstantData {
     fn from(v: V128Imm) -> Self {
         Self(v.to_vec())
+    }
+}
+
+impl From<Ieee128> for ConstantData {
+    fn from(v: Ieee128) -> Self {
+        Self(v.into_bytes())
+    }
+}
+
+impl TryFrom<&ConstantData> for Ieee128 {
+    type Error = <[u8; 16] as TryFrom<&'static [u8]>>::Error;
+
+    fn try_from(value: &ConstantData) -> Result<Self, Self::Error> {
+        Ok(Ieee128::with_bits(u128::from_le_bytes(
+            value.as_slice().try_into()?,
+        )))
     }
 }
 
@@ -93,10 +107,7 @@ impl ConstantData {
     /// in the high-order byte slots.
     pub fn expand_to(mut self, expected_size: usize) -> Self {
         if self.len() > expected_size {
-            panic!(
-                "The constant data is already expanded beyond {} bytes",
-                expected_size
-            )
+            panic!("The constant data is already expanded beyond {expected_size} bytes")
         }
         self.0.resize(expected_size, 0);
         self
@@ -117,7 +128,7 @@ impl fmt::Display for ConstantData {
         if !self.is_empty() {
             write!(f, "0x")?;
             for b in self.0.iter().rev() {
-                write!(f, "{:02x}", b)?;
+                write!(f, "{b:02x}")?;
             }
         }
         Ok(())
@@ -167,18 +178,22 @@ impl FromStr for ConstantData {
     }
 }
 
-/// Maintains the mapping between a constant handle (i.e.  [`Constant`](crate::ir::Constant)) and
-/// its constant data (i.e.  [`ConstantData`](crate::ir::ConstantData)).
-#[derive(Clone)]
+/// Maintains the mapping between a constant handle (i.e.  [`Constant`]) and
+/// its constant data (i.e.  [`ConstantData`]).
+#[derive(Clone, PartialEq, Hash)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
 pub struct ConstantPool {
     /// This mapping maintains the insertion order as long as Constants are created with
     /// sequentially increasing integers.
+    ///
+    /// It is important that, by construction, no entry in that list gets removed. If that ever
+    /// need to happen, don't forget to update the `Constant` generation scheme.
     handles_to_values: BTreeMap<Constant, ConstantData>,
 
-    /// This mapping is unordered (no need for lexicographic ordering) but allows us to map
-    /// constant data back to handles.
-    values_to_handles: HashMap<ConstantData, Constant>,
+    /// Mapping of hashed `ConstantData` to the index into the other hashmap.
+    ///
+    /// This allows for deduplication of entries into the `handles_to_values` mapping.
+    values_to_handles: BTreeMap<ConstantData, Constant>,
 }
 
 impl ConstantPool {
@@ -186,7 +201,7 @@ impl ConstantPool {
     pub fn new() -> Self {
         Self {
             handles_to_values: BTreeMap::new(),
-            values_to_handles: HashMap::new(),
+            values_to_handles: BTreeMap::new(),
         }
     }
 
@@ -200,13 +215,13 @@ impl ConstantPool {
     /// data is inserted that is a duplicate of previous constant data, the existing handle will be
     /// returned.
     pub fn insert(&mut self, constant_value: ConstantData) -> Constant {
-        if self.values_to_handles.contains_key(&constant_value) {
-            *self.values_to_handles.get(&constant_value).unwrap()
-        } else {
-            let constant_handle = Constant::new(self.len());
-            self.set(constant_handle, constant_value);
-            constant_handle
+        if let Some(cst) = self.values_to_handles.get(&constant_value) {
+            return *cst;
         }
+
+        let constant_handle = Constant::new(self.len());
+        self.set(constant_handle, constant_value);
+        constant_handle
     }
 
     /// Retrieve the constant data given a handle.
@@ -250,7 +265,7 @@ impl ConstantPool {
 
     /// Return the combined size of all of the constant values in the pool.
     pub fn byte_size(&self) -> usize {
-        self.values_to_handles.keys().map(|c| c.len()).sum()
+        self.handles_to_values.values().map(|c| c.len()).sum()
     }
 }
 
@@ -396,8 +411,7 @@ mod tests {
             let parsed = from.parse::<ConstantData>();
             assert!(
                 parsed.is_err(),
-                "Expected a parse error but parsing succeeded: {}",
-                from
+                "Expected a parse error but parsing succeeded: {from}"
             );
             assert_eq!(parsed.err().unwrap(), error_msg);
         }
@@ -456,5 +470,16 @@ mod tests {
             parse_to_uimm128("0x1234_5678"),
             [0x78, 0x56, 0x34, 0x12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
         );
+    }
+
+    #[test]
+    fn constant_ieee128() {
+        let value = Ieee128::with_bits(0x000102030405060708090a0b0c0d0e0f);
+        let constant = ConstantData::from(value);
+        assert_eq!(
+            constant.as_slice(),
+            &[0xf, 0xe, 0xd, 0xc, 0xb, 0xa, 0x9, 0x8, 0x7, 0x6, 0x5, 0x4, 0x3, 0x2, 0x1, 0x0]
+        );
+        assert_eq!(Ieee128::try_from(&constant).unwrap().bits(), value.bits());
     }
 }

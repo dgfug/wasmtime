@@ -18,6 +18,8 @@ impl Error {
     }
 }
 
+impl std::error::Error for Error {}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self.inner)
@@ -41,8 +43,8 @@ enum ErrorInner {
 impl fmt::Display for ErrorInner {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            ErrorInner::Msg(ref s) => write!(f, "{}", s),
-            ErrorInner::IoError(ref e) => write!(f, "{}", e),
+            ErrorInner::Msg(ref s) => write!(f, "{s}"),
+            ErrorInner::IoError(ref e) => write!(f, "{e}"),
         }
     }
 }

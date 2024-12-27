@@ -1,87 +1,19 @@
 test interpret
 test run
 target aarch64
+target aarch64 use_bti
 target x86_64
 target s390x
-
-
-function %br_table_i8(i8) -> i8 {
-  jt0 = jump_table [block1, block2, block2, block3]
-
-block0(v0: i8):
-  br_table v0, block4, jt0
-
-block1:
-  v1 = iconst.i8 1
-  jump block5(v1)
-
-block2:
-  v2 = iconst.i8 2
-  jump block5(v2)
-
-block3:
-  v3 = iconst.i8 3
-  jump block5(v3)
-
-block4:
-  v4 = iconst.i8 4
-  jump block5(v4)
-
-block5(v5: i8):
-  v6 = iadd.i8 v0, v5
-  return v6
-}
-; run: %br_table_i8(0) == 1
-; run: %br_table_i8(1) == 3
-; run: %br_table_i8(2) == 4
-; run: %br_table_i8(3) == 6
-; run: %br_table_i8(4) == 8
-; run: %br_table_i8(5) == 9
-; run: %br_table_i8(6) == 10
-; run: %br_table_i8(-1) == 3
-
-
-function %br_table_i16(i16) -> i16 {
-  jt0 = jump_table [block1, block2, block2, block3]
-
-block0(v0: i16):
-  br_table v0, block4, jt0
-
-block1:
-  v1 = iconst.i16 1
-  jump block5(v1)
-
-block2:
-  v2 = iconst.i16 2
-  jump block5(v2)
-
-block3:
-  v3 = iconst.i16 3
-  jump block5(v3)
-
-block4:
-  v4 = iconst.i16 4
-  jump block5(v4)
-
-block5(v5: i16):
-  v6 = iadd.i16 v0, v5
-  return v6
-}
-; run: %br_table_i16(0) == 1
-; run: %br_table_i16(1) == 3
-; run: %br_table_i16(2) == 4
-; run: %br_table_i16(3) == 6
-; run: %br_table_i16(4) == 8
-; run: %br_table_i16(5) == 9
-; run: %br_table_i16(6) == 10
-; run: %br_table_i16(-1) == 3
-
+target riscv64
+target riscv64 has_c has_zcb
+target pulley32
+target pulley32be
+target pulley64
+target pulley64be
 
 function %br_table_i32(i32) -> i32 {
-  jt0 = jump_table [block1, block2, block2, block3]
-
 block0(v0: i32):
-  br_table v0, block4, jt0
+  br_table v0, block4, [block1, block2, block2, block3]
 
 block1:
   v1 = iconst.i32 1
@@ -113,37 +45,92 @@ block5(v5: i32):
 ; run: %br_table_i32(-1) == 3
 
 
-function %br_table_i64(i64) -> i64 {
-  jt0 = jump_table [block1, block2, block2, block3]
 
-block0(v0: i64):
-  br_table v0, block4, jt0
+; RISC-V had a bug where having a br_table on a cold block would cause a segfault
+; See #5496 for more details.
+function %br_table_cold_block(i32) -> i32 system_v {
+block0(v0: i32):
+    jump block1
 
-block1:
-  v1 = iconst.i64 1
-  jump block5(v1)
+block1 cold:
+    br_table v0, block2, []
 
 block2:
-  v2 = iconst.i64 2
-  jump block5(v2)
-
-block3:
-  v3 = iconst.i64 3
-  jump block5(v3)
-
-block4:
-  v4 = iconst.i64 4
-  jump block5(v4)
-
-block5(v5: i64):
-  v6 = iadd.i64 v0, v5
-  return v6
+    v1 = iconst.i32 0
+    return v1
 }
-; run: %br_table_i64(0) == 1
-; run: %br_table_i64(1) == 3
-; run: %br_table_i64(2) == 4
-; run: %br_table_i64(3) == 6
-; run: %br_table_i64(4) == 8
-; run: %br_table_i64(5) == 9
-; run: %br_table_i64(6) == 10
-; run: %br_table_i64(-1) == 3
+; run: %br_table_cold_block(0) == 0
+; run: %br_table_cold_block(1) == 0
+
+function %br_table_i32_inline(i32) -> i32 {
+block0(v0: i32):
+  v1 = iconst.i32 1
+  v2 = iconst.i32 2
+  v3 = iconst.i32 3
+  v4 = iconst.i32 4
+  br_table v0, block1(v4), [block1(v1), block1(v2), block1(v2), block1(v3)]
+
+block1(v5: i32):
+  return v5
+}
+
+; run: %br_table_i32_inline(0) == 1
+; run: %br_table_i32_inline(1) == 2
+; run: %br_table_i32_inline(2) == 2
+; run: %br_table_i32_inline(3) == 3
+; run: %br_table_i32_inline(4) == 4
+; run: %br_table_i32_inline(297) == 4
+; run: %br_table_i32_inline(65535) == 4
+
+function %br_table_i32_inline_varied(i32) -> i32 {
+block0(v0: i32):
+  v1 = iconst.i32 1
+  v2 = iconst.i32 2
+  v3 = iconst.i32 3
+  v4 = iconst.i32 4
+  br_table v0, block1(v4), [block1(v1), block2(v2, v4), block2(v4, v3), block1(v3)]
+
+block2(v6: i32, v7: i32):
+  v8 = iadd v6, v7
+  jump block1(v8)
+
+block1(v5: i32):
+  return v5
+}
+
+; run: %br_table_i32_inline_varied(0) == 1
+; run: %br_table_i32_inline_varied(1) == 6
+; run: %br_table_i32_inline_varied(2) == 7
+; run: %br_table_i32_inline_varied(3) == 3
+; run: %br_table_i32_inline_varied(4) == 4
+; run: %br_table_i32_inline_varied(297) == 4
+; run: %br_table_i32_inline_varied(65535) == 4
+
+
+
+; This is a regression test for #5831.
+; The riscv64 backend was failing to clear the upper half of the
+; index register on a br_table, which caused it to jump to the wrong
+; block.
+function %br_table_upper_reg() -> i32 {
+block0:
+    v0 = iconst.i32 -555163938
+    v1 = iconst.i8 -34
+    jump block1(v0, v1)
+
+block1(v2: i32, v3: i8):
+    v4 = ishl.i32 v2, v2
+    v5 = rotr v4, v3
+    br_table v5, block2, [block2, block2, block3]
+
+block2 cold:
+    v100 = iconst.i32 100
+    return v100
+
+block3 cold:
+    v200 = iconst.i32 200
+    return v200
+}
+
+
+; run: %br_table_upper_reg() == 200

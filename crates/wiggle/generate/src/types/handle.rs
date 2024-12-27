@@ -1,47 +1,47 @@
-use crate::names::Names;
+use crate::names;
 
 use proc_macro2::TokenStream;
 use quote::quote;
 use witx::Layout;
 
-pub(super) fn define_handle(
-    names: &Names,
-    name: &witx::Id,
-    h: &witx::HandleDatatype,
-) -> TokenStream {
-    let rt = names.runtime_mod();
-    let ident = names.type_(name);
+pub(super) fn define_handle(name: &witx::Id, h: &witx::HandleDatatype) -> TokenStream {
+    let ident = names::type_(name);
     let size = h.mem_size_align().size as u32;
-    let align = h.mem_size_align().align as usize;
+    let align = h.mem_size_align().align;
     quote! {
         #[repr(transparent)]
         #[derive(Copy, Clone, Debug, ::std::hash::Hash, Eq, PartialEq)]
         pub struct #ident(u32);
 
         impl #ident {
+            #[inline]
             pub unsafe fn inner(&self) -> u32 {
                 self.0
             }
         }
 
         impl From<#ident> for u32 {
+            #[inline]
             fn from(e: #ident) -> u32 {
                 e.0
             }
         }
 
         impl From<#ident> for i32 {
+            #[inline]
             fn from(e: #ident) -> i32 {
                 e.0 as i32
             }
         }
 
         impl From<u32> for #ident {
+            #[inline]
             fn from(e: u32) -> #ident {
                 #ident(e)
             }
         }
         impl From<i32> for #ident {
+            #[inline]
             fn from(e: i32) -> #ident {
                 #ident(e as u32)
             }
@@ -53,29 +53,25 @@ pub(super) fn define_handle(
             }
         }
 
-        impl<'a> #rt::GuestType<'a> for #ident {
+        impl wiggle::GuestType for #ident {
+            #[inline]
             fn guest_size() -> u32 {
                 #size
             }
 
+            #[inline]
             fn guest_align() -> usize {
                 #align
             }
 
-            fn read(location: &#rt::GuestPtr<'a, #ident>) -> Result<#ident, #rt::GuestError> {
-                Ok(#ident(u32::read(&location.cast())?))
-            }
-
-            fn write(location: &#rt::GuestPtr<'_, Self>, val: Self) -> Result<(), #rt::GuestError> {
-                u32::write(&location.cast(), val.0)
-            }
-        }
-
-        unsafe impl<'a> #rt::GuestTypeTransparent<'a> for #ident {
             #[inline]
-            fn validate(_location: *mut #ident) -> Result<(), #rt::GuestError> {
-                // All bit patterns accepted
-                Ok(())
+            fn read(mem: &wiggle::GuestMemory, location: wiggle::GuestPtr<#ident>) -> Result<#ident, wiggle::GuestError> {
+                Ok(#ident(u32::read(mem, location.cast())?))
+            }
+
+            #[inline]
+            fn write(mem: &mut wiggle::GuestMemory, location: wiggle::GuestPtr<Self>, val: Self) -> Result<(), wiggle::GuestError> {
+                u32::write(mem, location.cast(), val.0)
             }
         }
     }

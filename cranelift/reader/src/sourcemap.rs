@@ -8,9 +8,10 @@
 
 use crate::error::{Location, ParseResult};
 use crate::lexer::split_entity_name;
-use cranelift_codegen::ir::entities::AnyEntity;
+use cranelift_codegen::ir::entities::{AnyEntity, DynamicType};
 use cranelift_codegen::ir::{
-    Block, Constant, FuncRef, GlobalValue, Heap, JumpTable, SigRef, StackSlot, Table, Value,
+    Block, Constant, DynamicStackSlot, FuncRef, GlobalValue, JumpTable, MemoryType, SigRef,
+    StackSlot, Value,
 };
 use std::collections::HashMap;
 
@@ -38,19 +39,14 @@ impl SourceMap {
         self.locations.contains_key(&ss.into())
     }
 
+    /// Look up a dynamic stack slot entity.
+    pub fn contains_dss(&self, dss: DynamicStackSlot) -> bool {
+        self.locations.contains_key(&dss.into())
+    }
+
     /// Look up a global value entity.
     pub fn contains_gv(&self, gv: GlobalValue) -> bool {
         self.locations.contains_key(&gv.into())
-    }
-
-    /// Look up a heap entity.
-    pub fn contains_heap(&self, heap: Heap) -> bool {
-        self.locations.contains_key(&heap.into())
-    }
-
-    /// Look up a table entity.
-    pub fn contains_table(&self, table: Table) -> bool {
-        self.locations.contains_key(&table.into())
     }
 
     /// Look up a signature entity.
@@ -103,20 +99,6 @@ impl SourceMap {
                     None
                 } else {
                     Some(gv.into())
-                }
-            }),
-            "heap" => Heap::with_number(num).and_then(|heap| {
-                if !self.contains_heap(heap) {
-                    None
-                } else {
-                    Some(heap.into())
-                }
-            }),
-            "table" => Table::with_number(num).and_then(|table| {
-                if !self.contains_table(table) {
-                    None
-                } else {
-                    Some(table.into())
                 }
             }),
             "sig" => SigRef::with_number(num).and_then(|sig| {
@@ -173,18 +155,23 @@ impl SourceMap {
         self.def_entity(entity.into(), loc)
     }
 
+    /// Define the dynamic stack slot `entity`.
+    pub fn def_dss(&mut self, entity: DynamicStackSlot, loc: Location) -> ParseResult<()> {
+        self.def_entity(entity.into(), loc)
+    }
+
+    /// Define the dynamic type `entity`.
+    pub fn def_dt(&mut self, entity: DynamicType, loc: Location) -> ParseResult<()> {
+        self.def_entity(entity.into(), loc)
+    }
+
     /// Define the global value `entity`.
     pub fn def_gv(&mut self, entity: GlobalValue, loc: Location) -> ParseResult<()> {
         self.def_entity(entity.into(), loc)
     }
 
-    /// Define the heap `entity`.
-    pub fn def_heap(&mut self, entity: Heap, loc: Location) -> ParseResult<()> {
-        self.def_entity(entity.into(), loc)
-    }
-
-    /// Define the table `entity`.
-    pub fn def_table(&mut self, entity: Table, loc: Location) -> ParseResult<()> {
+    /// Define the memory type `entity`.
+    pub fn def_mt(&mut self, entity: MemoryType, loc: Location) -> ParseResult<()> {
         self.def_entity(entity.into(), loc)
     }
 
@@ -228,7 +215,6 @@ mod tests {
         let tf = parse_test(
             "function %detail() {
                                ss10 = explicit_slot 13
-                               jt10 = jump_table [block0]
                              block0(v4: i32, v7: i32):
                                v10 = iadd v4, v7
                              }",
@@ -240,7 +226,6 @@ mod tests {
         assert_eq!(map.lookup_str("v0"), None);
         assert_eq!(map.lookup_str("ss1"), None);
         assert_eq!(map.lookup_str("ss10").unwrap().to_string(), "ss10");
-        assert_eq!(map.lookup_str("jt10").unwrap().to_string(), "jt10");
         assert_eq!(map.lookup_str("block0").unwrap().to_string(), "block0");
         assert_eq!(map.lookup_str("v4").unwrap().to_string(), "v4");
         assert_eq!(map.lookup_str("v7").unwrap().to_string(), "v7");

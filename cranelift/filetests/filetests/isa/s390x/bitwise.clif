@@ -1,12 +1,30 @@
-
-test compile
+test compile precise-output
+set enable_multi_ret_implicit_sret
 target s390x
 
 ; FIXME: add immediate operand versions
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; BAND
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+function %band_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+  v2 = band.i128 v0, v1
+  return v2
+}
+
+; VCode:
+; block0:
+;   vl %v1, 0(%r3)
+;   vl %v3, 0(%r4)
+;   vn %v6, %v1, %v3
+;   vst %v6, 0(%r2)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   vl %v1, 0(%r3)
+;   vl %v3, 0(%r4)
+;   vn %v6, %v1, %v3
+;   vst %v6, 0(%r2)
+;   br %r14
 
 function %band_i64(i64, i64) -> i64 {
 block0(v0: i64, v1: i64):
@@ -14,8 +32,15 @@ block0(v0: i64, v1: i64):
   return v2
 }
 
-; check:  ngr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   ngr %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   ngr %r2, %r3
+;   br %r14
 
 function %band_i64_mem(i64, i64) -> i64 {
 block0(v0: i64, v1: i64):
@@ -24,8 +49,15 @@ block0(v0: i64, v1: i64):
   return v3
 }
 
-; check:  ng %r2, 0(%r3)
-; nextln: br %r14
+; VCode:
+; block0:
+;   ng %r2, 0(%r3)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   ng %r2, 0(%r3) ; trap: heap_oob
+;   br %r14
 
 function %band_i32(i32, i32) -> i32 {
 block0(v0: i32, v1: i32):
@@ -33,8 +65,15 @@ block0(v0: i32, v1: i32):
   return v2
 }
 
-; check:  nr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   nr %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   nr %r2, %r3
+;   br %r14
 
 function %band_i32_mem(i32, i64) -> i32 {
 block0(v0: i32, v1: i64):
@@ -43,8 +82,15 @@ block0(v0: i32, v1: i64):
   return v3
 }
 
-; check:  n %r2, 0(%r3)
-; nextln: br %r14
+; VCode:
+; block0:
+;   n %r2, 0(%r3)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   n %r2, 0(%r3) ; trap: heap_oob
+;   br %r14
 
 function %band_i32_memoff(i32, i64) -> i32 {
 block0(v0: i32, v1: i64):
@@ -53,8 +99,15 @@ block0(v0: i32, v1: i64):
   return v3
 }
 
-; check:  ny %r2, 4096(%r3)
-; nextln: br %r14
+; VCode:
+; block0:
+;   ny %r2, 4096(%r3)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   ny %r2, 0x1000(%r3) ; trap: heap_oob
+;   br %r14
 
 function %band_i16(i16, i16) -> i16 {
 block0(v0: i16, v1: i16):
@@ -62,8 +115,15 @@ block0(v0: i16, v1: i16):
   return v2
 }
 
-; check:  nr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   nr %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   nr %r2, %r3
+;   br %r14
 
 function %band_i16_mem(i16, i64) -> i16 {
 block0(v0: i16, v1: i64):
@@ -72,9 +132,17 @@ block0(v0: i16, v1: i64):
   return v3
 }
 
-; check:  llh %r3, 0(%r3)
-; nextln: nr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   llh %r3, 0(%r3)
+;   nr %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   llh %r3, 0(%r3) ; trap: heap_oob
+;   nr %r2, %r3
+;   br %r14
 
 function %band_i8(i8, i8) -> i8 {
 block0(v0: i8, v1: i8):
@@ -82,8 +150,15 @@ block0(v0: i8, v1: i8):
   return v2
 }
 
-; check:  nr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   nr %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   nr %r2, %r3
+;   br %r14
 
 function %band_i8_mem(i8, i64) -> i8 {
 block0(v0: i8, v1: i64):
@@ -92,13 +167,39 @@ block0(v0: i8, v1: i64):
   return v3
 }
 
-; check:  llc %r3, 0(%r3)
-; nextln: nr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   llc %r3, 0(%r3)
+;   nr %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   llc %r3, 0(%r3) ; trap: heap_oob
+;   nr %r2, %r3
+;   br %r14
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; BOR
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+function %bor_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+  v2 = bor.i128 v0, v1
+  return v2
+}
+
+; VCode:
+; block0:
+;   vl %v1, 0(%r3)
+;   vl %v3, 0(%r4)
+;   vo %v6, %v1, %v3
+;   vst %v6, 0(%r2)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   vl %v1, 0(%r3)
+;   vl %v3, 0(%r4)
+;   vo %v6, %v1, %v3
+;   vst %v6, 0(%r2)
+;   br %r14
 
 function %bor_i64(i64, i64) -> i64 {
 block0(v0: i64, v1: i64):
@@ -106,8 +207,15 @@ block0(v0: i64, v1: i64):
   return v2
 }
 
-; check:  ogr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   ogr %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   ogr %r2, %r3
+;   br %r14
 
 function %bor_i64_mem(i64, i64) -> i64 {
 block0(v0: i64, v1: i64):
@@ -116,8 +224,15 @@ block0(v0: i64, v1: i64):
   return v3
 }
 
-; check:  og %r2, 0(%r3)
-; nextln: br %r14
+; VCode:
+; block0:
+;   og %r2, 0(%r3)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   og %r2, 0(%r3) ; trap: heap_oob
+;   br %r14
 
 function %bor_i32(i32, i32) -> i32 {
 block0(v0: i32, v1: i32):
@@ -125,8 +240,15 @@ block0(v0: i32, v1: i32):
   return v2
 }
 
-; check:  or %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   or %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   or %r2, %r3
+;   br %r14
 
 function %bor_i32_mem(i32, i64) -> i32 {
 block0(v0: i32, v1: i64):
@@ -135,8 +257,15 @@ block0(v0: i32, v1: i64):
   return v3
 }
 
-; check:  o %r2, 0(%r3)
-; nextln: br %r14
+; VCode:
+; block0:
+;   o %r2, 0(%r3)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   o %r2, 0(%r3) ; trap: heap_oob
+;   br %r14
 
 function %bor_i32_memoff(i32, i64) -> i32 {
 block0(v0: i32, v1: i64):
@@ -145,8 +274,15 @@ block0(v0: i32, v1: i64):
   return v3
 }
 
-; check:  oy %r2, 4096(%r3)
-; nextln: br %r14
+; VCode:
+; block0:
+;   oy %r2, 4096(%r3)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   oy %r2, 0x1000(%r3) ; trap: heap_oob
+;   br %r14
 
 function %bor_i16(i16, i16) -> i16 {
 block0(v0: i16, v1: i16):
@@ -154,8 +290,15 @@ block0(v0: i16, v1: i16):
   return v2
 }
 
-; check:  or %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   or %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   or %r2, %r3
+;   br %r14
 
 function %bor_i16_mem(i16, i64) -> i16 {
 block0(v0: i16, v1: i64):
@@ -164,9 +307,17 @@ block0(v0: i16, v1: i64):
   return v3
 }
 
-; check:  llh %r3, 0(%r3)
-; nextln: or %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   llh %r3, 0(%r3)
+;   or %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   llh %r3, 0(%r3) ; trap: heap_oob
+;   or %r2, %r3
+;   br %r14
 
 function %bor_i8(i8, i8) -> i8 {
 block0(v0: i8, v1: i8):
@@ -174,8 +325,15 @@ block0(v0: i8, v1: i8):
   return v2
 }
 
-; check:  or %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   or %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   or %r2, %r3
+;   br %r14
 
 function %bor_i8_mem(i8, i64) -> i8 {
 block0(v0: i8, v1: i64):
@@ -184,13 +342,39 @@ block0(v0: i8, v1: i64):
   return v3
 }
 
-; check:  llc %r3, 0(%r3)
-; nextln: or %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   llc %r3, 0(%r3)
+;   or %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   llc %r3, 0(%r3) ; trap: heap_oob
+;   or %r2, %r3
+;   br %r14
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; BXOR
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+function %bxor_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+  v2 = bxor.i128 v0, v1
+  return v2
+}
+
+; VCode:
+; block0:
+;   vl %v1, 0(%r3)
+;   vl %v3, 0(%r4)
+;   vx %v6, %v1, %v3
+;   vst %v6, 0(%r2)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   vl %v1, 0(%r3)
+;   vl %v3, 0(%r4)
+;   vx %v6, %v1, %v3
+;   vst %v6, 0(%r2)
+;   br %r14
 
 function %bxor_i64(i64, i64) -> i64 {
 block0(v0: i64, v1: i64):
@@ -198,8 +382,15 @@ block0(v0: i64, v1: i64):
   return v2
 }
 
-; check:  xgr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   xgr %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   xgr %r2, %r3
+;   br %r14
 
 function %bxor_i64_mem(i64, i64) -> i64 {
 block0(v0: i64, v1: i64):
@@ -208,8 +399,15 @@ block0(v0: i64, v1: i64):
   return v3
 }
 
-; check:  xg %r2, 0(%r3)
-; nextln: br %r14
+; VCode:
+; block0:
+;   xg %r2, 0(%r3)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   xg %r2, 0(%r3) ; trap: heap_oob
+;   br %r14
 
 function %bxor_i32(i32, i32) -> i32 {
 block0(v0: i32, v1: i32):
@@ -217,8 +415,15 @@ block0(v0: i32, v1: i32):
   return v2
 }
 
-; check:  xr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   xr %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   xr %r2, %r3
+;   br %r14
 
 function %bxor_i32_mem(i32, i64) -> i32 {
 block0(v0: i32, v1: i64):
@@ -227,8 +432,15 @@ block0(v0: i32, v1: i64):
   return v3
 }
 
-; check:  x %r2, 0(%r3)
-; nextln: br %r14
+; VCode:
+; block0:
+;   x %r2, 0(%r3)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   x %r2, 0(%r3) ; trap: heap_oob
+;   br %r14
 
 function %bxor_i32_memoff(i32, i64) -> i32 {
 block0(v0: i32, v1: i64):
@@ -237,8 +449,15 @@ block0(v0: i32, v1: i64):
   return v3
 }
 
-; check:  xy %r2, 4096(%r3)
-; nextln: br %r14
+; VCode:
+; block0:
+;   xy %r2, 4096(%r3)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   xy %r2, 0x1000(%r3) ; trap: heap_oob
+;   br %r14
 
 function %bxor_i16(i16, i16) -> i16 {
 block0(v0: i16, v1: i16):
@@ -246,8 +465,15 @@ block0(v0: i16, v1: i16):
   return v2
 }
 
-; check:  xr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   xr %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   xr %r2, %r3
+;   br %r14
 
 function %bxor_i16_mem(i16, i64) -> i16 {
 block0(v0: i16, v1: i64):
@@ -256,9 +482,17 @@ block0(v0: i16, v1: i64):
   return v3
 }
 
-; check:  llh %r3, 0(%r3)
-; nextln: xr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   llh %r3, 0(%r3)
+;   xr %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   llh %r3, 0(%r3) ; trap: heap_oob
+;   xr %r2, %r3
+;   br %r14
 
 function %bxor_i8(i8, i8) -> i8 {
 block0(v0: i8, v1: i8):
@@ -266,8 +500,15 @@ block0(v0: i8, v1: i8):
   return v2
 }
 
-; check:  xr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   xr %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   xr %r2, %r3
+;   br %r14
 
 function %bxor_i8_mem(i8, i64) -> i8 {
 block0(v0: i8, v1: i64):
@@ -276,13 +517,39 @@ block0(v0: i8, v1: i64):
   return v3
 }
 
-; check:  llc %r3, 0(%r3)
-; nextln: xr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   llc %r3, 0(%r3)
+;   xr %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   llc %r3, 0(%r3) ; trap: heap_oob
+;   xr %r2, %r3
+;   br %r14
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; BAND_NOT
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+function %band_not_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+  v2 = band_not.i128 v0, v1
+  return v2
+}
+
+; VCode:
+; block0:
+;   vl %v1, 0(%r3)
+;   vl %v3, 0(%r4)
+;   vnc %v6, %v1, %v3
+;   vst %v6, 0(%r2)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   vl %v1, 0(%r3)
+;   vl %v3, 0(%r4)
+;   vnc %v6, %v1, %v3
+;   vst %v6, 0(%r2)
+;   br %r14
 
 function %band_not_i64(i64, i64) -> i64 {
 block0(v0: i64, v1: i64):
@@ -290,10 +557,19 @@ block0(v0: i64, v1: i64):
   return v2
 }
 
-; check:  ngr %r2, %r3
-; nextln: xilf %r2, 4294967295
-; nextln: xihf %r2, 4294967295
-; nextln: br %r14
+; VCode:
+; block0:
+;   xilf %r3, 4294967295
+;   xihf %r3, 4294967295
+;   ngr %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   xilf %r3, 0xffffffff
+;   xihf %r3, 0xffffffff
+;   ngr %r2, %r3
+;   br %r14
 
 function %band_not_i32(i32, i32) -> i32 {
 block0(v0: i32, v1: i32):
@@ -301,9 +577,17 @@ block0(v0: i32, v1: i32):
   return v2
 }
 
-; check:  nr %r2, %r3
-; nextln: xilf %r2, 4294967295
-; nextln: br %r14
+; VCode:
+; block0:
+;   xilf %r3, 4294967295
+;   nr %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   xilf %r3, 0xffffffff
+;   nr %r2, %r3
+;   br %r14
 
 function %band_not_i16(i16, i16) -> i16 {
 block0(v0: i16, v1: i16):
@@ -311,9 +595,17 @@ block0(v0: i16, v1: i16):
   return v2
 }
 
-; check:  nr %r2, %r3
-; nextln: xilf %r2, 4294967295
-; nextln: br %r14
+; VCode:
+; block0:
+;   xilf %r3, 4294967295
+;   nr %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   xilf %r3, 0xffffffff
+;   nr %r2, %r3
+;   br %r14
 
 function %band_not_i8(i8, i8) -> i8 {
 block0(v0: i8, v1: i8):
@@ -321,13 +613,39 @@ block0(v0: i8, v1: i8):
   return v2
 }
 
-; check:  nr %r2, %r3
-; nextln: xilf %r2, 4294967295
-; nextln: br %r14
+; VCode:
+; block0:
+;   xilf %r3, 4294967295
+;   nr %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   xilf %r3, 0xffffffff
+;   nr %r2, %r3
+;   br %r14
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; BOR_NOT
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+function %bor_not_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+  v2 = bor_not.i128 v0, v1
+  return v2
+}
+
+; VCode:
+; block0:
+;   vl %v1, 0(%r3)
+;   vl %v3, 0(%r4)
+;   voc %v6, %v1, %v3
+;   vst %v6, 0(%r2)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   vl %v1, 0(%r3)
+;   vl %v3, 0(%r4)
+;   voc %v6, %v1, %v3
+;   vst %v6, 0(%r2)
+;   br %r14
 
 function %bor_not_i64(i64, i64) -> i64 {
 block0(v0: i64, v1: i64):
@@ -335,10 +653,19 @@ block0(v0: i64, v1: i64):
   return v2
 }
 
-; check:  ogr %r2, %r3
-; nextln: xilf %r2, 4294967295
-; nextln: xihf %r2, 4294967295
-; nextln: br %r14
+; VCode:
+; block0:
+;   xilf %r3, 4294967295
+;   xihf %r3, 4294967295
+;   ogr %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   xilf %r3, 0xffffffff
+;   xihf %r3, 0xffffffff
+;   ogr %r2, %r3
+;   br %r14
 
 function %bor_not_i32(i32, i32) -> i32 {
 block0(v0: i32, v1: i32):
@@ -346,9 +673,17 @@ block0(v0: i32, v1: i32):
   return v2
 }
 
-; check:  or %r2, %r3
-; nextln: xilf %r2, 4294967295
-; nextln: br %r14
+; VCode:
+; block0:
+;   xilf %r3, 4294967295
+;   or %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   xilf %r3, 0xffffffff
+;   or %r2, %r3
+;   br %r14
 
 function %bor_not_i16(i16, i16) -> i16 {
 block0(v0: i16, v1: i16):
@@ -356,9 +691,17 @@ block0(v0: i16, v1: i16):
   return v2
 }
 
-; check:  or %r2, %r3
-; nextln: xilf %r2, 4294967295
-; nextln: br %r14
+; VCode:
+; block0:
+;   xilf %r3, 4294967295
+;   or %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   xilf %r3, 0xffffffff
+;   or %r2, %r3
+;   br %r14
 
 function %bor_not_i8(i8, i8) -> i8 {
 block0(v0: i8, v1: i8):
@@ -366,13 +709,39 @@ block0(v0: i8, v1: i8):
   return v2
 }
 
-; check:  or %r2, %r3
-; nextln: xilf %r2, 4294967295
-; nextln: br %r14
+; VCode:
+; block0:
+;   xilf %r3, 4294967295
+;   or %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   xilf %r3, 0xffffffff
+;   or %r2, %r3
+;   br %r14
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; BXOR_NOT
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+function %bxor_not_i128(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+  v2 = bxor_not.i128 v0, v1
+  return v2
+}
+
+; VCode:
+; block0:
+;   vl %v1, 0(%r3)
+;   vl %v3, 0(%r4)
+;   vnx %v6, %v1, %v3
+;   vst %v6, 0(%r2)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   vl %v1, 0(%r3)
+;   vl %v3, 0(%r4)
+;   vnx %v6, %v1, %v3
+;   vst %v6, 0(%r2)
+;   br %r14
 
 function %bxor_not_i64(i64, i64) -> i64 {
 block0(v0: i64, v1: i64):
@@ -380,10 +749,19 @@ block0(v0: i64, v1: i64):
   return v2
 }
 
-; check:  xgr %r2, %r3
-; nextln: xilf %r2, 4294967295
-; nextln: xihf %r2, 4294967295
-; nextln: br %r14
+; VCode:
+; block0:
+;   xilf %r3, 4294967295
+;   xihf %r3, 4294967295
+;   xgr %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   xilf %r3, 0xffffffff
+;   xihf %r3, 0xffffffff
+;   xgr %r2, %r3
+;   br %r14
 
 function %bxor_not_i32(i32, i32) -> i32 {
 block0(v0: i32, v1: i32):
@@ -391,9 +769,17 @@ block0(v0: i32, v1: i32):
   return v2
 }
 
-; check:  xr %r2, %r3
-; nextln: xilf %r2, 4294967295
-; nextln: br %r14
+; VCode:
+; block0:
+;   xilf %r3, 4294967295
+;   xr %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   xilf %r3, 0xffffffff
+;   xr %r2, %r3
+;   br %r14
 
 function %bxor_not_i16(i16, i16) -> i16 {
 block0(v0: i16, v1: i16):
@@ -401,9 +787,17 @@ block0(v0: i16, v1: i16):
   return v2
 }
 
-; check:  xr %r2, %r3
-; nextln: xilf %r2, 4294967295
-; nextln: br %r14
+; VCode:
+; block0:
+;   xilf %r3, 4294967295
+;   xr %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   xilf %r3, 0xffffffff
+;   xr %r2, %r3
+;   br %r14
 
 function %bxor_not_i8(i8, i8) -> i8 {
 block0(v0: i8, v1: i8):
@@ -411,13 +805,37 @@ block0(v0: i8, v1: i8):
   return v2
 }
 
-; check:  xr %r2, %r3
-; nextln: xilf %r2, 4294967295
-; nextln: br %r14
+; VCode:
+; block0:
+;   xilf %r3, 4294967295
+;   xr %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   xilf %r3, 0xffffffff
+;   xr %r2, %r3
+;   br %r14
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; BNOT
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+function %bnot_i128(i128) -> i128 {
+block0(v0: i128):
+  v1 = bnot.i128 v0
+  return v1
+}
+
+; VCode:
+; block0:
+;   vl %v1, 0(%r3)
+;   vno %v4, %v1, %v1
+;   vst %v4, 0(%r2)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   vl %v1, 0(%r3)
+;   vno %v4, %v1, %v1
+;   vst %v4, 0(%r2)
+;   br %r14
 
 function %bnot_i64(i64) -> i64 {
 block0(v0: i64):
@@ -425,9 +843,17 @@ block0(v0: i64):
   return v1
 }
 
-; check:  xilf %r2, 4294967295
-; nextln: xihf %r2, 4294967295
-; nextln: br %r14
+; VCode:
+; block0:
+;   xilf %r2, 4294967295
+;   xihf %r2, 4294967295
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   xilf %r2, 0xffffffff
+;   xihf %r2, 0xffffffff
+;   br %r14
 
 function %bnot_i32(i32) -> i32 {
 block0(v0: i32):
@@ -435,8 +861,15 @@ block0(v0: i32):
   return v1
 }
 
-; check:  xilf %r2, 4294967295
-; nextln: br %r14
+; VCode:
+; block0:
+;   xilf %r2, 4294967295
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   xilf %r2, 0xffffffff
+;   br %r14
 
 function %bnot_i16(i16) -> i16 {
 block0(v0: i16):
@@ -444,8 +877,15 @@ block0(v0: i16):
   return v1
 }
 
-; check:  xilf %r2, 4294967295
-; nextln: br %r14
+; VCode:
+; block0:
+;   xilf %r2, 4294967295
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   xilf %r2, 0xffffffff
+;   br %r14
 
 function %bnot_i8(i8) -> i8 {
 block0(v0: i8):
@@ -453,12 +893,39 @@ block0(v0: i8):
   return v1
 }
 
-; check:  xilf %r2, 4294967295
-; nextln: br %r14
+; VCode:
+; block0:
+;   xilf %r2, 4294967295
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   xilf %r2, 0xffffffff
+;   br %r14
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; BITSELECT
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+function %bitselect_i128(i128, i128, i128) -> i128 {
+block0(v0: i128, v1: i128, v2: i128):
+  v3 = bitselect.i128 v0, v1, v2
+  return v3
+}
+
+; VCode:
+; block0:
+;   vl %v1, 0(%r3)
+;   vl %v3, 0(%r4)
+;   vl %v5, 0(%r5)
+;   vsel %v16, %v3, %v5, %v1
+;   vst %v16, 0(%r2)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   vl %v1, 0(%r3)
+;   vl %v3, 0(%r4)
+;   vl %v5, 0(%r5)
+;   vsel %v16, %v3, %v5, %v1
+;   vst %v16, 0(%r2)
+;   br %r14
 
 function %bitselect_i64(i64, i64, i64) -> i64 {
 block0(v0: i64, v1: i64, v2: i64):
@@ -466,12 +933,23 @@ block0(v0: i64, v1: i64, v2: i64):
   return v3
 }
 
-; check:  ngr %r3, %r2
-; nextln: ngrk %r2, %r4, %r2
-; nextln: xilf %r2, 4294967295
-; nextln: xihf %r2, 4294967295
-; nextln: ogr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   ngr %r3, %r2
+;   xilf %r2, 4294967295
+;   xihf %r2, 4294967295
+;   ngr %r4, %r2
+;   ogrk %r2, %r4, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   ngr %r3, %r2
+;   xilf %r2, 0xffffffff
+;   xihf %r2, 0xffffffff
+;   ngr %r4, %r2
+;   ogrk %r2, %r4, %r3
+;   br %r14
 
 function %bitselect_i32(i32, i32, i32) -> i32 {
 block0(v0: i32, v1: i32, v2: i32):
@@ -479,11 +957,21 @@ block0(v0: i32, v1: i32, v2: i32):
   return v3
 }
 
-; check:  nr %r3, %r2
-; nextln: nrk %r2, %r4, %r2
-; nextln: xilf %r2, 4294967295
-; nextln: or %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   nr %r3, %r2
+;   xilf %r2, 4294967295
+;   nrk %r2, %r4, %r2
+;   or %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   nr %r3, %r2
+;   xilf %r2, 0xffffffff
+;   nrk %r2, %r4, %r2
+;   or %r2, %r3
+;   br %r14
 
 function %bitselect_i16(i16, i16, i16) -> i16 {
 block0(v0: i16, v1: i16, v2: i16):
@@ -491,11 +979,21 @@ block0(v0: i16, v1: i16, v2: i16):
   return v3
 }
 
-; check:  nr %r3, %r2
-; nextln: nrk %r2, %r4, %r2
-; nextln: xilf %r2, 4294967295
-; nextln: or %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   nr %r3, %r2
+;   xilf %r2, 4294967295
+;   nrk %r2, %r4, %r2
+;   or %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   nr %r3, %r2
+;   xilf %r2, 0xffffffff
+;   nrk %r2, %r4, %r2
+;   or %r2, %r3
+;   br %r14
 
 function %bitselect_i8(i8, i8, i8) -> i8 {
 block0(v0: i8, v1: i8, v2: i8):
@@ -503,9 +1001,78 @@ block0(v0: i8, v1: i8, v2: i8):
   return v3
 }
 
-; check:  nr %r3, %r2
-; nextln: nrk %r2, %r4, %r2
-; nextln: xilf %r2, 4294967295
-; nextln: or %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   nr %r3, %r2
+;   xilf %r2, 4294967295
+;   nrk %r2, %r4, %r2
+;   or %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   nr %r3, %r2
+;   xilf %r2, 0xffffffff
+;   nrk %r2, %r4, %r2
+;   or %r2, %r3
+;   br %r14
+
+function %bnot_of_bxor(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
+  v2 = bxor v0, v1
+  v3 = bnot v2
+  return v3
+}
+
+; VCode:
+; block0:
+;   xr %r2, %r3
+;   xilf %r2, 4294967295
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   xr %r2, %r3
+;   xilf %r2, 0xffffffff
+;   br %r14
+
+function %bnot_of_bxor(i128, i128) -> i128 {
+block0(v0: i128, v1: i128):
+  v2 = bxor v0, v1
+  v3 = bnot v2
+  return v3
+}
+
+; VCode:
+; block0:
+;   vl %v1, 0(%r3)
+;   vl %v3, 0(%r4)
+;   vnx %v6, %v1, %v3
+;   vst %v6, 0(%r2)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   vl %v1, 0(%r3)
+;   vl %v3, 0(%r4)
+;   vnx %v6, %v1, %v3
+;   vst %v6, 0(%r2)
+;   br %r14
+
+function %bnot_of_bxor(i32x4, i32x4) -> i32x4 {
+block0(v0: i32x4, v1: i32x4):
+  v2 = bxor v0, v1
+  v3 = bnot v2
+  return v3
+}
+
+; VCode:
+; block0:
+;   vnx %v24, %v24, %v25
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   vnx %v24, %v24, %v25
+;   br %r14
 

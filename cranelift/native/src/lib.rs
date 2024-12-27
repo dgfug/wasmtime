@@ -1,30 +1,14 @@
 //! Performs autodetection of the host for the purposes of running
 //! Cranelift to generate code to run on the same machine.
 
-#![deny(
-    missing_docs,
-    trivial_numeric_casts,
-    unused_extern_crates,
-    unstable_features
-)]
-#![warn(unused_import_braces)]
-#![cfg_attr(feature = "clippy", plugin(clippy(conf_file = "../../clippy.toml")))]
-#![cfg_attr(feature = "cargo-clippy", allow(clippy::new_without_default))]
-#![cfg_attr(
-    feature = "cargo-clippy",
-    warn(
-        clippy::float_arithmetic,
-        clippy::mut_mut,
-        clippy::nonminimal_bool,
-        clippy::map_unwrap_or,
-        clippy::clippy::print_stdout,
-        clippy::unicode_not_nfc,
-        clippy::use_self
-    )
-)]
+#![deny(missing_docs)]
 
 use cranelift_codegen::isa;
+use cranelift_codegen::settings::Configurable;
 use target_lexicon::Triple;
+
+#[cfg(all(target_arch = "riscv64", target_os = "linux"))]
+mod riscv;
 
 /// Return an `isa` builder configured for the current host
 /// machine, or `Err(())` if the host machine is not supported
@@ -38,26 +22,36 @@ pub fn builder() -> Result<isa::Builder, &'static str> {
 /// in the current configuration.
 ///
 /// Selects the given backend variant specifically; this is
-/// useful when more than oen backend exists for a given target
+/// useful when more than one backend exists for a given target
 /// (e.g., on x86-64).
 pub fn builder_with_options(infer_native_flags: bool) -> Result<isa::Builder, &'static str> {
     let mut isa_builder = isa::lookup(Triple::host()).map_err(|err| match err {
         isa::LookupError::SupportDisabled => "support for architecture disabled at compile time",
         isa::LookupError::Unsupported => "unsupported architecture",
     })?;
+    if infer_native_flags {
+        self::infer_native_flags(&mut isa_builder)?;
+    }
+    Ok(isa_builder)
+}
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+/// Return an `isa` builder configured for the current host
+/// machine, or `Err(())` if the host machine is not supported
+/// in the current configuration.
+///
+/// Selects the given backend variant specifically; this is
+/// useful when more than one backend exists for a given target
+/// (e.g., on x86-64).
+pub fn infer_native_flags(isa_builder: &mut dyn Configurable) -> Result<(), &'static str> {
+    #[cfg(target_arch = "x86_64")]
     {
-        use cranelift_codegen::settings::Configurable;
-
         if !std::is_x86_feature_detected!("sse2") {
             return Err("x86 support requires SSE2");
         }
 
-        if !infer_native_flags {
-            return Ok(isa_builder);
+        if std::is_x86_feature_detected!("cmpxchg16b") {
+            isa_builder.enable("has_cmpxchg16b").unwrap();
         }
-
         if std::is_x86_feature_detected!("sse3") {
             isa_builder.enable("has_sse3").unwrap();
         }
@@ -78,6 +72,9 @@ pub fn builder_with_options(infer_native_flags: bool) -> Result<isa::Builder, &'
         }
         if std::is_x86_feature_detected!("avx2") {
             isa_builder.enable("has_avx2").unwrap();
+        }
+        if std::is_x86_feature_detected!("fma") {
+            isa_builder.enable("has_fma").unwrap();
         }
         if std::is_x86_feature_detected!("bmi1") {
             isa_builder.enable("has_bmi1").unwrap();
@@ -105,17 +102,25 @@ pub fn builder_with_options(infer_native_flags: bool) -> Result<isa::Builder, &'
         }
     }
 
-    // `stdsimd` is necessary for std::is_aarch64_feature_detected!().
-    #[cfg(all(target_arch = "aarch64", feature = "stdsimd"))]
+    #[cfg(target_arch = "aarch64")]
     {
-        use cranelift_codegen::settings::Configurable;
-
-        if !infer_native_flags {
-            return Ok(isa_builder);
+        if std::arch::is_aarch64_feature_detected!("lse") {
+            isa_builder.enable("has_lse").unwrap();
         }
 
-        if std::is_aarch64_feature_detected!("lse") {
-            isa_builder.enable("has_lse").unwrap();
+        if std::arch::is_aarch64_feature_detected!("paca") {
+            isa_builder.enable("has_pauth").unwrap();
+        }
+
+        if std::arch::is_aarch64_feature_detected!("fp16") {
+            isa_builder.enable("has_fp16").unwrap();
+        }
+
+        if cfg!(target_os = "macos") {
+            // Pointer authentication is always available on Apple Silicon.
+            isa_builder.enable("sign_return_address").unwrap();
+            // macOS enforces the use of the B key for return addresses.
+            isa_builder.enable("sign_return_address_with_bkey").unwrap();
         }
     }
 
@@ -123,12 +128,6 @@ pub fn builder_with_options(infer_native_flags: bool) -> Result<isa::Builder, &'
     // we use getauxval from the libc crate directly.
     #[cfg(all(target_arch = "s390x", target_os = "linux"))]
     {
-        use cranelift_codegen::settings::Configurable;
-
-        if !infer_native_flags {
-            return Ok(isa_builder);
-        }
-
         let v = unsafe { libc::getauxval(libc::AT_HWCAP) };
         const HWCAP_S390X_VXRS_EXT2: libc::c_ulong = 32768;
         if (v & HWCAP_S390X_VXRS_EXT2) != 0 {
@@ -139,12 +138,28 @@ pub fn builder_with_options(infer_native_flags: bool) -> Result<isa::Builder, &'
         }
     }
 
-    // squelch warnings about unused mut/variables on some platforms.
-    drop(&mut isa_builder);
-    drop(infer_native_flags);
+    // `is_riscv_feature_detected` is nightly only for now, use
+    // getauxval from the libc crate directly as a temporary measure.
+    #[cfg(all(target_arch = "riscv64", target_os = "linux"))]
+    {
+        // Try both hwcap and cpuinfo
+        // HWCAP only returns single letter extensions, cpuinfo returns all of
+        // them but may not be available in some systems (QEMU < 8.1).
+        riscv::hwcap_detect(isa_builder)?;
 
-    Ok(isa_builder)
+        // Ignore errors for cpuinfo. QEMU versions prior to 8.1 do not emulate
+        // the cpuinfo interface, so we can't rely on it being present for now.
+        let _ = riscv::cpuinfo_detect(isa_builder);
+    }
+
+    // On all other architectures (e.g. wasm32) we won't infer any native flags,
+    // but still need to use the `isa_builder` to avoid compiler warnings.
+    let _ = isa_builder;
+    Ok(())
 }
+
+/// Version number of this crate.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(test)]
 mod tests {
@@ -156,11 +171,13 @@ mod tests {
     fn test() {
         if let Ok(isa_builder) = builder() {
             let flag_builder = settings::builder();
-            let isa = isa_builder.finish(settings::Flags::new(flag_builder));
+            let isa = isa_builder
+                .finish(settings::Flags::new(flag_builder))
+                .unwrap();
 
             if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
                 assert_eq!(isa.default_call_conv(), CallConv::AppleAarch64);
-            } else if cfg!(any(unix, target_os = "nebulet")) {
+            } else if cfg!(unix) {
                 assert_eq!(isa.default_call_conv(), CallConv::SystemV);
             } else if cfg!(windows) {
                 assert_eq!(isa.default_call_conv(), CallConv::WindowsFastcall);
@@ -176,6 +193,3 @@ mod tests {
         }
     }
 }
-
-/// Version number of this crate.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -5,3 +5,6 @@
 *.png binary
 *.ico binary
 *.wasm binary
+
+# ISLE should use lisp syntax highlighting.
+*.isle linguist-language=lisp

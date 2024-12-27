@@ -57,10 +57,11 @@ fn check_gdb_output(output: &str, directives: &str) -> Result<()> {
 pub fn test_debug_dwarf_gdb() -> Result<()> {
     let output = gdb_with_script(
         &[
-            "-g",
-            "tests/all/debug/testsuite/fib-wasm.wasm",
+            "-Ccache=n",
+            "-Ddebug-info",
             "--invoke",
             "fib",
+            "tests/all/debug/testsuite/fib-wasm.wasm",
             "3",
         ],
         r#"set breakpoint pending on

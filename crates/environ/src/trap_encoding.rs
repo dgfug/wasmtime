@@ -1,47 +1,5 @@
-use object::write::{Object, StandardSegment};
-use object::{Bytes, LittleEndian, SectionKind, U32Bytes};
-use std::convert::TryFrom;
-use std::ops::Range;
-
-/// A helper structure to build the custom-encoded section of a wasmtime
-/// compilation image which encodes trap information.
-///
-/// This structure is incrementally fed the results of compiling individual
-/// functions and handles all the encoding internally, allowing usage of
-/// `lookup_trap_code` below with the resulting section.
-#[derive(Default)]
-pub struct TrapEncodingBuilder {
-    offsets: Vec<U32Bytes<LittleEndian>>,
-    traps: Vec<u8>,
-    last_offset: u32,
-}
-
-/// A custom binary-encoded section of wasmtime compilation artifacts which
-/// encodes the ability to map an offset in the text section to the trap code
-/// that it corresponds to.
-///
-/// This section is used at runtime to determine what flavor fo trap happened to
-/// ensure that embedders and debuggers know the reason for the wasm trap. The
-/// encoding of this section is custom to Wasmtime and managed with helpers in
-/// the `object` crate:
-///
-/// * First the section has a 32-bit little endian integer indicating how many
-///   trap entries are in the section.
-/// * Next is an array, of the same length as read before, of 32-bit
-///   little-endian integers. These integers are offsets into the text section
-///   of the compilation image.
-/// * Finally is the same count number of bytes. Each of these bytes corresponds
-///   to a trap code.
-///
-/// This section is decoded by `lookup_trap_code` below which will read the
-/// section count, slice some bytes to get the various arrays, and then perform
-/// a binary search on the offsets array to find the an index corresponding to
-/// the pc being looked up. If found the same index in the trap array (the array
-/// of bytes) is the trap code for that offset.
-///
-/// Note that at this time this section has an alignment of 1. Additionally due
-/// to the 32-bit encodings for offsets this doesn't support images >=4gb.
-pub const ELF_WASMTIME_TRAPS: &str = ".wasmtime.traps";
+use core::fmt;
+use object::{Bytes, LittleEndian, U32Bytes};
 
 /// Information about trap.
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -52,29 +10,30 @@ pub struct TrapInformation {
     pub code_offset: u32,
 
     /// Code of the trap.
-    pub trap_code: TrapCode,
+    pub trap_code: Trap,
 }
 
-/// A trap code describing the reason for a trap.
-///
-/// All trap instructions have an explicit trap code.
+// The code can be accessed from the c-api, where the possible values are
+// translated into enum values defined there:
+//
+// * `wasm_trap_code` in c-api/src/trap.rs, and
+// * `wasmtime_trap_code_enum` in c-api/include/wasmtime/trap.h.
+//
+// These need to be kept in sync.
+#[non_exhaustive]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-#[repr(u8)]
-pub enum TrapCode {
+#[allow(missing_docs, reason = "self-describing variants")]
+pub enum Trap {
     /// The current stack space was exhausted.
     StackOverflow,
 
-    /// A `heap_addr` instruction detected an out-of-bounds error.
-    ///
-    /// Note that not all out-of-bounds heap accesses are reported this way;
-    /// some are detected by a segmentation fault on the heap unmapped or
-    /// offset-guard pages.
-    HeapOutOfBounds,
+    /// An out-of-bounds memory access.
+    MemoryOutOfBounds,
 
     /// A wasm atomic operation was presented with a not-naturally-aligned linear-memory address.
     HeapMisaligned,
 
-    /// A `table_addr` instruction detected an out-of-bounds error.
+    /// An out-of-bounds access to a table.
     TableOutOfBounds,
 
     /// Indirect call to a null table entry.
@@ -96,61 +55,111 @@ pub enum TrapCode {
     UnreachableCodeReached,
 
     /// Execution has potentially run too long and may be interrupted.
-    /// This trap is resumable.
     Interrupt,
+
+    /// When the `component-model` feature is enabled this trap represents a
+    /// function that was `canon lift`'d, then `canon lower`'d, then called.
+    /// This combination of creation of a function in the component model
+    /// generates a function that always traps and, when called, produces this
+    /// flavor of trap.
+    AlwaysTrapAdapter,
+
+    /// When wasm code is configured to consume fuel and it runs out of fuel
+    /// then this trap will be raised.
+    OutOfFuel,
+
+    /// Used to indicate that a trap was raised by atomic wait operations on non shared memory.
+    AtomicWaitNonSharedMemory,
+
+    /// Call to a null reference.
+    NullReference,
+
+    /// Attempt to access beyond the bounds of an array.
+    ArrayOutOfBounds,
+
+    /// Attempted an allocation that was too large to succeed.
+    AllocationTooLarge,
+
+    /// Attempted to cast a reference to a type that it is not an instance of.
+    CastFailure,
+
+    /// When the `component-model` feature is enabled this trap represents a
+    /// scenario where one component tried to call another component but it
+    /// would have violated the reentrance rules of the component model,
+    /// triggering a trap instead.
+    CannotEnterComponent,
     // if adding a variant here be sure to update the `check!` macro below
 }
 
-impl TrapEncodingBuilder {
-    /// Appends trap information about a function into this section.
-    ///
-    /// This function is called to describe traps for the `func` range
-    /// specified. The `func` offsets are specified relative to the text section
-    /// itself, and the `traps` offsets are specified relative to the start of
-    /// `func`.
-    ///
-    /// This is required to be called in-order for increasing ranges of `func`
-    /// to ensure the final array is properly sorted. Additionally `traps` must
-    /// be sorted.
-    pub fn push(&mut self, func: Range<u64>, traps: &[TrapInformation]) {
-        // NB: for now this only supports <=4GB text sections in object files.
-        // Alternative schemes will need to be created for >32-bit offsets to
-        // avoid making this section overly large.
-        let func_start = u32::try_from(func.start).unwrap();
-        let func_end = u32::try_from(func.end).unwrap();
-
-        // Sanity-check to ensure that functions are pushed in-order, otherwise
-        // the `offsets` array won't be sorted which is our goal.
-        assert!(func_start >= self.last_offset);
-
-        self.offsets.reserve(traps.len());
-        self.traps.reserve(traps.len());
-        for info in traps {
-            let pos = func_start + info.code_offset;
-            assert!(pos >= self.last_offset);
-            self.offsets.push(U32Bytes::new(LittleEndian, pos));
-            self.traps.push(info.trap_code as u8);
-            self.last_offset = pos;
+impl Trap {
+    /// Converts a byte back into a `Trap` if its in-bounds
+    pub fn from_u8(byte: u8) -> Option<Trap> {
+        // FIXME: this could use some sort of derive-like thing to avoid having to
+        // deduplicate the names here.
+        //
+        // This simply converts from the a `u8`, to the `Trap` enum.
+        macro_rules! check {
+            ($($name:ident)*) => ($(if byte == Trap::$name as u8 {
+                return Some(Trap::$name);
+            })*);
         }
 
-        self.last_offset = func_end;
-    }
+        check! {
+            StackOverflow
+            MemoryOutOfBounds
+            HeapMisaligned
+            TableOutOfBounds
+            IndirectCallToNull
+            BadSignature
+            IntegerOverflow
+            IntegerDivisionByZero
+            BadConversionToInteger
+            UnreachableCodeReached
+            Interrupt
+            AlwaysTrapAdapter
+            OutOfFuel
+            AtomicWaitNonSharedMemory
+            NullReference
+            ArrayOutOfBounds
+            AllocationTooLarge
+            CastFailure
+            CannotEnterComponent
+        }
 
-    /// Encodes this section into the object provided.
-    pub fn append_to(self, obj: &mut Object) {
-        let section = obj.add_section(
-            obj.segment_name(StandardSegment::Data).to_vec(),
-            ELF_WASMTIME_TRAPS.as_bytes().to_vec(),
-            SectionKind::ReadOnlyData,
-        );
-
-        // NB: this matches the encoding expected by `lookup` below.
-        let amt = u32::try_from(self.traps.len()).unwrap();
-        obj.append_section_data(section, &amt.to_le_bytes(), 1);
-        obj.append_section_data(section, object::bytes_of_slice(&self.offsets), 1);
-        obj.append_section_data(section, &self.traps, 1);
+        None
     }
 }
+
+impl fmt::Display for Trap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use Trap::*;
+
+        let desc = match self {
+            StackOverflow => "call stack exhausted",
+            MemoryOutOfBounds => "out of bounds memory access",
+            HeapMisaligned => "unaligned atomic",
+            TableOutOfBounds => "undefined element: out of bounds table access",
+            IndirectCallToNull => "uninitialized element",
+            BadSignature => "indirect call type mismatch",
+            IntegerOverflow => "integer overflow",
+            IntegerDivisionByZero => "integer divide by zero",
+            BadConversionToInteger => "invalid conversion to integer",
+            UnreachableCodeReached => "wasm `unreachable` instruction executed",
+            Interrupt => "interrupt",
+            AlwaysTrapAdapter => "degenerate component adapter called",
+            OutOfFuel => "all fuel consumed by WebAssembly",
+            AtomicWaitNonSharedMemory => "atomic wait on non-shared memory",
+            NullReference => "null reference",
+            ArrayOutOfBounds => "out of bounds array access",
+            AllocationTooLarge => "allocation size too large",
+            CastFailure => "cast failure",
+            CannotEnterComponent => "cannot enter component instance",
+        };
+        write!(f, "wasm trap: {desc}")
+    }
+}
+
+impl core::error::Error for Trap {}
 
 /// Decodes the provided trap information section and attempts to find the trap
 /// code corresponding to the `offset` specified.
@@ -158,7 +167,7 @@ impl TrapEncodingBuilder {
 /// The `section` provided is expected to have been built by
 /// `TrapEncodingBuilder` above. Additionally the `offset` should be a relative
 /// offset within the text section of the compilation image.
-pub fn lookup_trap_code(section: &[u8], offset: usize) -> Option<TrapCode> {
+pub fn lookup_trap_code(section: &[u8], offset: usize) -> Option<Trap> {
     let mut section = Bytes(section);
     // NB: this matches the encoding written by `append_to` above.
     let count = section.read::<U32Bytes<LittleEndian>>().ok()?;
@@ -181,35 +190,9 @@ pub fn lookup_trap_code(section: &[u8], offset: usize) -> Option<TrapCode> {
         .binary_search_by_key(&offset, |val| val.get(LittleEndian))
         .ok()?;
     debug_assert!(index < traps.len());
-    let trap = *traps.get(index)?;
+    let byte = *traps.get(index)?;
 
-    // FIXME: this could use some sort of derive-like thing to avoid having to
-    // deduplicate the names here.
-    //
-    // This simply converts from the `trap`, a `u8`, to the `TrapCode` enum.
-    macro_rules! check {
-        ($($name:ident)*) => ($(if trap == TrapCode::$name as u8 {
-            return Some(TrapCode::$name);
-        })*);
-    }
-
-    check! {
-        StackOverflow
-        HeapOutOfBounds
-        HeapMisaligned
-        TableOutOfBounds
-        IndirectCallToNull
-        BadSignature
-        IntegerOverflow
-        IntegerDivisionByZero
-        BadConversionToInteger
-        UnreachableCodeReached
-        Interrupt
-    }
-
-    if cfg!(debug_assertions) {
-        panic!("missing mapping for {}", trap);
-    } else {
-        None
-    }
+    let trap = Trap::from_u8(byte);
+    debug_assert!(trap.is_some(), "missing mapping for {byte}");
+    trap
 }

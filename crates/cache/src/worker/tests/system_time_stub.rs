@@ -1,9 +1,7 @@
-use lazy_static::lazy_static;
+use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, SystemTimeError};
 
-lazy_static! {
-    pub static ref NOW: SystemTime = SystemTime::now(); // no need for RefCell and set_now() for now
-}
+pub static NOW: LazyLock<SystemTime> = LazyLock::new(SystemTime::now);
 
 #[derive(PartialOrd, PartialEq, Ord, Eq)]
 pub struct SystemTimeStub(SystemTime);

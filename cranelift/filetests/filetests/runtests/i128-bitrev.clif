@@ -2,8 +2,15 @@ test run
 set enable_llvm_abi_extensions=true
 target aarch64
 target x86_64
+target riscv64
+target riscv64 has_zbb
+target riscv64 has_zbkb
+target riscv64 has_zbb has_zbkb
+target riscv64 has_c has_zcb
+set enable_multi_ret_implicit_sret
+target s390x
 
-function %reverse_bits_zero() -> b1 {
+function %reverse_bits_zero() -> i8 {
 block0:
     v0 = iconst.i64 0
     v1 = iconcat v0, v0
@@ -13,7 +20,7 @@ block0:
 }
 ; run
 
-function %reverse_bits_one() -> b1 {
+function %reverse_bits_one() -> i8 {
 block0:
     v0 = iconst.i64 0
     v1 = iconst.i64 1
@@ -30,7 +37,7 @@ block0:
 }
 ; run
 
-function %reverse_bits() -> b1 {
+function %reverse_bits() -> i8 {
 block0:
     v0 = iconst.i64 0x06AD_8667_69EC_41BA
     v1 = iconst.i64 0x6C83_D81A_6E28_83AB

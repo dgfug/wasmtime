@@ -52,7 +52,7 @@ impl<F: Forest> NodePool<F> {
     /// Free a node.
     pub fn free_node(&mut self, node: Node) {
         // Quick check for a double free.
-        debug_assert!(!self.nodes[node].is_free(), "{} is already free", node);
+        debug_assert!(!self.nodes[node].is_free(), "{node} is already free");
         self.nodes[node] = NodeData::Free {
             next: self.freelist,
         };
@@ -63,7 +63,6 @@ impl<F: Forest> NodePool<F> {
     pub fn free_tree(&mut self, node: Node) {
         if let NodeData::Inner { size, tree, .. } = self[node] {
             // Note that we have to capture `tree` by value to avoid borrow checker trouble.
-            #[cfg_attr(feature = "cargo-clippy", allow(clippy::needless_range_loop))]
             for i in 0..usize::from(size + 1) {
                 // Recursively free sub-trees. This recursion can never be deeper than `MAX_PATH`,
                 // and since most trees have less than a handful of nodes, it is worthwhile to
@@ -163,7 +162,7 @@ impl<F: Forest> NodePool<F> {
 
                     // Verify occupancy.
                     // Right-most nodes can be small, but others must be at least half full.
-                    assert!(size > 0, "Leaf {} is empty", node);
+                    assert!(size > 0, "Leaf {node} is empty");
                     assert!(
                         rkey.is_none() || size * 2 >= capacity,
                         "Only {}/{} entries in {}:{}, upper={}",

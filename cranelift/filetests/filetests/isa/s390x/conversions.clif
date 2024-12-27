@@ -1,9 +1,46 @@
-test compile
+test compile precise-output
+set enable_multi_ret_implicit_sret
 target s390x
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; UEXTEND
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+function %uextend_i64_i128(i64) -> i128 {
+block0(v0: i64):
+  v1 = uextend.i128 v0
+  return v1
+}
+
+; VCode:
+; block0:
+;   vgbm %v4, 0
+;   vlvgg %v4, %r3, 1
+;   vst %v4, 0(%r2)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   vzero %v4
+;   vlvgg %v4, %r3, 1
+;   vst %v4, 0(%r2)
+;   br %r14
+
+function %uextend_i32_i128(i32) -> i128 {
+block0(v0: i32):
+  v1 = uextend.i128 v0
+  return v1
+}
+
+; VCode:
+; block0:
+;   vgbm %v4, 0
+;   vlvgf %v4, %r3, 3
+;   vst %v4, 0(%r2)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   vzero %v4
+;   vlvgf %v4, %r3, 3
+;   vst %v4, 0(%r2)
+;   br %r14
 
 function %uextend_i32_i64(i32) -> i64 {
 block0(v0: i32):
@@ -11,8 +48,35 @@ block0(v0: i32):
   return v1
 }
 
-; check:  llgfr %r2, %r2
-; nextln: br %r14
+; VCode:
+; block0:
+;   llgfr %r2, %r2
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   llgfr %r2, %r2
+;   br %r14
+
+function %uextend_i16_i128(i16) -> i128 {
+block0(v0: i16):
+  v1 = uextend.i128 v0
+  return v1
+}
+
+; VCode:
+; block0:
+;   vgbm %v4, 0
+;   vlvgh %v4, %r3, 7
+;   vst %v4, 0(%r2)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   vzero %v4
+;   vlvgh %v4, %r3, 7
+;   vst %v4, 0(%r2)
+;   br %r14
 
 function %uextend_i16_i64(i16) -> i64 {
 block0(v0: i16):
@@ -20,8 +84,15 @@ block0(v0: i16):
   return v1
 }
 
-; check:  llghr %r2, %r2
-; nextln: br %r14
+; VCode:
+; block0:
+;   llghr %r2, %r2
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   llghr %r2, %r2
+;   br %r14
 
 function %uextend_i16_i32(i16) -> i32 {
 block0(v0: i16):
@@ -29,8 +100,35 @@ block0(v0: i16):
   return v1
 }
 
-; check:  llhr %r2, %r2
-; nextln: br %r14
+; VCode:
+; block0:
+;   llhr %r2, %r2
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   llhr %r2, %r2
+;   br %r14
+
+function %uextend_i8_i128(i8) -> i128 {
+block0(v0: i8):
+  v1 = uextend.i128 v0
+  return v1
+}
+
+; VCode:
+; block0:
+;   vgbm %v4, 0
+;   vlvgb %v4, %r3, 15
+;   vst %v4, 0(%r2)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   vzero %v4
+;   vlvgb %v4, %r3, 0xf
+;   vst %v4, 0(%r2)
+;   br %r14
 
 function %uextend_i8_i64(i8) -> i64 {
 block0(v0: i8):
@@ -38,8 +136,15 @@ block0(v0: i8):
   return v1
 }
 
-; check:  llgcr %r2, %r2
-; nextln: br %r14
+; VCode:
+; block0:
+;   llgcr %r2, %r2
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   llgcr %r2, %r2
+;   br %r14
 
 function %uextend_i8_i32(i8) -> i32 {
 block0(v0: i8):
@@ -47,8 +152,15 @@ block0(v0: i8):
   return v1
 }
 
-; check:  llcr %r2, %r2
-; nextln: br %r14
+; VCode:
+; block0:
+;   llcr %r2, %r2
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   llcr %r2, %r2
+;   br %r14
 
 function %uextend_i8_i16(i8) -> i16 {
 block0(v0: i8):
@@ -56,13 +168,57 @@ block0(v0: i8):
   return v1
 }
 
-; check:  llcr %r2, %r2
-; nextln: br %r14
+; VCode:
+; block0:
+;   llcr %r2, %r2
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   llcr %r2, %r2
+;   br %r14
 
+function %sextend_i64_i128(i64) -> i128 {
+block0(v0: i64):
+  v1 = sextend.i128 v0
+  return v1
+}
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; SEXTEND
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; VCode:
+; block0:
+;   srag %r5, %r3, 63
+;   vlvgp %v5, %r5, %r3
+;   vst %v5, 0(%r2)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   srag %r5, %r3, 0x3f
+;   vlvgp %v5, %r5, %r3
+;   vst %v5, 0(%r2)
+;   br %r14
+
+function %sextend_i32_i128(i32) -> i128 {
+block0(v0: i32):
+  v1 = sextend.i128 v0
+  return v1
+}
+
+; VCode:
+; block0:
+;   lgfr %r5, %r3
+;   srag %r3, %r5, 63
+;   vlvgp %v7, %r3, %r5
+;   vst %v7, 0(%r2)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lgfr %r5, %r3
+;   srag %r3, %r5, 0x3f
+;   vlvgp %v7, %r3, %r5
+;   vst %v7, 0(%r2)
+;   br %r14
 
 function %sextend_i32_i64(i32) -> i64 {
 block0(v0: i32):
@@ -70,8 +226,37 @@ block0(v0: i32):
   return v1
 }
 
-; check:  lgfr %r2, %r2
-; nextln: br %r14
+; VCode:
+; block0:
+;   lgfr %r2, %r2
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lgfr %r2, %r2
+;   br %r14
+
+function %sextend_i16_i128(i16) -> i128 {
+block0(v0: i16):
+  v1 = sextend.i128 v0
+  return v1
+}
+
+; VCode:
+; block0:
+;   lghr %r5, %r3
+;   srag %r3, %r5, 63
+;   vlvgp %v7, %r3, %r5
+;   vst %v7, 0(%r2)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lghr %r5, %r3
+;   srag %r3, %r5, 0x3f
+;   vlvgp %v7, %r3, %r5
+;   vst %v7, 0(%r2)
+;   br %r14
 
 function %sextend_i16_i64(i16) -> i64 {
 block0(v0: i16):
@@ -79,8 +264,15 @@ block0(v0: i16):
   return v1
 }
 
-; check:  lghr %r2, %r2
-; nextln: br %r14
+; VCode:
+; block0:
+;   lghr %r2, %r2
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lghr %r2, %r2
+;   br %r14
 
 function %sextend_i16_i32(i16) -> i32 {
 block0(v0: i16):
@@ -88,8 +280,37 @@ block0(v0: i16):
   return v1
 }
 
-; check:  lhr %r2, %r2
-; nextln: br %r14
+; VCode:
+; block0:
+;   lhr %r2, %r2
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lhr %r2, %r2
+;   br %r14
+
+function %sextend_i8_i128(i8) -> i128 {
+block0(v0: i8):
+  v1 = sextend.i128 v0
+  return v1
+}
+
+; VCode:
+; block0:
+;   lgbr %r5, %r3
+;   srag %r3, %r5, 63
+;   vlvgp %v7, %r3, %r5
+;   vst %v7, 0(%r2)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lgbr %r5, %r3
+;   srag %r3, %r5, 0x3f
+;   vlvgp %v7, %r3, %r5
+;   vst %v7, 0(%r2)
+;   br %r14
 
 function %sextend_i8_i64(i8) -> i64 {
 block0(v0: i8):
@@ -97,8 +318,15 @@ block0(v0: i8):
   return v1
 }
 
-; check:  lgbr %r2, %r2
-; nextln: br %r14
+; VCode:
+; block0:
+;   lgbr %r2, %r2
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lgbr %r2, %r2
+;   br %r14
 
 function %sextend_i8_i32(i8) -> i32 {
 block0(v0: i8):
@@ -106,8 +334,15 @@ block0(v0: i8):
   return v1
 }
 
-; check:  lbr %r2, %r2
-; nextln: br %r14
+; VCode:
+; block0:
+;   lbr %r2, %r2
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lbr %r2, %r2
+;   br %r14
 
 function %sextend_i8_i16(i8) -> i16 {
 block0(v0: i8):
@@ -115,13 +350,87 @@ block0(v0: i8):
   return v1
 }
 
-; check:  lbr %r2, %r2
-; nextln: br %r14
+; VCode:
+; block0:
+;   lbr %r2, %r2
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lbr %r2, %r2
+;   br %r14
 
+function %ireduce_i128_i64(i128) -> i64 {
+block0(v0: i128):
+  v1 = ireduce.i64 v0
+  return v1
+}
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; IREDUCE
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; VCode:
+; block0:
+;   vl %v1, 0(%r2)
+;   vlgvg %r2, %v1, 1
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   vl %v1, 0(%r2)
+;   vlgvg %r2, %v1, 1
+;   br %r14
+
+function %ireduce_i128_i32(i128) -> i32 {
+block0(v0: i128):
+  v1 = ireduce.i32 v0
+  return v1
+}
+
+; VCode:
+; block0:
+;   vl %v1, 0(%r2)
+;   vlgvg %r2, %v1, 1
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   vl %v1, 0(%r2)
+;   vlgvg %r2, %v1, 1
+;   br %r14
+
+function %ireduce_i128_i16(i128) -> i16 {
+block0(v0: i128):
+  v1 = ireduce.i16 v0
+  return v1
+}
+
+; VCode:
+; block0:
+;   vl %v1, 0(%r2)
+;   vlgvg %r2, %v1, 1
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   vl %v1, 0(%r2)
+;   vlgvg %r2, %v1, 1
+;   br %r14
+
+function %ireduce_i128_i8(i128) -> i8 {
+block0(v0: i128):
+  v1 = ireduce.i8 v0
+  return v1
+}
+
+; VCode:
+; block0:
+;   vl %v1, 0(%r2)
+;   vlgvg %r2, %v1, 1
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   vl %v1, 0(%r2)
+;   vlgvg %r2, %v1, 1
+;   br %r14
 
 function %ireduce_i64_i32(i64, i64) -> i32 {
 block0(v0: i64, v1: i64):
@@ -129,8 +438,15 @@ block0(v0: i64, v1: i64):
   return v2
 }
 
-; check:  lr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   lgr %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lgr %r2, %r3
+;   br %r14
 
 function %ireduce_i64_i16(i64, i64) -> i16 {
 block0(v0: i64, v1: i64):
@@ -138,8 +454,15 @@ block0(v0: i64, v1: i64):
   return v2
 }
 
-; check:  lr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   lgr %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lgr %r2, %r3
+;   br %r14
 
 function %ireduce_i64_i8(i64, i64) -> i8 {
 block0(v0: i64, v1: i64):
@@ -147,8 +470,15 @@ block0(v0: i64, v1: i64):
   return v2
 }
 
-; check:  lr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   lgr %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lgr %r2, %r3
+;   br %r14
 
 function %ireduce_i32_i16(i32, i32) -> i16 {
 block0(v0: i32, v1: i32):
@@ -156,8 +486,15 @@ block0(v0: i32, v1: i32):
   return v2
 }
 
-; check:  lr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   lgr %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lgr %r2, %r3
+;   br %r14
 
 function %ireduce_i32_i8(i32, i32) -> i8 {
 block0(v0: i32, v1: i32):
@@ -165,8 +502,15 @@ block0(v0: i32, v1: i32):
   return v2
 }
 
-; check:  lr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   lgr %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lgr %r2, %r3
+;   br %r14
 
 function %ireduce_i16_i8(i16, i16) -> i8 {
 block0(v0: i16, v1: i16):
@@ -174,575 +518,687 @@ block0(v0: i16, v1: i16):
   return v2
 }
 
-; check:  lr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   lgr %r2, %r3
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lgr %r2, %r3
+;   br %r14
 
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; BEXTEND
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-function %bextend_b32_b64(b32) -> b64 {
-block0(v0: b32):
-  v1 = bextend.b64 v0
+function %bmask_i128_i128(i128) -> i128 {
+block0(v0: i128):
+  v1 = bmask.i128 v0
   return v1
 }
 
-; check:  lgfr %r2, %r2
-; nextln: br %r14
+; VCode:
+; block0:
+;   vl %v1, 0(%r3)
+;   vgbm %v4, 0
+;   vceqgs %v6, %v1, %v4
+;   lghi %r3, 0
+;   locghine %r3, -1
+;   vlvgp %v20, %r3, %r3
+;   vst %v20, 0(%r2)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   vl %v1, 0(%r3)
+;   vzero %v4
+;   vceqgs %v6, %v1, %v4
+;   lghi %r3, 0
+;   locghine %r3, -1
+;   vlvgp %v20, %r3, %r3
+;   vst %v20, 0(%r2)
+;   br %r14
 
-function %bextend_b16_b64(b16) -> b64 {
-block0(v0: b16):
-  v1 = bextend.b64 v0
+function %bmask_i128_i64(i128) -> i64 {
+block0(v0: i128):
+  v1 = bmask.i64 v0
   return v1
 }
 
-; check:  lghr %r2, %r2
-; nextln: br %r14
+; VCode:
+; block0:
+;   vl %v1, 0(%r2)
+;   vgbm %v3, 0
+;   vceqgs %v5, %v1, %v3
+;   lghi %r2, 0
+;   locghine %r2, -1
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   vl %v1, 0(%r2)
+;   vzero %v3
+;   vceqgs %v5, %v1, %v3
+;   lghi %r2, 0
+;   locghine %r2, -1
+;   br %r14
 
-function %bextend_b16_b32(b16) -> b32 {
-block0(v0: b16):
-  v1 = bextend.b32 v0
+function %bmask_i128_i32(i128) -> i32 {
+block0(v0: i128):
+  v1 = bmask.i32 v0
   return v1
 }
 
-; check:  lhr %r2, %r2
-; nextln: br %r14
+; VCode:
+; block0:
+;   vl %v1, 0(%r2)
+;   vgbm %v3, 0
+;   vceqgs %v5, %v1, %v3
+;   lhi %r2, 0
+;   lochine %r2, -1
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   vl %v1, 0(%r2)
+;   vzero %v3
+;   vceqgs %v5, %v1, %v3
+;   lhi %r2, 0
+;   lochine %r2, -1
+;   br %r14
 
-function %bextend_b8_b64(b8) -> b64 {
-block0(v0: b8):
-  v1 = bextend.b64 v0
+function %bmask_i128_i16(i128) -> i16 {
+block0(v0: i128):
+  v1 = bmask.i16 v0
   return v1
 }
 
-; check:  lgbr %r2, %r2
-; nextln: br %r14
+; VCode:
+; block0:
+;   vl %v1, 0(%r2)
+;   vgbm %v3, 0
+;   vceqgs %v5, %v1, %v3
+;   lhi %r2, 0
+;   lochine %r2, -1
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   vl %v1, 0(%r2)
+;   vzero %v3
+;   vceqgs %v5, %v1, %v3
+;   lhi %r2, 0
+;   lochine %r2, -1
+;   br %r14
 
-function %bextend_b8_b32(b8) -> b32 {
-block0(v0: b8):
-  v1 = bextend.b32 v0
+function %bmask_i128_i8(i128) -> i8 {
+block0(v0: i128):
+  v1 = bmask.i8 v0
   return v1
 }
 
-; check:  lbr %r2, %r2
-; nextln: br %r14
+; VCode:
+; block0:
+;   vl %v1, 0(%r2)
+;   vgbm %v3, 0
+;   vceqgs %v5, %v1, %v3
+;   lhi %r2, 0
+;   lochine %r2, -1
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   vl %v1, 0(%r2)
+;   vzero %v3
+;   vceqgs %v5, %v1, %v3
+;   lhi %r2, 0
+;   lochine %r2, -1
+;   br %r14
 
-function %bextend_b8_b16(b8) -> b16 {
-block0(v0: b8):
-  v1 = bextend.b16 v0
-  return v1
-}
-
-; check:  lbr %r2, %r2
-; nextln: br %r14
-
-function %bextend_b1_b64(b1) -> b64 {
-block0(v0: b1):
-  v1 = bextend.b64 v0
-  return v1
-}
-
-; check:  sllg %r2, %r2, 63
-; nextln: srag %r2, %r2, 63
-; nextln: br %r14
-
-function %bextend_b1_b32(b1) -> b32 {
-block0(v0: b1):
-  v1 = bextend.b32 v0
-  return v1
-}
-
-; check:  sllk %r2, %r2, 31
-; nextln: srak %r2, %r2, 31
-; nextln: br %r14
-
-function %bextend_b1_b16(b1) -> b16 {
-block0(v0: b1):
-  v1 = bextend.b16 v0
-  return v1
-}
-
-; check:  sllk %r2, %r2, 31
-; nextln: srak %r2, %r2, 31
-; nextln: br %r14
-
-function %bextend_b1_b8(b1) -> b8 {
-block0(v0: b1):
-  v1 = bextend.b8 v0
-  return v1
-}
-
-; check:  sllk %r2, %r2, 31
-; nextln: srak %r2, %r2, 31
-; nextln: br %r14
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; BREDUCE
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-function %breduce_b64_b32(b64, b64) -> b32 {
-block0(v0: b64, v1: b64):
-  v2 = breduce.b32 v1
+function %bmask_i64_i128(i64, i64) -> i128 {
+block0(v0: i64, v1: i64):
+  v2 = bmask.i128 v1
   return v2
 }
 
-; check:  lr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   cghi %r4, 0
+;   lghi %r3, 0
+;   locghilh %r3, -1
+;   vlvgp %v16, %r3, %r3
+;   vst %v16, 0(%r2)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   cghi %r4, 0
+;   lghi %r3, 0
+;   locghilh %r3, -1
+;   vlvgp %v16, %r3, %r3
+;   vst %v16, 0(%r2)
+;   br %r14
 
-function %breduce_b64_b16(b64, b64) -> b16 {
-block0(v0: b64, v1: b64):
-  v2 = breduce.b16 v1
-  return v2
-}
-
-; check:  lr %r2, %r3
-; nextln: br %r14
-
-function %breduce_b64_b8(b64, b64) -> b8 {
-block0(v0: b64, v1: b64):
-  v2 = breduce.b8 v1
-  return v2
-}
-
-; check:  lr %r2, %r3
-; nextln: br %r14
-
-function %breduce_b64_b1(b64, b64) -> b1 {
-block0(v0: b64, v1: b64):
-  v2 = breduce.b1 v1
-  return v2
-}
-
-; check:  lr %r2, %r3
-; nextln: br %r14
-
-function %breduce_b32_b16(b32, b32) -> b16 {
-block0(v0: b32, v1: b32):
-  v2 = breduce.b16 v1
-  return v2
-}
-
-; check:  lr %r2, %r3
-; nextln: br %r14
-
-function %breduce_b32_b8(b32, b32) -> b8 {
-block0(v0: b32, v1: b32):
-  v2 = breduce.b8 v1
-  return v2
-}
-
-; check:  lr %r2, %r3
-; nextln: br %r14
-
-function %breduce_b32_b1(b32, b32) -> b1 {
-block0(v0: b32, v1: b32):
-  v2 = breduce.b1 v1
-  return v2
-}
-
-; check:  lr %r2, %r3
-; nextln: br %r14
-
-function %breduce_b16_b8(b16, b16) -> b8 {
-block0(v0: b16, v1: b16):
-  v2 = breduce.b8 v1
-  return v2
-}
-
-; check:  lr %r2, %r3
-; nextln: br %r14
-
-function %breduce_b16_b1(b16, b16) -> b1 {
-block0(v0: b16, v1: b16):
-  v2 = breduce.b1 v1
-  return v2
-}
-
-; check:  lr %r2, %r3
-; nextln: br %r14
-
-function %breduce_b8_b1(b8, b8) -> b1 {
-block0(v0: b8, v1: b8):
-  v2 = breduce.b1 v1
-  return v2
-}
-
-; check:  lr %r2, %r3
-; nextln: br %r14
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; BMASK
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-function %bmask_b64_i64(b64, b64) -> i64 {
-block0(v0: b64, v1: b64):
+function %bmask_i64_i64(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
   v2 = bmask.i64 v1
   return v2
 }
 
-; check:  lgr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   cghi %r3, 0
+;   lghi %r2, 0
+;   locghilh %r2, -1
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   cghi %r3, 0
+;   lghi %r2, 0
+;   locghilh %r2, -1
+;   br %r14
 
-function %bmask_b64_i32(b64, b64) -> i32 {
-block0(v0: b64, v1: b64):
+function %bmask_i64_i32(i64, i64) -> i32 {
+block0(v0: i64, v1: i64):
   v2 = bmask.i32 v1
   return v2
 }
 
-; check:  lr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   cghi %r3, 0
+;   lhi %r2, 0
+;   lochilh %r2, -1
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   cghi %r3, 0
+;   lhi %r2, 0
+;   lochilh %r2, -1
+;   br %r14
 
-function %bmask_b64_i16(b64, b64) -> i16 {
-block0(v0: b64, v1: b64):
+function %bmask_i64_i16(i64, i64) -> i16 {
+block0(v0: i64, v1: i64):
   v2 = bmask.i16 v1
   return v2
 }
 
-; check:  lr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   cghi %r3, 0
+;   lhi %r2, 0
+;   lochilh %r2, -1
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   cghi %r3, 0
+;   lhi %r2, 0
+;   lochilh %r2, -1
+;   br %r14
 
-function %bmask_b64_i8(b64, b64) -> i8 {
-block0(v0: b64, v1: b64):
+function %bmask_i64_i8(i64, i64) -> i8 {
+block0(v0: i64, v1: i64):
   v2 = bmask.i8 v1
   return v2
 }
 
-; check:  lr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   cghi %r3, 0
+;   lhi %r2, 0
+;   lochilh %r2, -1
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   cghi %r3, 0
+;   lhi %r2, 0
+;   lochilh %r2, -1
+;   br %r14
 
-function %bmask_b32_i64(b32, b32) -> i64 {
-block0(v0: b32, v1: b32):
+function %bmask_i32_i128(i32, i32) -> i128 {
+block0(v0: i32, v1: i32):
+  v2 = bmask.i128 v1
+  return v2
+}
+
+; VCode:
+; block0:
+;   chi %r4, 0
+;   lghi %r3, 0
+;   locghilh %r3, -1
+;   vlvgp %v16, %r3, %r3
+;   vst %v16, 0(%r2)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   chi %r4, 0
+;   lghi %r3, 0
+;   locghilh %r3, -1
+;   vlvgp %v16, %r3, %r3
+;   vst %v16, 0(%r2)
+;   br %r14
+
+function %bmask_i32_i64(i32, i32) -> i64 {
+block0(v0: i32, v1: i32):
   v2 = bmask.i64 v1
   return v2
 }
 
-; check:  lgfr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   chi %r3, 0
+;   lghi %r2, 0
+;   locghilh %r2, -1
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   chi %r3, 0
+;   lghi %r2, 0
+;   locghilh %r2, -1
+;   br %r14
 
-function %bmask_b32_i32(b32, b32) -> i32 {
-block0(v0: b32, v1: b32):
+function %bmask_i32_i32(i32, i32) -> i32 {
+block0(v0: i32, v1: i32):
   v2 = bmask.i32 v1
   return v2
 }
 
-; check:  lr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   chi %r3, 0
+;   lhi %r2, 0
+;   lochilh %r2, -1
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   chi %r3, 0
+;   lhi %r2, 0
+;   lochilh %r2, -1
+;   br %r14
 
-function %bmask_b32_i16(b32, b32) -> i16 {
-block0(v0: b32, v1: b32):
+function %bmask_i32_i16(i32, i32) -> i16 {
+block0(v0: i32, v1: i32):
   v2 = bmask.i16 v1
   return v2
 }
 
-; check:  lr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   chi %r3, 0
+;   lhi %r2, 0
+;   lochilh %r2, -1
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   chi %r3, 0
+;   lhi %r2, 0
+;   lochilh %r2, -1
+;   br %r14
 
-function %bmask_b32_i8(b32, b32) -> i8 {
-block0(v0: b32, v1: b32):
+function %bmask_i32_i8(i32, i32) -> i8 {
+block0(v0: i32, v1: i32):
   v2 = bmask.i8 v1
   return v2
 }
 
-; check:  lr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   chi %r3, 0
+;   lhi %r2, 0
+;   lochilh %r2, -1
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   chi %r3, 0
+;   lhi %r2, 0
+;   lochilh %r2, -1
+;   br %r14
 
-function %bmask_b16_i64(b16, b16) -> i64 {
-block0(v0: b16, v1: b16):
+function %bmask_i16_i128(i16, i16) -> i128 {
+block0(v0: i16, v1: i16):
+  v2 = bmask.i128 v1
+  return v2
+}
+
+; VCode:
+; block0:
+;   lhr %r5, %r4
+;   chi %r5, 0
+;   lghi %r5, 0
+;   locghilh %r5, -1
+;   vlvgp %v18, %r5, %r5
+;   vst %v18, 0(%r2)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lhr %r5, %r4
+;   chi %r5, 0
+;   lghi %r5, 0
+;   locghilh %r5, -1
+;   vlvgp %v18, %r5, %r5
+;   vst %v18, 0(%r2)
+;   br %r14
+
+function %bmask_i16_i64(i16, i16) -> i64 {
+block0(v0: i16, v1: i16):
   v2 = bmask.i64 v1
   return v2
 }
 
-; check:  lghr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   lhr %r4, %r3
+;   chi %r4, 0
+;   lghi %r2, 0
+;   locghilh %r2, -1
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lhr %r4, %r3
+;   chi %r4, 0
+;   lghi %r2, 0
+;   locghilh %r2, -1
+;   br %r14
 
-function %bmask_b16_i32(b16, b16) -> i32 {
-block0(v0: b16, v1: b16):
+function %bmask_i16_i32(i16, i16) -> i32 {
+block0(v0: i16, v1: i16):
   v2 = bmask.i32 v1
   return v2
 }
 
-; check:  lhr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   lhr %r4, %r3
+;   chi %r4, 0
+;   lhi %r2, 0
+;   lochilh %r2, -1
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lhr %r4, %r3
+;   chi %r4, 0
+;   lhi %r2, 0
+;   lochilh %r2, -1
+;   br %r14
 
-function %bmask_b16_i16(b16, b16) -> i16 {
-block0(v0: b16, v1: b16):
+function %bmask_i16_i16(i16, i16) -> i16 {
+block0(v0: i16, v1: i16):
   v2 = bmask.i16 v1
   return v2
 }
 
-; check:  lr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   lhr %r4, %r3
+;   chi %r4, 0
+;   lhi %r2, 0
+;   lochilh %r2, -1
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lhr %r4, %r3
+;   chi %r4, 0
+;   lhi %r2, 0
+;   lochilh %r2, -1
+;   br %r14
 
-function %bmask_b16_i8(b16, b16) -> i8 {
-block0(v0: b16, v1: b16):
+function %bmask_i16_i8(i16, i16) -> i8 {
+block0(v0: i16, v1: i16):
   v2 = bmask.i8 v1
   return v2
 }
 
-; check:  lr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   lhr %r4, %r3
+;   chi %r4, 0
+;   lhi %r2, 0
+;   lochilh %r2, -1
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lhr %r4, %r3
+;   chi %r4, 0
+;   lhi %r2, 0
+;   lochilh %r2, -1
+;   br %r14
 
-function %bmask_b8_i64(b8, b8) -> i64 {
-block0(v0: b8, v1: b8):
+function %bmask_i8_i128(i8, i8) -> i128 {
+block0(v0: i8, v1: i8):
+  v2 = bmask.i128 v1
+  return v2
+}
+
+; VCode:
+; block0:
+;   lbr %r5, %r4
+;   chi %r5, 0
+;   lghi %r5, 0
+;   locghilh %r5, -1
+;   vlvgp %v18, %r5, %r5
+;   vst %v18, 0(%r2)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lbr %r5, %r4
+;   chi %r5, 0
+;   lghi %r5, 0
+;   locghilh %r5, -1
+;   vlvgp %v18, %r5, %r5
+;   vst %v18, 0(%r2)
+;   br %r14
+
+function %bmask_i8_i64(i8, i8) -> i64 {
+block0(v0: i8, v1: i8):
   v2 = bmask.i64 v1
   return v2
 }
 
-; check:  lgbr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   lbr %r4, %r3
+;   chi %r4, 0
+;   lghi %r2, 0
+;   locghilh %r2, -1
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lbr %r4, %r3
+;   chi %r4, 0
+;   lghi %r2, 0
+;   locghilh %r2, -1
+;   br %r14
 
-function %bmask_b8_i32(b8, b8) -> i32 {
-block0(v0: b8, v1: b8):
+function %bmask_i8_i32(i8, i8) -> i32 {
+block0(v0: i8, v1: i8):
   v2 = bmask.i32 v1
   return v2
 }
 
-; check:  lbr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   lbr %r4, %r3
+;   chi %r4, 0
+;   lhi %r2, 0
+;   lochilh %r2, -1
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lbr %r4, %r3
+;   chi %r4, 0
+;   lhi %r2, 0
+;   lochilh %r2, -1
+;   br %r14
 
-function %bmask_b8_i16(b8, b8) -> i16 {
-block0(v0: b8, v1: b8):
+function %bmask_i8_i16(i8, i8) -> i16 {
+block0(v0: i8, v1: i8):
   v2 = bmask.i16 v1
   return v2
 }
 
-; check:  lbr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   lbr %r4, %r3
+;   chi %r4, 0
+;   lhi %r2, 0
+;   lochilh %r2, -1
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lbr %r4, %r3
+;   chi %r4, 0
+;   lhi %r2, 0
+;   lochilh %r2, -1
+;   br %r14
 
-function %bmask_b8_i8(b8, b8) -> i8 {
-block0(v0: b8, v1: b8):
+function %bmask_i8_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
   v2 = bmask.i8 v1
   return v2
 }
 
-; check:  lr %r2, %r3
-; nextln: br %r14
+; VCode:
+; block0:
+;   lbr %r4, %r3
+;   chi %r4, 0
+;   lhi %r2, 0
+;   lochilh %r2, -1
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lbr %r4, %r3
+;   chi %r4, 0
+;   lhi %r2, 0
+;   lochilh %r2, -1
+;   br %r14
 
-function %bmask_b1_i64(b1, b1) -> i64 {
-block0(v0: b1, v1: b1):
+function %bmask_i8_i128(i8, i8) -> i128 {
+block0(v0: i8, v1: i8):
+  v2 = bmask.i128 v1
+  return v2
+}
+
+; VCode:
+; block0:
+;   lbr %r5, %r4
+;   chi %r5, 0
+;   lghi %r5, 0
+;   locghilh %r5, -1
+;   vlvgp %v18, %r5, %r5
+;   vst %v18, 0(%r2)
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lbr %r5, %r4
+;   chi %r5, 0
+;   lghi %r5, 0
+;   locghilh %r5, -1
+;   vlvgp %v18, %r5, %r5
+;   vst %v18, 0(%r2)
+;   br %r14
+
+function %bmask_i8_i64(i8, i8) -> i64 {
+block0(v0: i8, v1: i8):
   v2 = bmask.i64 v1
   return v2
 }
 
-; check:  sllg %r2, %r3, 63
-; nextln: srag %r2, %r2, 63
-; nextln: br %r14
+; VCode:
+; block0:
+;   lbr %r4, %r3
+;   chi %r4, 0
+;   lghi %r2, 0
+;   locghilh %r2, -1
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lbr %r4, %r3
+;   chi %r4, 0
+;   lghi %r2, 0
+;   locghilh %r2, -1
+;   br %r14
 
-function %bmask_b1_i32(b1, b1) -> i32 {
-block0(v0: b1, v1: b1):
+function %bmask_i8_i32(i8, i8) -> i32 {
+block0(v0: i8, v1: i8):
   v2 = bmask.i32 v1
   return v2
 }
 
-; check:  sllk %r2, %r3, 31
-; nextln: srak %r2, %r2, 31
-; nextln: br %r14
+; VCode:
+; block0:
+;   lbr %r4, %r3
+;   chi %r4, 0
+;   lhi %r2, 0
+;   lochilh %r2, -1
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lbr %r4, %r3
+;   chi %r4, 0
+;   lhi %r2, 0
+;   lochilh %r2, -1
+;   br %r14
 
-function %bmask_b1_i16(b1, b1) -> i16 {
-block0(v0: b1, v1: b1):
+function %bmask_i8_i16(i8, i8) -> i16 {
+block0(v0: i8, v1: i8):
   v2 = bmask.i16 v1
   return v2
 }
 
-; check:  sllk %r2, %r3, 31
-; nextln: srak %r2, %r2, 31
-; nextln: br %r14
+; VCode:
+; block0:
+;   lbr %r4, %r3
+;   chi %r4, 0
+;   lhi %r2, 0
+;   lochilh %r2, -1
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lbr %r4, %r3
+;   chi %r4, 0
+;   lhi %r2, 0
+;   lochilh %r2, -1
+;   br %r14
 
-function %bmask_b1_i8(b1, b1) -> i8 {
-block0(v0: b1, v1: b1):
+function %bmask_i8_i8(i8, i8) -> i8 {
+block0(v0: i8, v1: i8):
   v2 = bmask.i8 v1
   return v2
 }
 
-; check:  sllk %r2, %r3, 31
-; nextln: srak %r2, %r2, 31
-; nextln: br %r14
-
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;; BINT
-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-
-function %bint_b64_i64(b64) -> i64 {
-block0(v0: b64):
-  v1 = bint.i64 v0
-  return v1
-}
-
-; check:  lghi %r3, 1
-; nextln: ngr %r2, %r3
-; nextln: br %r14
-
-function %bint_b64_i32(b64) -> i32 {
-block0(v0: b64):
-  v1 = bint.i32 v0
-  return v1
-}
-
-; check:  nilf %r2, 1
-; nextln: br %r14
-
-function %bint_b64_i16(b64) -> i16 {
-block0(v0: b64):
-  v1 = bint.i16 v0
-  return v1
-}
-
-; check:  nill %r2, 1
-; nextln: br %r14
-
-function %bint_b64_i8(b64) -> i8 {
-block0(v0: b64):
-  v1 = bint.i8 v0
-  return v1
-}
-
-; check:  nill %r2, 1
-; nextln: br %r14
-
-function %bint_b32_i64(b32) -> i64 {
-block0(v0: b32):
-  v1 = bint.i64 v0
-  return v1
-}
-
-; check:  lghi %r3, 1
-; nextln: ngr %r2, %r3
-; nextln: br %r14
-
-function %bint_b32_i32(b32) -> i32 {
-block0(v0: b32):
-  v1 = bint.i32 v0
-  return v1
-}
-
-; check:  nilf %r2, 1
-; nextln: br %r14
-
-function %bint_b32_i16(b32) -> i16 {
-block0(v0: b32):
-  v1 = bint.i16 v0
-  return v1
-}
-
-; check:  nill %r2, 1
-; nextln: br %r14
-
-function %bint_b32_i8(b32) -> i8 {
-block0(v0: b32):
-  v1 = bint.i8 v0
-  return v1
-}
-
-; check:  nill %r2, 1
-; nextln: br %r14
-
-function %bint_b16_i64(b16) -> i64 {
-block0(v0: b16):
-  v1 = bint.i64 v0
-  return v1
-}
-
-; check:  lghi %r3, 1
-; nextln: ngr %r2, %r3
-; nextln: br %r14
-
-function %bint_b16_i32(b16) -> i32 {
-block0(v0: b16):
-  v1 = bint.i32 v0
-  return v1
-}
-
-; check:  nilf %r2, 1
-; nextln: br %r14
-
-function %bint_b16_i16(b16) -> i16 {
-block0(v0: b16):
-  v1 = bint.i16 v0
-  return v1
-}
-
-; check:  nill %r2, 1
-; nextln: br %r14
-
-function %bint_b16_i8(b16) -> i8 {
-block0(v0: b16):
-  v1 = bint.i8 v0
-  return v1
-}
-
-; check:  nill %r2, 1
-; nextln: br %r14
-
-function %bint_b8_i64(b8) -> i64 {
-block0(v0: b8):
-  v1 = bint.i64 v0
-  return v1
-}
-
-; check:  lghi %r3, 1
-; nextln: ngr %r2, %r3
-; nextln: br %r14
-
-function %bint_b8_i32(b8) -> i32 {
-block0(v0: b8):
-  v1 = bint.i32 v0
-  return v1
-}
-
-; check:  nilf %r2, 1
-; nextln: br %r14
-
-function %bint_b8_i16(b8) -> i16 {
-block0(v0: b8):
-  v1 = bint.i16 v0
-  return v1
-}
-
-; check:  nill %r2, 1
-; nextln: br %r14
-
-function %bint_b8_i8(b8) -> i8 {
-block0(v0: b8):
-  v1 = bint.i8 v0
-  return v1
-}
-
-; check:  nill %r2, 1
-; nextln: br %r14
-
-function %bint_b1_i64(b1) -> i64 {
-block0(v0: b1):
-  v1 = bint.i64 v0
-  return v1
-}
-
-; check:  lghi %r3, 1
-; nextln: ngr %r2, %r3
-; nextln: br %r14
-
-function %bint_b1_i32(b1) -> i32 {
-block0(v0: b1):
-  v1 = bint.i32 v0
-  return v1
-}
-
-; check:  nilf %r2, 1
-; nextln: br %r14
-
-function %bint_b1_i16(b1) -> i16 {
-block0(v0: b1):
-  v1 = bint.i16 v0
-  return v1
-}
-
-; check:  nill %r2, 1
-; nextln: br %r14
-
-function %bint_b1_i8(b1) -> i8 {
-block0(v0: b1):
-  v1 = bint.i8 v0
-  return v1
-}
-
-; check:  nill %r2, 1
-; nextln: br %r14
+; VCode:
+; block0:
+;   lbr %r4, %r3
+;   chi %r4, 0
+;   lhi %r2, 0
+;   lochilh %r2, -1
+;   br %r14
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   lbr %r4, %r3
+;   chi %r4, 0
+;   lhi %r2, 0
+;   lochilh %r2, -1
+;   br %r14
 

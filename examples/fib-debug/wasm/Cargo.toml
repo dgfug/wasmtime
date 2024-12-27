@@ -2,8 +2,11 @@
 name = "example-fib-debug-wasm"
 version = "0.0.0"
 authors = ["The Wasmtime Project Developers"]
-edition = "2018"
+edition = "2021"
 publish = false
+
+[lints]
+workspace = true
 
 [lib]
 crate-type = ["cdylib"]

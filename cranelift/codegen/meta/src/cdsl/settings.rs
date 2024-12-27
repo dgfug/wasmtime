@@ -66,7 +66,7 @@ impl Setting {
     }
 }
 
-#[derive(Hash, PartialEq, Eq)]
+#[derive(Hash, PartialEq, Eq, Copy, Clone)]
 pub(crate) struct PresetIndex(usize);
 
 #[derive(Hash, PartialEq, Eq)]
@@ -75,14 +75,14 @@ pub(crate) enum PresetType {
     OtherPreset(PresetIndex),
 }
 
-impl Into<PresetType> for BoolSettingIndex {
-    fn into(self) -> PresetType {
-        PresetType::BoolSetting(self)
+impl From<BoolSettingIndex> for PresetType {
+    fn from(bool_setting_index: BoolSettingIndex) -> Self {
+        PresetType::BoolSetting(bool_setting_index)
     }
 }
-impl Into<PresetType> for PresetIndex {
-    fn into(self) -> PresetType {
-        PresetType::OtherPreset(self)
+impl From<PresetIndex> for PresetType {
+    fn from(value: PresetIndex) -> Self {
+        PresetType::OtherPreset(value)
     }
 }
 
@@ -110,6 +110,15 @@ impl Preset {
         }
         layout
     }
+
+    pub fn setting_names<'a>(
+        &'a self,
+        group: &'a SettingGroup,
+    ) -> impl Iterator<Item = &'static str> + 'a {
+        self.values
+            .iter()
+            .map(|bool_index| group.settings[bool_index.0].name)
+    }
 }
 
 pub(crate) struct SettingGroup {
@@ -125,30 +134,13 @@ impl SettingGroup {
     fn num_bool_settings(&self) -> u8 {
         self.settings
             .iter()
-            .filter(|s| {
-                if let SpecificSetting::Bool(_) = s.specific {
-                    true
-                } else {
-                    false
-                }
-            })
+            .filter(|s| matches!(s.specific, SpecificSetting::Bool(_)))
             .count() as u8
     }
 
     pub fn byte_size(&self) -> u8 {
         let num_predicates = self.num_bool_settings() + (self.predicates.len() as u8);
         self.bool_start_byte_offset + (num_predicates + 7) / 8
-    }
-
-    pub fn get_bool(&self, name: &'static str) -> (BoolSettingIndex, &Self) {
-        for (i, s) in self.settings.iter().enumerate() {
-            if let SpecificSetting::Bool(_) = s.specific {
-                if s.name == name {
-                    return (BoolSettingIndex(i), self);
-                }
-            }
-        }
-        panic!("Should have found bool setting by name.");
     }
 }
 
@@ -172,18 +164,18 @@ struct ProtoSetting {
 pub(crate) enum PredicateNode {
     OwnedBool(BoolSettingIndex),
     SharedBool(&'static str, &'static str),
-    Not(Box<PredicateNode>),
     And(Box<PredicateNode>, Box<PredicateNode>),
 }
 
-impl Into<PredicateNode> for BoolSettingIndex {
-    fn into(self) -> PredicateNode {
-        PredicateNode::OwnedBool(self)
+impl From<BoolSettingIndex> for PredicateNode {
+    fn from(bool_setting_index: BoolSettingIndex) -> Self {
+        PredicateNode::OwnedBool(bool_setting_index)
     }
 }
-impl<'a> Into<PredicateNode> for (BoolSettingIndex, &'a SettingGroup) {
-    fn into(self) -> PredicateNode {
-        let (index, group) = (self.0, self.1);
+
+impl<'a> From<(BoolSettingIndex, &'a SettingGroup)> for PredicateNode {
+    fn from(val: (BoolSettingIndex, &'a SettingGroup)) -> Self {
+        let (index, group) = (val.0, val.1);
         let setting = &group.settings[index.0];
         PredicateNode::SharedBool(group.name, setting.name)
     }
@@ -197,12 +189,11 @@ impl PredicateNode {
                 group.name, group.settings[bool_setting_index.0].name
             ),
             PredicateNode::SharedBool(ref group_name, ref bool_name) => {
-                format!("{}.{}()", group_name, bool_name)
+                format!("{group_name}.{bool_name}()")
             }
             PredicateNode::And(ref lhs, ref rhs) => {
                 format!("{} && {}", lhs.render(group), rhs.render(group))
             }
-            PredicateNode::Not(ref node) => format!("!({})", node.render(group)),
         }
     }
 }

@@ -1,9 +1,6 @@
 use cranelift_codegen::ir::*;
 use cranelift_codegen::isa::CallConv;
-use cranelift_codegen::{
-    binemit::{NullStackMapSink, NullTrapSink},
-    settings,
-};
+use cranelift_codegen::settings;
 use cranelift_codegen::{ir::types::I16, Context};
 use cranelift_entity::EntityRef;
 use cranelift_frontend::*;
@@ -14,7 +11,9 @@ use cranelift_object::*;
 fn error_on_incompatible_sig_in_declare_function() {
     let flag_builder = settings::builder();
     let isa_builder = cranelift_codegen::isa::lookup_by_name("x86_64-unknown-linux-gnu").unwrap();
-    let isa = isa_builder.finish(settings::Flags::new(flag_builder));
+    let isa = isa_builder
+        .finish(settings::Flags::new(flag_builder))
+        .unwrap();
     let mut module =
         ObjectModule::new(ObjectBuilder::new(isa, "foo", default_libcall_names()).unwrap());
     let mut sig = Signature {
@@ -44,7 +43,7 @@ fn define_simple_function(module: &mut ObjectModule) -> FuncId {
         .unwrap();
 
     let mut ctx = Context::new();
-    ctx.func = Function::with_name_signature(ExternalName::user(0, func_id.as_u32()), sig);
+    ctx.func = Function::with_name_signature(UserFuncName::user(0, func_id.as_u32()), sig);
     let mut func_ctx = FunctionBuilderContext::new();
     {
         let mut bcx: FunctionBuilder = FunctionBuilder::new(&mut ctx.func, &mut func_ctx);
@@ -53,11 +52,7 @@ fn define_simple_function(module: &mut ObjectModule) -> FuncId {
         bcx.ins().return_(&[]);
     }
 
-    let mut trap_sink = NullTrapSink {};
-    let mut stack_map_sink = NullStackMapSink {};
-    module
-        .define_function(func_id, &mut ctx, &mut trap_sink, &mut stack_map_sink)
-        .unwrap();
+    module.define_function(func_id, &mut ctx).unwrap();
 
     func_id
 }
@@ -67,7 +62,9 @@ fn define_simple_function(module: &mut ObjectModule) -> FuncId {
 fn panic_on_define_after_finalize() {
     let flag_builder = settings::builder();
     let isa_builder = cranelift_codegen::isa::lookup_by_name("x86_64-unknown-linux-gnu").unwrap();
-    let isa = isa_builder.finish(settings::Flags::new(flag_builder));
+    let isa = isa_builder
+        .finish(settings::Flags::new(flag_builder))
+        .unwrap();
     let mut module =
         ObjectModule::new(ObjectBuilder::new(isa, "foo", default_libcall_names()).unwrap());
 
@@ -85,8 +82,7 @@ fn switch_error() {
         call_conv: CallConv::SystemV,
     };
 
-    let mut func = Function::with_name_signature(ExternalName::user(0, 0), sig);
-
+    let mut func = Function::with_name_signature(UserFuncName::default(), sig);
     let mut func_ctx = FunctionBuilderContext::new();
     {
         let mut bcx: FunctionBuilder = FunctionBuilder::new(&mut func, &mut func_ctx);
@@ -95,7 +91,7 @@ fn switch_error() {
         let bb1 = bcx.create_block();
         let bb2 = bcx.create_block();
         let bb3 = bcx.create_block();
-        println!("{} {} {} {} {}", start, bb0, bb1, bb2, bb3);
+        println!("{start} {bb0} {bb1} {bb2} {bb3}");
 
         bcx.declare_var(Variable::new(0), types::I32);
         bcx.declare_var(Variable::new(1), types::I32);
@@ -143,7 +139,7 @@ fn switch_error() {
         Err(err) => {
             let pretty_error =
                 cranelift_codegen::print_errors::pretty_verifier_error(&func, None, err);
-            panic!("pretty_error:\n{}", pretty_error);
+            panic!("pretty_error:\n{pretty_error}");
         }
     }
 }
@@ -152,7 +148,9 @@ fn switch_error() {
 fn libcall_function() {
     let flag_builder = settings::builder();
     let isa_builder = cranelift_codegen::isa::lookup_by_name("x86_64-unknown-linux-gnu").unwrap();
-    let isa = isa_builder.finish(settings::Flags::new(flag_builder));
+    let isa = isa_builder
+        .finish(settings::Flags::new(flag_builder))
+        .unwrap();
     let mut module =
         ObjectModule::new(ObjectBuilder::new(isa, "foo", default_libcall_names()).unwrap());
 
@@ -167,7 +165,7 @@ fn libcall_function() {
         .unwrap();
 
     let mut ctx = Context::new();
-    ctx.func = Function::with_name_signature(ExternalName::user(0, func_id.as_u32()), sig);
+    ctx.func = Function::with_name_signature(UserFuncName::user(0, func_id.as_u32()), sig);
     let mut func_ctx = FunctionBuilderContext::new();
     {
         let mut bcx: FunctionBuilder = FunctionBuilder::new(&mut ctx.func, &mut func_ctx);
@@ -194,23 +192,19 @@ fn libcall_function() {
         bcx.ins().return_(&[]);
     }
 
-    let mut trap_sink = NullTrapSink {};
-    let mut stack_map_sink = NullStackMapSink {};
-    module
-        .define_function(func_id, &mut ctx, &mut trap_sink, &mut stack_map_sink)
-        .unwrap();
+    module.define_function(func_id, &mut ctx).unwrap();
 
     module.finish();
 }
 
 #[test]
-#[should_panic(
-    expected = "Result::unwrap()` on an `Err` value: Backend(Symbol \"function\\u{0}with\\u{0}nul\\u{0}bytes\" has a null byte, which is disallowed"
-)]
+#[should_panic(expected = "has a null byte, which is disallowed")]
 fn reject_nul_byte_symbol_for_func() {
     let flag_builder = settings::builder();
     let isa_builder = cranelift_codegen::isa::lookup_by_name("x86_64-unknown-linux-gnu").unwrap();
-    let isa = isa_builder.finish(settings::Flags::new(flag_builder));
+    let isa = isa_builder
+        .finish(settings::Flags::new(flag_builder))
+        .unwrap();
     let mut module =
         ObjectModule::new(ObjectBuilder::new(isa, "foo", default_libcall_names()).unwrap());
 
@@ -226,13 +220,13 @@ fn reject_nul_byte_symbol_for_func() {
 }
 
 #[test]
-#[should_panic(
-    expected = "Result::unwrap()` on an `Err` value: Backend(Symbol \"data\\u{0}with\\u{0}nul\\u{0}bytes\" has a null byte, which is disallowed"
-)]
+#[should_panic(expected = "has a null byte, which is disallowed")]
 fn reject_nul_byte_symbol_for_data() {
     let flag_builder = settings::builder();
     let isa_builder = cranelift_codegen::isa::lookup_by_name("x86_64-unknown-linux-gnu").unwrap();
-    let isa = isa_builder.finish(settings::Flags::new(flag_builder));
+    let isa = isa_builder
+        .finish(settings::Flags::new(flag_builder))
+        .unwrap();
     let mut module =
         ObjectModule::new(ObjectBuilder::new(isa, "foo", default_libcall_names()).unwrap());
 

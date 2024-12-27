@@ -2,7 +2,7 @@
 use core::fmt::{self, Display, Formatter};
 use core::str::FromStr;
 #[cfg(feature = "enable-serde")]
-use serde::{Deserialize, Serialize};
+use serde_derive::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
@@ -30,6 +30,25 @@ pub enum AtomicRmwOp {
     Smin,
     /// Signed max
     Smax,
+}
+
+impl AtomicRmwOp {
+    /// Returns a slice with all supported [AtomicRmwOp]'s.
+    pub fn all() -> &'static [AtomicRmwOp] {
+        &[
+            AtomicRmwOp::Add,
+            AtomicRmwOp::Sub,
+            AtomicRmwOp::And,
+            AtomicRmwOp::Nand,
+            AtomicRmwOp::Or,
+            AtomicRmwOp::Xor,
+            AtomicRmwOp::Xchg,
+            AtomicRmwOp::Umin,
+            AtomicRmwOp::Umax,
+            AtomicRmwOp::Smin,
+            AtomicRmwOp::Smax,
+        ]
+    }
 }
 
 impl Display for AtomicRmwOp {
@@ -67,6 +86,19 @@ impl FromStr for AtomicRmwOp {
             "smin" => Ok(AtomicRmwOp::Smin),
             "smax" => Ok(AtomicRmwOp::Smax),
             _ => Err(()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip_parse() {
+        for op in AtomicRmwOp::all() {
+            let roundtripped = format!("{op}").parse::<AtomicRmwOp>().unwrap();
+            assert_eq!(*op, roundtripped);
         }
     }
 }

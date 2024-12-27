@@ -3,10 +3,19 @@ use std::cell::UnsafeCell;
 use std::ffi::c_void;
 use std::sync::Arc;
 use wasmtime::{
-    AsContext, AsContextMut, InterruptHandle, Store, StoreContext, StoreContextMut, Val,
+    AsContext, AsContextMut, Caller, Store, StoreContext, StoreContextMut, StoreLimits,
+    StoreLimitsBuilder, UpdateDeadline, Val,
 };
 
-/// This representation of a `Store` is used to implement the `wasm.h` API.
+// Store-related type aliases for `wasm.h` APIs. Not for use with `wasmtime.h`
+// APIs!
+pub type WasmStoreData = ();
+pub type WasmStore = Store<WasmStoreData>;
+pub type WasmStoreContext<'a> = StoreContext<'a, WasmStoreData>;
+pub type WasmStoreContextMut<'a> = StoreContextMut<'a, WasmStoreData>;
+
+/// This representation of a `Store` is used to implement the `wasm.h` API (and
+/// *not* the `wasmtime.h` API!)
 ///
 /// This is stored alongside `Func` and such for `wasm.h` so each object is
 /// independently owned. The usage of `Arc` here is mostly to just get it to be
@@ -17,16 +26,16 @@ use wasmtime::{
 /// The aliasing requirements are documented in the C API `wasm.h` itself (at
 /// least Wasmtime's implementation).
 #[derive(Clone)]
-pub struct StoreRef {
-    store: Arc<UnsafeCell<Store<()>>>,
+pub struct WasmStoreRef {
+    store: Arc<UnsafeCell<WasmStore>>,
 }
 
-impl StoreRef {
-    pub unsafe fn context(&self) -> StoreContext<'_, ()> {
+impl WasmStoreRef {
+    pub unsafe fn context(&self) -> WasmStoreContext<'_> {
         (*self.store.get()).as_context()
     }
 
-    pub unsafe fn context_mut(&mut self) -> StoreContextMut<'_, ()> {
+    pub unsafe fn context_mut(&mut self) -> WasmStoreContextMut<'_> {
         (*self.store.get()).as_context_mut()
     }
 }
@@ -34,7 +43,7 @@ impl StoreRef {
 #[repr(C)]
 #[derive(Clone)]
 pub struct wasm_store_t {
-    pub(crate) store: StoreRef,
+    pub(crate) store: WasmStoreRef,
 }
 
 wasmtime_c_api_macros::declare_own!(wasm_store_t);
@@ -44,31 +53,37 @@ pub extern "C" fn wasm_store_new(engine: &wasm_engine_t) -> Box<wasm_store_t> {
     let engine = &engine.engine;
     let store = Store::new(engine, ());
     Box::new(wasm_store_t {
-        store: StoreRef {
+        store: WasmStoreRef {
             store: Arc::new(UnsafeCell::new(store)),
         },
     })
 }
+
+// Store-related type aliases for `wasmtime.h` APIs. Not for use with `wasm.h`
+// APIs!
+pub type WasmtimeStore = Store<WasmtimeStoreData>;
+pub type WasmtimeStoreContext<'a> = StoreContext<'a, WasmtimeStoreData>;
+pub type WasmtimeStoreContextMut<'a> = StoreContextMut<'a, WasmtimeStoreData>;
+pub type WasmtimeCaller<'a> = Caller<'a, WasmtimeStoreData>;
 
 /// Representation of a `Store` for `wasmtime.h` This notably tries to move more
 /// burden of aliasing on the caller rather than internally, allowing for a more
 /// raw representation of contexts and such that requires less `unsafe` in the
 /// implementation.
 ///
-/// Note that this notably carries `StoreData` as a payload which allows storing
-/// foreign data and configuring WASI as well.
+/// Note that this notably carries `WasmtimeStoreData` as a payload which allows
+/// storing foreign data and configuring WASI as well.
 #[repr(C)]
 pub struct wasmtime_store_t {
-    pub(crate) store: Store<StoreData>,
+    pub(crate) store: WasmtimeStore,
 }
 
-pub type CStoreContext<'a> = StoreContext<'a, StoreData>;
-pub type CStoreContextMut<'a> = StoreContextMut<'a, StoreData>;
+wasmtime_c_api_macros::declare_own!(wasmtime_store_t);
 
-pub struct StoreData {
+pub struct WasmtimeStoreData {
     foreign: crate::ForeignData,
     #[cfg(feature = "wasi")]
-    pub(crate) wasi: Option<wasmtime_wasi::WasiCtx>,
+    pub(crate) wasi: Option<wasmtime_wasi::preview1::WasiP1Ctx>,
 
     /// Temporary storage for usage during a wasm->host call to store values
     /// in a slice we pass to the C API.
@@ -77,10 +92,10 @@ pub struct StoreData {
     /// Temporary storage for usage during host->wasm calls, same as above but
     /// for a different direction.
     pub wasm_val_storage: Vec<Val>,
-}
 
-#[no_mangle]
-pub extern "C" fn wasmtime_store_delete(_: Box<wasmtime_store_t>) {}
+    /// Limits for the store.
+    pub store_limits: StoreLimits,
+}
 
 #[no_mangle]
 pub extern "C" fn wasmtime_store_new(
@@ -91,36 +106,112 @@ pub extern "C" fn wasmtime_store_new(
     Box::new(wasmtime_store_t {
         store: Store::new(
             &engine.engine,
-            StoreData {
+            WasmtimeStoreData {
                 foreign: ForeignData { data, finalizer },
                 #[cfg(feature = "wasi")]
                 wasi: None,
                 hostcall_val_storage: Vec::new(),
                 wasm_val_storage: Vec::new(),
+                store_limits: StoreLimits::default(),
             },
         ),
     })
 }
 
+pub type wasmtime_update_deadline_kind_t = u8;
+pub const WASMTIME_UPDATE_DEADLINE_CONTINUE: wasmtime_update_deadline_kind_t = 0;
+pub const WASMTIME_UPDATE_DEADLINE_YIELD: wasmtime_update_deadline_kind_t = 1;
+
 #[no_mangle]
-pub extern "C" fn wasmtime_store_context(store: &mut wasmtime_store_t) -> CStoreContextMut<'_> {
+pub extern "C" fn wasmtime_store_epoch_deadline_callback(
+    store: &mut wasmtime_store_t,
+    func: extern "C" fn(
+        WasmtimeStoreContextMut<'_>,
+        *mut c_void,
+        *mut u64,
+        *mut wasmtime_update_deadline_kind_t,
+    ) -> Option<Box<wasmtime_error_t>>,
+    data: *mut c_void,
+    finalizer: Option<extern "C" fn(*mut c_void)>,
+) {
+    let foreign = crate::ForeignData { data, finalizer };
+    store.store.epoch_deadline_callback(move |mut store_ctx| {
+        let _ = &foreign; // Move foreign into this closure
+        let mut delta: u64 = 0;
+        let mut kind = WASMTIME_UPDATE_DEADLINE_CONTINUE;
+        let result = (func)(
+            store_ctx.as_context_mut(),
+            foreign.data,
+            &mut delta as *mut u64,
+            &mut kind as *mut wasmtime_update_deadline_kind_t,
+        );
+        match result {
+            Some(err) => Err(wasmtime::Error::from(<wasmtime_error_t as Into<
+                anyhow::Error,
+            >>::into(*err))),
+            None if kind == WASMTIME_UPDATE_DEADLINE_CONTINUE => {
+                Ok(UpdateDeadline::Continue(delta))
+            }
+            #[cfg(feature = "async")]
+            None if kind == WASMTIME_UPDATE_DEADLINE_YIELD => Ok(UpdateDeadline::Yield(delta)),
+            _ => panic!("unknown wasmtime_update_deadline_kind_t: {kind}"),
+        }
+    });
+}
+
+#[no_mangle]
+pub extern "C" fn wasmtime_store_context(
+    store: &mut wasmtime_store_t,
+) -> WasmtimeStoreContextMut<'_> {
     store.store.as_context_mut()
 }
 
 #[no_mangle]
-pub extern "C" fn wasmtime_context_get_data(store: CStoreContext<'_>) -> *mut c_void {
+pub extern "C" fn wasmtime_store_limiter(
+    store: &mut wasmtime_store_t,
+    memory_size: i64,
+    table_elements: i64,
+    instances: i64,
+    tables: i64,
+    memories: i64,
+) {
+    let mut limiter = StoreLimitsBuilder::new();
+    if memory_size >= 0 {
+        limiter = limiter.memory_size(memory_size as usize);
+    }
+    if table_elements >= 0 {
+        limiter = limiter.table_elements(table_elements as usize);
+    }
+    if instances >= 0 {
+        limiter = limiter.instances(instances as usize);
+    }
+    if tables >= 0 {
+        limiter = limiter.tables(tables as usize);
+    }
+    if memories >= 0 {
+        limiter = limiter.memories(memories as usize);
+    }
+    store.store.data_mut().store_limits = limiter.build();
+    store.store.limiter(|data| &mut data.store_limits);
+}
+
+#[no_mangle]
+pub extern "C" fn wasmtime_context_get_data(store: WasmtimeStoreContext<'_>) -> *mut c_void {
     store.data().foreign.data
 }
 
 #[no_mangle]
-pub extern "C" fn wasmtime_context_set_data(mut store: CStoreContextMut<'_>, data: *mut c_void) {
+pub extern "C" fn wasmtime_context_set_data(
+    mut store: WasmtimeStoreContextMut<'_>,
+    data: *mut c_void,
+) {
     store.data_mut().foreign.data = data;
 }
 
 #[cfg(feature = "wasi")]
 #[no_mangle]
 pub extern "C" fn wasmtime_context_set_wasi(
-    mut context: CStoreContextMut<'_>,
+    mut context: WasmtimeStoreContextMut<'_>,
     wasi: Box<crate::wasi_config_t>,
 ) -> Option<Box<wasmtime_error_t>> {
     crate::handle_result(wasi.into_wasi_ctx(), |wasi| {
@@ -129,58 +220,32 @@ pub extern "C" fn wasmtime_context_set_wasi(
 }
 
 #[no_mangle]
-pub extern "C" fn wasmtime_context_gc(mut context: CStoreContextMut<'_>) {
+pub extern "C" fn wasmtime_context_gc(mut context: WasmtimeStoreContextMut<'_>) {
     context.gc();
 }
 
 #[no_mangle]
-pub extern "C" fn wasmtime_context_add_fuel(
-    mut store: CStoreContextMut<'_>,
+pub extern "C" fn wasmtime_context_set_fuel(
+    mut store: WasmtimeStoreContextMut<'_>,
     fuel: u64,
 ) -> Option<Box<wasmtime_error_t>> {
-    crate::handle_result(store.add_fuel(fuel), |()| {})
+    crate::handle_result(store.set_fuel(fuel), |()| {})
 }
 
 #[no_mangle]
-pub extern "C" fn wasmtime_context_fuel_consumed(store: CStoreContext<'_>, fuel: &mut u64) -> bool {
-    match store.fuel_consumed() {
-        Some(amt) => {
-            *fuel = amt;
-            true
-        }
-        None => false,
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn wasmtime_context_consume_fuel(
-    mut store: CStoreContextMut<'_>,
-    fuel: u64,
-    remaining_fuel: &mut u64,
+pub extern "C" fn wasmtime_context_get_fuel(
+    store: WasmtimeStoreContext<'_>,
+    fuel: &mut u64,
 ) -> Option<Box<wasmtime_error_t>> {
-    crate::handle_result(store.consume_fuel(fuel), |remaining| {
-        *remaining_fuel = remaining;
+    crate::handle_result(store.get_fuel(), |amt| {
+        *fuel = amt;
     })
 }
 
-#[repr(C)]
-pub struct wasmtime_interrupt_handle_t {
-    handle: InterruptHandle,
-}
-
 #[no_mangle]
-pub extern "C" fn wasmtime_interrupt_handle_new(
-    store: CStoreContext<'_>,
-) -> Option<Box<wasmtime_interrupt_handle_t>> {
-    Some(Box::new(wasmtime_interrupt_handle_t {
-        handle: store.interrupt_handle().ok()?,
-    }))
+pub extern "C" fn wasmtime_context_set_epoch_deadline(
+    mut store: WasmtimeStoreContextMut<'_>,
+    ticks_beyond_current: u64,
+) {
+    store.set_epoch_deadline(ticks_beyond_current);
 }
-
-#[no_mangle]
-pub extern "C" fn wasmtime_interrupt_handle_interrupt(handle: &wasmtime_interrupt_handle_t) {
-    handle.handle.interrupt();
-}
-
-#[no_mangle]
-pub extern "C" fn wasmtime_interrupt_handle_delete(_: Box<wasmtime_interrupt_handle_t>) {}

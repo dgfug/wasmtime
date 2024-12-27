@@ -8,7 +8,6 @@ pub mod instructions;
 pub mod isa;
 pub mod operands;
 pub mod settings;
-pub mod type_inference;
 pub mod types;
 pub mod typevar;
 
@@ -17,15 +16,6 @@ pub mod typevar;
 macro_rules! predicate {
     ($a:ident && $($b:tt)*) => {
         PredicateNode::And(Box::new($a.into()), Box::new(predicate!($($b)*)))
-    };
-    (!$a:ident && $($b:tt)*) => {
-        PredicateNode::And(
-            Box::new(PredicateNode::Not(Box::new($a.into()))),
-            Box::new(predicate!($($b)*))
-        )
-    };
-    (!$a:ident) => {
-        PredicateNode::Not(Box::new($a.into()))
     };
     ($a:ident) => {
         $a.into()
@@ -38,7 +28,7 @@ macro_rules! preset {
     () => {
         vec![]
     };
-    ($($x:ident)&&*) => {
+    ($($x:tt)&&*) => {
         {
             let mut v = Vec::new();
             $(

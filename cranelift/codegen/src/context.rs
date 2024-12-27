@@ -9,28 +9,28 @@
 //! contexts concurrently. Typically, you would have one context per compilation thread and only a
 //! single ISA instance.
 
-use crate::binemit::{CodeInfo, MemoryCodeSink, RelocSink, StackMapSink, TrapSink};
-use crate::dce::do_dce;
+use crate::alias_analysis::AliasAnalysis;
 use crate::dominator_tree::DominatorTree;
+use crate::egraph::EgraphPass;
 use crate::flowgraph::ControlFlowGraph;
 use crate::ir::Function;
 use crate::isa::TargetIsa;
 use crate::legalizer::simple_legalize;
-use crate::licm::do_licm;
 use crate::loop_analysis::LoopAnalysis;
-use crate::machinst::{MachCompileResult, MachStackMap};
+use crate::machinst::{CompiledCode, CompiledCodeStencil};
 use crate::nan_canonicalization::do_nan_canonicalization;
 use crate::remove_constant_phis::do_remove_constant_phis;
-use crate::result::CodegenResult;
+use crate::result::{CodegenResult, CompileResult};
 use crate::settings::{FlagsOrIsa, OptLevel};
-use crate::simple_gvn::do_simple_gvn;
-use crate::simple_preopt::do_preopt;
-use crate::timing;
+use crate::trace;
 use crate::unreachable_code::eliminate_unreachable_code;
 use crate::verifier::{verify_context, VerifierErrors, VerifierResult};
+use crate::{timing, CompileError};
 #[cfg(feature = "souper-harvest")]
 use alloc::string::String;
 use alloc::vec::Vec;
+use cranelift_control::ControlPlane;
+use target_lexicon::Architecture;
 
 #[cfg(feature = "souper-harvest")]
 use crate::souper_harvest::do_souper_harvest;
@@ -50,9 +50,9 @@ pub struct Context {
     pub loop_analysis: LoopAnalysis,
 
     /// Result of MachBackend compilation, if computed.
-    pub mach_compile_result: Option<MachCompileResult>,
+    pub(crate) compiled_code: Option<CompiledCode>,
 
-    /// Flag: do we want a disassembly with the MachCompileResult?
+    /// Flag: do we want a disassembly with the CompiledCode?
     pub want_disasm: bool,
 }
 
@@ -75,7 +75,7 @@ impl Context {
             cfg: ControlFlowGraph::new(),
             domtree: DominatorTree::new(),
             loop_analysis: LoopAnalysis::new(),
-            mach_compile_result: None,
+            compiled_code: None,
             want_disasm: false,
         }
     }
@@ -86,8 +86,20 @@ impl Context {
         self.cfg.clear();
         self.domtree.clear();
         self.loop_analysis.clear();
-        self.mach_compile_result = None;
+        self.compiled_code = None;
         self.want_disasm = false;
+    }
+
+    /// Returns the compilation result for this function, available after any `compile` function
+    /// has been called.
+    pub fn compiled_code(&self) -> Option<&CompiledCode> {
+        self.compiled_code.as_ref()
+    }
+
+    /// Returns the compilation result for this function, available after any `compile` function
+    /// has been called.
+    pub fn take_compiled_code(&mut self) -> Option<CompiledCode> {
+        self.compiled_code.take()
     }
 
     /// Set the flag to request a disassembly when compiling with a
@@ -97,163 +109,134 @@ impl Context {
     }
 
     /// Compile the function, and emit machine code into a `Vec<u8>`.
-    ///
-    /// Run the function through all the passes necessary to generate code for the target ISA
-    /// represented by `isa`, as well as the final step of emitting machine code into a
-    /// `Vec<u8>`. The machine code is not relocated. Instead, any relocations are emitted
-    /// into `relocs`.
-    ///
-    /// This function calls `compile` and `emit_to_memory`, taking care to resize `mem` as
-    /// needed, so it provides a safe interface.
-    ///
-    /// Returns information about the function's code and read-only data.
+    #[deprecated = "use Context::compile"]
     pub fn compile_and_emit(
         &mut self,
         isa: &dyn TargetIsa,
         mem: &mut Vec<u8>,
-        relocs: &mut dyn RelocSink,
-        traps: &mut dyn TrapSink,
-        stack_maps: &mut dyn StackMapSink,
-    ) -> CodegenResult<CodeInfo> {
-        let info = self.compile(isa)?;
-        let old_len = mem.len();
-        mem.resize(old_len + info.total_size as usize, 0);
-        let new_info = unsafe {
-            self.emit_to_memory(mem.as_mut_ptr().add(old_len), relocs, traps, stack_maps)
-        };
-        debug_assert!(new_info == info);
-        Ok(info)
+        ctrl_plane: &mut ControlPlane,
+    ) -> CompileResult<&CompiledCode> {
+        let compiled_code = self.compile(isa, ctrl_plane)?;
+        mem.extend_from_slice(compiled_code.code_buffer());
+        Ok(compiled_code)
     }
 
-    /// Compile the function.
+    /// Internally compiles the function into a stencil.
     ///
-    /// Run the function through all the passes necessary to generate code for the target ISA
-    /// represented by `isa`. This does not include the final step of emitting machine code into a
-    /// code sink.
-    ///
-    /// Returns information about the function's code and read-only data.
-    pub fn compile(&mut self, isa: &dyn TargetIsa) -> CodegenResult<CodeInfo> {
+    /// Public only for testing and fuzzing purposes.
+    pub fn compile_stencil(
+        &mut self,
+        isa: &dyn TargetIsa,
+        ctrl_plane: &mut ControlPlane,
+    ) -> CodegenResult<CompiledCodeStencil> {
         let _tt = timing::compile();
+
         self.verify_if(isa)?;
 
-        let opt_level = isa.flags().opt_level();
+        self.optimize(isa, ctrl_plane)?;
+
+        isa.compile_function(&self.func, &self.domtree, self.want_disasm, ctrl_plane)
+    }
+
+    /// Optimize the function, performing all compilation steps up to
+    /// but not including machine-code lowering and register
+    /// allocation.
+    ///
+    /// Public only for testing purposes.
+    pub fn optimize(
+        &mut self,
+        isa: &dyn TargetIsa,
+        ctrl_plane: &mut ControlPlane,
+    ) -> CodegenResult<()> {
         log::debug!(
-            "Compiling (opt level {:?}):\n{}",
+            "Number of CLIF instructions to optimize: {}",
+            self.func.dfg.num_insts()
+        );
+        log::debug!(
+            "Number of CLIF blocks to optimize: {}",
+            self.func.dfg.num_blocks()
+        );
+
+        let opt_level = isa.flags().opt_level();
+        crate::trace!(
+            "Optimizing (opt level {:?}):\n{}",
             opt_level,
             self.func.display()
         );
 
         self.compute_cfg();
-        if opt_level != OptLevel::None {
-            self.preopt(isa)?;
-        }
         if isa.flags().enable_nan_canonicalization() {
             self.canonicalize_nans(isa)?;
         }
 
         self.legalize(isa)?;
-        if opt_level != OptLevel::None {
-            self.compute_domtree();
-            self.compute_loop_analysis();
-            self.licm(isa)?;
-            self.simple_gvn(isa)?;
-        }
 
         self.compute_domtree();
         self.eliminate_unreachable_code(isa)?;
-        if opt_level != OptLevel::None {
-            self.dce(isa)?;
-        }
-
         self.remove_constant_phis(isa)?;
 
-        // FIXME: make this non optional
-        let backend = isa.get_mach_backend().expect("only mach backends nowadays");
-        let result = backend.compile_function(&self.func, self.want_disasm)?;
-        let info = result.code_info();
-        self.mach_compile_result = Some(result);
-        Ok(info)
+        self.func.dfg.resolve_all_aliases();
+
+        if opt_level != OptLevel::None {
+            self.egraph_pass(isa, ctrl_plane)?;
+        }
+
+        Ok(())
     }
 
-    /// Emit machine code directly into raw memory.
+    /// Compile the function,
     ///
-    /// Write all of the function's machine code to the memory at `mem`. The size of the machine
-    /// code is returned by `compile` above.
+    /// Run the function through all the passes necessary to generate
+    /// code for the target ISA represented by `isa`. The generated
+    /// machine code is not relocated. Instead, any relocations can be
+    /// obtained from `compiled_code.buffer.relocs()`.
     ///
-    /// The machine code is not relocated. Instead, any relocations are emitted into `relocs`.
+    /// Performs any optimizations that are enabled, unless
+    /// `optimize()` was already invoked.
     ///
-    /// # Safety
-    ///
-    /// This function is unsafe since it does not perform bounds checking on the memory buffer,
-    /// and it can't guarantee that the `mem` pointer is valid.
-    ///
-    /// Returns information about the emitted code and data.
-    pub unsafe fn emit_to_memory(
-        &self,
-        mem: *mut u8,
-        relocs: &mut dyn RelocSink,
-        traps: &mut dyn TrapSink,
-        stack_maps: &mut dyn StackMapSink,
-    ) -> CodeInfo {
-        let _tt = timing::binemit();
-        let mut sink = MemoryCodeSink::new(mem, relocs, traps);
-        let result = self
-            .mach_compile_result
-            .as_ref()
-            .expect("only using mach backend now");
-        result.buffer.emit(&mut sink);
-        let info = sink.info;
-        // New backends do not emit StackMaps through the `CodeSink` because its interface
-        // requires `Value`s; instead, the `StackMap` objects are directly accessible via
-        // `result.buffer.stack_maps()`.
-        for &MachStackMap {
-            offset_end,
-            ref stack_map,
-            ..
-        } in result.buffer.stack_maps()
-        {
-            stack_maps.add_stack_map(offset_end, stack_map.clone());
-        }
-        info
+    /// Returns the generated machine code as well as information about
+    /// the function's code and read-only data.
+    pub fn compile(
+        &mut self,
+        isa: &dyn TargetIsa,
+        ctrl_plane: &mut ControlPlane,
+    ) -> CompileResult<&CompiledCode> {
+        let stencil = self
+            .compile_stencil(isa, ctrl_plane)
+            .map_err(|error| CompileError {
+                inner: error,
+                func: &self.func,
+            })?;
+        Ok(self
+            .compiled_code
+            .insert(stencil.apply_params(&self.func.params)))
     }
 
     /// If available, return information about the code layout in the
     /// final machine code: the offsets (in bytes) of each basic-block
     /// start, and all basic-block edges.
+    #[deprecated = "use CompiledCode::get_code_bb_layout"]
     pub fn get_code_bb_layout(&self) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
-        if let Some(result) = self.mach_compile_result.as_ref() {
-            Some((
-                result.bb_starts.iter().map(|&off| off as usize).collect(),
-                result
-                    .bb_edges
-                    .iter()
-                    .map(|&(from, to)| (from as usize, to as usize))
-                    .collect(),
-            ))
-        } else {
-            None
-        }
+        self.compiled_code().map(CompiledCode::get_code_bb_layout)
     }
 
     /// Creates unwind information for the function.
     ///
     /// Returns `None` if the function has no unwind information.
     #[cfg(feature = "unwind")]
+    #[deprecated = "use CompiledCode::create_unwind_info"]
     pub fn create_unwind_info(
         &self,
         isa: &dyn TargetIsa,
     ) -> CodegenResult<Option<crate::isa::unwind::UnwindInfo>> {
-        if let Some(backend) = isa.get_mach_backend() {
-            let unwind_info_kind = isa.unwind_info_kind();
-            let result = self.mach_compile_result.as_ref().unwrap();
-            return backend.emit_unwind_info(result, unwind_info_kind);
-        }
-        isa.create_unwind_info(&self.func)
+        self.compiled_code().unwrap().create_unwind_info(isa)
     }
 
     /// Run the verifier on the function.
     ///
     /// Also check that the dominator tree and control flow graph are consistent with the function.
+    ///
+    /// TODO: rename to "CLIF validate" or similar.
     pub fn verify<'a, FOI: Into<FlagsOrIsa<'a>>>(&self, fisa: FOI) -> VerifierResult<()> {
         let mut errors = VerifierErrors::default();
         let _ = verify_context(&self.func, &self.cfg, &self.domtree, fisa, &mut errors);
@@ -274,13 +257,6 @@ impl Context {
         Ok(())
     }
 
-    /// Perform dead-code elimination on the function.
-    pub fn dce<'a, FOI: Into<FlagsOrIsa<'a>>>(&mut self, fisa: FOI) -> CodegenResult<()> {
-        do_dce(&mut self.func, &mut self.domtree);
-        self.verify_if(fisa)?;
-        Ok(())
-    }
-
     /// Perform constant-phi removal on the function.
     pub fn remove_constant_phis<'a, FOI: Into<FlagsOrIsa<'a>>>(
         &mut self,
@@ -291,16 +267,17 @@ impl Context {
         Ok(())
     }
 
-    /// Perform pre-legalization rewrites on the function.
-    pub fn preopt(&mut self, isa: &dyn TargetIsa) -> CodegenResult<()> {
-        do_preopt(&mut self.func, &mut self.cfg, isa);
-        self.verify_if(isa)?;
-        Ok(())
-    }
-
     /// Perform NaN canonicalizing rewrites on the function.
     pub fn canonicalize_nans(&mut self, isa: &dyn TargetIsa) -> CodegenResult<()> {
-        do_nan_canonicalization(&mut self.func);
+        // Currently only RiscV64 is the only arch that may not have vector support.
+        let has_vector_support = match isa.triple().architecture {
+            Architecture::Riscv64(_) => match isa.isa_flags().iter().find(|f| f.name == "has_v") {
+                Some(value) => value.as_bool().unwrap_or(false),
+                None => false,
+            },
+            _ => true,
+        };
+        do_nan_canonicalization(&mut self.func, has_vector_support);
         self.verify_if(isa)
     }
 
@@ -312,7 +289,7 @@ impl Context {
         self.loop_analysis.clear();
 
         // Run some specific legalizations only.
-        simple_legalize(&mut self.func, &mut self.cfg, isa);
+        simple_legalize(&mut self.func, isa);
         self.verify_if(isa)
     }
 
@@ -338,23 +315,6 @@ impl Context {
         self.compute_domtree()
     }
 
-    /// Perform simple GVN on the function.
-    pub fn simple_gvn<'a, FOI: Into<FlagsOrIsa<'a>>>(&mut self, fisa: FOI) -> CodegenResult<()> {
-        do_simple_gvn(&mut self.func, &mut self.domtree);
-        self.verify_if(fisa)
-    }
-
-    /// Perform LICM on the function.
-    pub fn licm(&mut self, isa: &dyn TargetIsa) -> CodegenResult<()> {
-        do_licm(
-            &mut self.func,
-            &mut self.cfg,
-            &mut self.domtree,
-            &mut self.loop_analysis,
-        );
-        self.verify_if(isa)
-    }
-
     /// Perform unreachable code elimination.
     pub fn eliminate_unreachable_code<'a, FOI>(&mut self, fisa: FOI) -> CodegenResult<()>
     where
@@ -362,6 +322,17 @@ impl Context {
     {
         eliminate_unreachable_code(&mut self.func, &mut self.cfg, &self.domtree);
         self.verify_if(fisa)
+    }
+
+    /// Replace all redundant loads with the known values in
+    /// memory. These are loads whose values were already loaded by
+    /// other loads earlier, as well as loads whose values were stored
+    /// by a store instruction to the same instruction (so-called
+    /// "store-to-load forwarding").
+    pub fn replace_redundant_loads(&mut self) -> CodegenResult<()> {
+        let mut analysis = AliasAnalysis::new(&self.func, &self.domtree);
+        analysis.compute_and_update_aliases(&mut self.func);
+        Ok(())
     }
 
     /// Harvest candidate left-hand sides for superoptimization with Souper.
@@ -372,5 +343,39 @@ impl Context {
     ) -> CodegenResult<()> {
         do_souper_harvest(&self.func, out);
         Ok(())
+    }
+
+    /// Run optimizations via the egraph infrastructure.
+    pub fn egraph_pass<'a, FOI>(
+        &mut self,
+        fisa: FOI,
+        ctrl_plane: &mut ControlPlane,
+    ) -> CodegenResult<()>
+    where
+        FOI: Into<FlagsOrIsa<'a>>,
+    {
+        let _tt = timing::egraph();
+
+        trace!(
+            "About to optimize with egraph phase:\n{}",
+            self.func.display()
+        );
+        let fisa = fisa.into();
+        self.compute_loop_analysis();
+        let mut alias_analysis = AliasAnalysis::new(&self.func, &self.domtree);
+        let mut pass = EgraphPass::new(
+            &mut self.func,
+            &self.domtree,
+            &self.loop_analysis,
+            &mut alias_analysis,
+            &fisa.flags,
+            ctrl_plane,
+        );
+        pass.run();
+        log::debug!("egraph stats: {:?}", pass.stats);
+        trace!("pinned_union_count: {}", pass.eclasses.pinned_union_count);
+        trace!("After egraph optimization:\n{}", self.func.display());
+
+        self.verify_if(fisa)
     }
 }

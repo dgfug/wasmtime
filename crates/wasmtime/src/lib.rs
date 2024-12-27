@@ -1,35 +1,55 @@
-//! Wasmtime's embedding API
+//! # Wasmtime's embedding API
 //!
-//! This crate contains an API used to interact with WebAssembly modules. For
-//! example you can compile modules, instantiate them, call them, etc. As an
-//! embedder of WebAssembly you can also provide WebAssembly modules
-//! functionality from the host by creating host-defined functions, memories,
-//! globals, etc, which can do things that WebAssembly cannot (such as print to
-//! the screen).
+//! Wasmtime is a WebAssembly engine for JIT-compiled or ahead-of-time compiled
+//! WebAssembly modules and components. More information about the Wasmtime
+//! project as a whole can be found [in the documentation
+//! book](https://docs.wasmtime.dev) whereas this documentation mostly focuses
+//! on the API reference of the `wasmtime` crate itself.
 //!
-//! The `wasmtime` crate has similar concepts to the
-//! the [JS WebAssembly
-//! API](https://developer.mozilla.org/en-US/docs/WebAssembly) as well as the
-//! [proposed C API](https://github.com/webassembly/wasm-c-api), but the Rust
-//! API is designed for efficiency, ergonomics, and expressivity in Rust. As
-//! with all other Rust code you're guaranteed that programs will be safe (not
-//! have undefined behavior or segfault) so long as you don't use `unsafe` in
-//! your own program. With `wasmtime` you can easily and conveniently embed a
-//! WebAssembly runtime with confidence that the WebAssembly is safely
-//! sandboxed.
+//! This crate contains an API used to interact with [WebAssembly modules] or
+//! [WebAssembly components]. For example you can compile WebAssembly, create
+//! instances, call functions, etc. As an embedder of WebAssembly you can also
+//! provide guests functionality from the host by creating host-defined
+//! functions, memories, globals, etc, which can do things that WebAssembly
+//! cannot (such as print to the screen).
 //!
-//! An example of using Wasmtime looks like:
+//! [WebAssembly modules]: https://webassembly.github.io/spec
+//! [WebAssembly components]: https://component-model.bytecodealliance.org
+//!
+//! The `wasmtime` crate is designed to be safe, efficient, and ergonomic.
+//! This enables executing WebAssembly without the embedder needing to use
+//! `unsafe` code, meaning that you're guaranteed there is no undefined behavior
+//! or segfaults in either the WebAssembly guest or the host itself.
+//!
+//! The `wasmtime` crate can roughly be thought of as being split into two
+//! halves:
+//!
+//! * One half of the crate is similar to the [JS WebAssembly
+//!   API](https://developer.mozilla.org/en-US/docs/WebAssembly) as well as the
+//!   [proposed C API](https://github.com/webassembly/wasm-c-api) and is
+//!   intended for working with [WebAssembly modules]. This API resides in the
+//!   root of the `wasmtime` crate's namespace, for example
+//!   [`wasmtime::Module`](`Module`).
+//!
+//! * The second half of the crate is for use with the [WebAssembly Component
+//!   Model]. The implementation of the component model is present in
+//!   [`wasmtime::component`](`component`) and roughly mirrors the structure for
+//!   core WebAssembly, for example [`component::Func`] mirrors [`Func`].
+//!
+//! [WebAssembly Component Model]: https://component-model.bytecodealliance.org
+//!
+//! An example of using Wasmtime to run a core WebAssembly module looks like:
 //!
 //! ```
-//! use anyhow::Result;
 //! use wasmtime::*;
 //!
-//! fn main() -> Result<()> {
-//!     // Modules can be compiled through either the text or binary format
+//! fn main() -> wasmtime::Result<()> {
 //!     let engine = Engine::default();
+//!
+//!     // Modules can be compiled through either the text or binary format
 //!     let wat = r#"
 //!         (module
-//!             (import "host" "hello" (func $host_hello (param i32)))
+//!             (import "host" "host_func" (func $host_hello (param i32)))
 //!
 //!             (func (export "hello")
 //!                 i32.const 3
@@ -38,20 +58,24 @@
 //!     "#;
 //!     let module = Module::new(&engine, wat)?;
 //!
+//!     // Host functionality can be arbitrary Rust functions and is provided
+//!     // to guests through a `Linker`.
+//!     let mut linker = Linker::new(&engine);
+//!     linker.func_wrap("host", "host_func", |caller: Caller<'_, u32>, param: i32| {
+//!         println!("Got {} from WebAssembly", param);
+//!         println!("my host state is: {}", caller.data());
+//!     })?;
+//!
 //!     // All wasm objects operate within the context of a "store". Each
 //!     // `Store` has a type parameter to store host-specific data, which in
 //!     // this case we're using `4` for.
-//!     let mut store = Store::new(&engine, 4);
-//!     let host_hello = Func::wrap(&mut store, |caller: Caller<'_, u32>, param: i32| {
-//!         println!("Got {} from WebAssembly", param);
-//!         println!("my host state is: {}", caller.data());
-//!     });
+//!     let mut store: Store<u32> = Store::new(&engine, 4);
 //!
 //!     // Instantiation of a module requires specifying its imports and then
 //!     // afterwards we can fetch exports by name, as well as asserting the
 //!     // type signature of the function with `get_typed_func`.
-//!     let instance = Instance::new(&mut store, &module, &[host_hello.into()])?;
-//!     let hello = instance.get_typed_func::<(), (), _>(&mut store, "hello")?;
+//!     let instance = linker.instantiate(&mut store, &module)?;
+//!     let hello = instance.get_typed_func::<(), ()>(&mut store, "hello")?;
 //!
 //!     // And finally we can call the wasm!
 //!     hello.call(&mut store, ())?;
@@ -65,19 +89,13 @@
 //! There are a number of core types and concepts that are important to be aware
 //! of when using the `wasmtime` crate:
 //!
-//! * [`Engine`] - a global compilation environment for WebAssembly. An
-//!   [`Engine`] is an object that can be shared concurrently across threads and
-//!   is created with a [`Config`] to tweak various settings. Compilation of any
-//!   WebAssembly requires first configuring and creating an [`Engine`].
-//!
-//! * [`Module`] - a compiled WebAssembly module. This structure represents
-//!   in-memory JIT code which is ready to execute after being instantiated.
-//!   It's often important to cache instances of a [`Module`] because creation
-//!   (compilation) can be expensive. Note that [`Module`] is safe to share
-//!   across threads, and can be created from a WebAssembly binary and an
-//!   [`Engine`] with [`Module::new`]. Caching can either happen with
-//!   [`Engine::precompile_module`] or [`Module::serialize`], feeding those
-//!   bytes back into [`Module::deserialize`].
+//! * [`Engine`] - a global compilation and runtime environment for WebAssembly.
+//!   An [`Engine`] is an object that can be shared concurrently across threads
+//!   and is created with a [`Config`] with many knobs for configuring
+//!   behavior. Compiling or executing any WebAssembly requires first
+//!   configuring and creating an [`Engine`]. All [`Module`]s and
+//!   [`Component`](component::Component)s belong to an [`Engine`], and
+//!   typically there's one [`Engine`] per process.
 //!
 //! * [`Store`] - container for all information related to WebAssembly objects
 //!   such as functions, instances, memories, etc. A [`Store<T>`][`Store`]
@@ -87,19 +105,48 @@
 //!   required for all WebAssembly operations, such as calling a wasm function.
 //!   The [`Store`] is passed in as a "context" to methods like [`Func::call`].
 //!   Dropping a [`Store`] will deallocate all memory associated with
-//!   WebAssembly objects within the [`Store`].
+//!   WebAssembly objects within the [`Store`]. A [`Store`] is cheap to create
+//!   and destroy and does not GC objects such as unused instances internally,
+//!   so it's intended to be short-lived (or no longer than the instances it
+//!   contains).
 //!
-//! * [`Instance`] - an instantiated WebAssembly module. An instance is where
-//!   you can actually acquire a [`Func`] from, for example, to call.
+//! * [`Linker`] (or [`component::Linker`]) - host functions are defined within
+//!   a linker to provide them a string-based name which can be looked up when
+//!   instantiating a WebAssembly module or component. Linkers are traditionally
+//!   populated at startup and then reused for all future instantiations of all
+//!   instances, assuming the set of host functions does not change over time.
+//!   Host functions are `Fn(..) + Send + Sync` and typically do not close over
+//!   mutable state. Instead it's recommended to store mutable state in the `T`
+//!   of [`Store<T>`] which is accessed through [`Caller<'_,
+//!   T>`](crate::Caller) provided to host functions.
 //!
-//! * [`Func`] - a WebAssembly (or host) function. This can be acquired as the
-//!   export of an [`Instance`] to call WebAssembly functions, or it can be
-//!   created via functions like [`Func::wrap`] to wrap host-defined
-//!   functionality and give it to WebAssembly.
+//! * [`Module`] (or [`Component`](component::Component)) - a compiled
+//!   WebAssembly module or component. These structures contain compiled
+//!   executable code from a WebAssembly binary which is ready to execute after
+//!   being instantiated. These are expensive to create as they require
+//!   compilation of the input WebAssembly. Modules and components are safe to
+//!   share across threads, however. Modules and components can additionally be
+//!   [serialized into a list of bytes](crate::Module::serialize) to later be
+//!   [deserialized](crate::Module::deserialize) quickly. This enables JIT-style
+//!   compilation through constructors such as [`Module::new`] and AOT-style
+//!   compilation by having the compilation process use [`Module::serialize`]
+//!   and the execution process use [`Module::deserialize`].
 //!
-//! * [`Table`], [`Global`], [`Memory`] - other WebAssembly objects which can
-//!   either be defined on the host or in wasm itself (via instances). These all
-//!   have various ways of being interacted with like [`Func`].
+//! * [`Instance`] (or [`component::Instance`]) - an instantiated WebAssembly
+//!   module or component. An instance is where you can actually acquire a
+//!   [`Func`] (or [`component::Func`]) from, for example, to call.
+//!
+//! * [`Func`] (or [`component::Func`]) - a WebAssembly function. This can be
+//!   acquired as the export of an [`Instance`] to call WebAssembly functions,
+//!   or it can be created via functions like [`Func::wrap`] to wrap
+//!   host-defined functionality and give it to WebAssembly. Functions also have
+//!   typed views as [`TypedFunc`] or [`component::TypedFunc`] for a more
+//!   efficient calling convention.
+//!
+//! * [`Table`], [`Global`], [`Memory`], [`component::Resource`] - other
+//!   WebAssembly objects which can either be defined on the host or in wasm
+//!   itself (via instances). These all have various ways of being interacted
+//!   with like [`Func`].
 //!
 //! All "store-connected" types such as [`Func`], [`Memory`], etc, require the
 //! store to be passed in as a context to each method. Methods in wasmtime
@@ -119,91 +166,6 @@
 //! [`Func`] point within the [`Store`] and require the [`Store`] to be provided
 //! to actually access the internals of the WebAssembly function, for instance.
 //!
-//! ## Linking
-//!
-//! WebAssembly modules almost always require functionality from the host to
-//! perform I/O-like tasks. They might refer to quite a few pieces of host
-//! functionality, WASI, or maybe even a number of other wasm modules. To assist
-//! with managing this a [`Linker`] type is provided to instantiate modules.
-//!
-//! A [`Linker`] performs name-based resolution of the imports of a WebAssembly
-//! module so the [`Linker::instantiate`] method does not take an `imports`
-//! argument like [`Instance::new`] does. Methods like [`Linker::define`] or
-//! [`Linker::func_wrap`] can be used to define names within a [`Linker`] to
-//! later be used for instantiation.
-//!
-//! For example we can reimplement the above example with a `Linker`:
-//!
-//! ```
-//! use anyhow::Result;
-//! use wasmtime::*;
-//!
-//! fn main() -> Result<()> {
-//!     let engine = Engine::default();
-//!     let wat = r#"
-//!         (module
-//!             (import "host" "hello" (func $host_hello (param i32)))
-//!
-//!             (func (export "hello")
-//!                 i32.const 3
-//!                 call $host_hello)
-//!         )
-//!     "#;
-//!     let module = Module::new(&engine, wat)?;
-//!
-//!     // Create a `Linker` and define our host function in it:
-//!     let mut linker = Linker::new(&engine);
-//!     linker.func_wrap("host", "hello", |caller: Caller<'_, u32>, param: i32| {
-//!         println!("Got {} from WebAssembly", param);
-//!         println!("my host state is: {}", caller.data());
-//!     })?;
-//!
-//!     // Use the `linker` to instantiate the module, which will automatically
-//!     // resolve the imports of the module using name-based resolution.
-//!     let mut store = Store::new(&engine, 0);
-//!     let instance = linker.instantiate(&mut store, &module)?;
-//!     let hello = instance.get_typed_func::<(), (), _>(&mut store, "hello")?;
-//!     hello.call(&mut store, ())?;
-//!
-//!     Ok(())
-//! }
-//! ```
-//!
-//! The [`Linker`] type also transparently handles Commands and Reactors
-//! as defined by WASI.
-//!
-//! ## Example Architecture
-//!
-//! To better understand how Wasmtime types interact with each other let's walk
-//! through, at a high-level, an example of how you might use WebAssembly. In
-//! our use case let's say we have a web server where we'd like to run some
-//! custom WebAssembly on each request. To ensure requests are entirely isolated
-//! from each other, though, we'll be creating a new [`Store`] for each
-//! request.
-//!
-//! When the server starts, we'll start off by creating an [`Engine`] (and maybe
-//! tweaking [`Config`] settings if necessary). This [`Engine`] will be the only
-//! engine for the lifetime of the server itself. Next, we can compile our
-//! WebAssembly. You'd create a [`Module`] through the [`Module::new`] API.
-//! This will generate JIT code and perform expensive compilation tasks
-//! up-front. Finally the last step of initialization would be to create a
-//! [`Linker`] which will later be used to instantiate modules, adding
-//! functionality like WASI to the linker too.
-//!
-//! After that setup, the server starts up as usual and is ready to receive
-//! requests. Upon receiving a request you'd then create a [`Store`] with
-//! [`Store::new`] referring to the original [`Engine`]. Using your [`Module`]
-//! and [`Linker`] from before you'd then call [`Linker::instantiate`] to
-//! instantiate our module for the request. Both of these operations are
-//! designed to be as cheap as possible.
-//!
-//! With an [`Instance`] you can then invoke various exports and interact with
-//! the WebAssembly module. Once the request is finished the [`Store`],
-//! is dropped and everything will be deallocated. Note that if the same
-//! [`Store`] were used for every request then that would have all requests
-//! sharing resources and nothing would ever get deallocated, causing memory
-//! usage to baloon and would achive less isolation between requests.
-//!
 //! ## WASI
 //!
 //! The `wasmtime` crate does not natively provide support for WASI, but you can
@@ -214,32 +176,22 @@
 //!
 //! [`wasmtime-wasi`]: https://crates.io/crates/wasmtime-wasi
 //!
-//! ## Cross-store usage of items
-//!
-//! In `wasmtime` wasm items such as [`Global`] and [`Memory`] "belong" to a
-//! [`Store`]. The store they belong to is the one they were created with
-//! (passed in as a parameter) or instantiated with. This store is the only
-//! store that can be used to interact with wasm items after they're created.
-//!
-//! The `wasmtime` crate will panic if the [`Store`] argument passed in to these
-//! operations is incorrect. In other words it's considered a programmer error
-//! rather than a recoverable error for the wrong [`Store`] to be used when
-//! calling APIs.
-//!
 //! ## Crate Features
 //!
 //! The `wasmtime` crate comes with a number of compile-time features that can
 //! be used to customize what features it supports. Some of these features are
 //! just internal details, but some affect the public API of the `wasmtime`
-//! crate. Be sure to check the API you're using to see if any crate features
-//! are enabled.
+//! crate. Wasmtime APIs gated behind a Cargo feature should be indicated as
+//! such in the documentation.
+//!
+//! * `runtime` - Enabled by default, this feature enables executing
+//!   WebAssembly modules and components. If a compiler is not available (such
+//!   as `cranelift`) then [`Module::deserialize`] must be used, for example, to
+//!   provide an ahead-of-time compiled artifact to execute WebAssembly.
 //!
 //! * `cranelift` - Enabled by default, this features enables using Cranelift at
 //!   runtime to compile a WebAssembly module to native code. This feature is
-//!   required to process and compile new WebAssembly modules. If this feature
-//!   is disabled then the only way to create a [`Module`] is to use the
-//!   [`Module::deserialize`] function with a precompiled artifact (typically
-//!   compiled with the same version of Wasmtime, just somewhere else).
+//!   required to process and compile new WebAssembly modules and components.
 //!
 //! * `cache` - Enabled by default, this feature adds support for wasmtime to
 //!   perform internal caching of modules in a global location. This must still
@@ -247,207 +199,235 @@
 //!   [`Config::cache_config_load_default`].
 //!
 //! * `wat` - Enabled by default, this feature adds support for accepting the
-//!   text format of WebAssembly in [`Module::new`]. The text format will be
+//!   text format of WebAssembly in [`Module::new`] and
+//!   [`Component::new`](component::Component::new). The text format will be
 //!   automatically recognized and translated to binary when compiling a
 //!   module.
 //!
 //! * `parallel-compilation` - Enabled by default, this feature enables support
-//!   for compiling functions of a module in parallel with `rayon`.
+//!   for compiling functions in parallel with `rayon`.
 //!
 //! * `async` - Enabled by default, this feature enables APIs and runtime
 //!   support for defining asynchronous host functions and calling WebAssembly
-//!   asynchronously.
+//!   asynchronously. For more information see [`Config::async_support`].
 //!
-//! * `jitdump` - Enabled by default, this feature compiles in support for the
-//!   jitdump runtime profilng format. The profiler can be selected with
-//!   [`Config::profiler`].
-//!
-//! * `vtune` - Not enabled by default, this feature compiles in support for
-//!   supporting VTune profiling of JIT code.
-//!
-//! * `uffd` - Not enabled by default. This feature enables `userfaultfd` support
-//!   when using the pooling instance allocator. As handling page faults in user space
-//!   comes with a performance penalty, this feature should only be enabled when kernel
-//!   lock contention is hampering multithreading throughput. This feature is only
-//!   supported on Linux and requires a Linux kernel version 4.11 or higher.
+//! * `profiling` - Enabled by default, this feature compiles in support for
+//!   profiling guest code via a number of possible strategies. See
+//!   [`Config::profiler`] for more information.
 //!
 //! * `all-arch` - Not enabled by default. This feature compiles in support for
 //!   all architectures for both the JIT compiler and the `wasmtime compile` CLI
-//!   command.
+//!   command. This can be combined with [`Config::target`] to precompile
+//!   modules for a different platform than the host.
 //!
-//! ## Examples
+//! * `pooling-allocator` - Enabled by default, this feature adds support for
+//!   [`PoolingAllocationConfig`] to pass to [`Config::allocation_strategy`].
+//!   The pooling allocator can enable efficient reuse of resources for
+//!   high-concurrency and high-instantiation-count scenarios.
 //!
-//! In addition to the examples below be sure to check out the [online embedding
-//! documentation][rustdocs] as well as the [online list of examples][examples]
+//! * `demangle` - Enabled by default, this will affect how backtraces are
+//!   printed and whether symbol names from WebAssembly are attempted to be
+//!   demangled. Rust and C++ demanglings are currently supported.
 //!
-//! [rustdocs]: https://bytecodealliance.github.io/wasmtime/lang-rust.html
-//! [examples]: https://bytecodealliance.github.io/wasmtime/examples-rust-embed.html
+//! * `coredump` - Enabled by default, this will provide support for generating
+//!   a core dump when a trap happens. This can be configured via
+//!   [`Config::coredump_on_trap`].
 //!
-//! An example of using WASI looks like:
+//! * `addr2line` - Enabled by default, this feature configures whether traps
+//!   will attempt to parse DWARF debug information and convert WebAssembly
+//!   addresses to source filenames and line numbers.
 //!
-//! ```no_run
-//! # use anyhow::Result;
-//! # use wasmtime::*;
-//! use wasmtime_wasi::sync::WasiCtxBuilder;
+//! * `debug-builtins` - Enabled by default, this feature includes some built-in
+//!   debugging utilities and symbols for native debuggers such as GDB and LLDB
+//!   to attach to the process Wasmtime is used within. The intrinsics provided
+//!   will enable debugging guest code compiled to WebAssembly. This must also
+//!   be enabled via [`Config::debug_info`] as well for guests.
 //!
-//! # fn main() -> Result<()> {
-//! // Compile our module and create a `Linker` which has WASI functions defined
-//! // within it.
-//! let engine = Engine::default();
-//! let module = Module::from_file(&engine, "foo.wasm")?;
-//! let mut linker = Linker::new(&engine);
-//! wasmtime_wasi::add_to_linker(&mut linker, |cx| cx)?;
+//! * `component-model` - Enabled by default, this enables support for the
+//!   [`wasmtime::component`](component) API for working with components.
 //!
-//! // Configure and create a `WasiCtx`, which WASI functions need access to
-//! // through the host state of the store (which in this case is the host state
-//! // of the store)
-//! let wasi_ctx = WasiCtxBuilder::new().inherit_stdio().build();
-//! let mut store = Store::new(&engine, wasi_ctx);
+//! * `gc` - Enabled by default, this enables support for a number of
+//!   WebAssembly proposals such as `reference-types`, `function-references`,
+//!   and `gc`. Note that the implementation of the `gc` proposal itself is not
+//!   yet complete at this time.
 //!
-//! // Instantiate our module with the imports we've created, and run it.
-//! let instance = linker.instantiate(&mut store, &module)?;
-//! // ...
+//! * `threads` - Enabled by default, this enables compile-time support for the
+//!   WebAssembly `threads` proposal, notably shared memories.
 //!
-//! # Ok(())
-//! # }
-//! ```
+//! * `call-hook` - Disabled by default, this enables support for the
+//!   [`Store::call_hook`] API. This incurs a small overhead on all
+//!   entries/exits from WebAssembly and may want to be disabled by some
+//!   embedders.
 //!
-//! An example of reading a string from a wasm module:
+//! * `memory-protection-keys` - Disabled by default, this enables support for
+//!   the [`PoolingAllocationConfig::memory_protection_keys`] API. This feature
+//!   currently only works on x64 Linux and can enable compacting the virtual
+//!   memory allocation for linear memories in the pooling allocator. This comes
+//!   with the same overhead as the `call-hook` feature where entries/exits into
+//!   WebAssembly will have more overhead than before.
 //!
-//! ```
-//! use std::str;
+//! * `signals-based-traps` - Enabled by default, this enables support for using
+//!   host signal handlers to implement WebAssembly traps. For example virtual
+//!   memory is used to catch out-of-bounds accesses in WebAssembly that result
+//!   in segfaults. This is implicitly enabled by the `std` feature and is the
+//!   best way to get high-performance WebAssembly.
 //!
-//! # use wasmtime::*;
-//! # fn main() -> anyhow::Result<()> {
-//! let mut store = Store::default();
-//! let log_str = Func::wrap(&mut store, |mut caller: Caller<'_, ()>, ptr: i32, len: i32| {
-//!     // Use our `caller` context to learn about the memory export of the
-//!     // module which called this host function.
-//!     let mem = match caller.get_export("memory") {
-//!         Some(Extern::Memory(mem)) => mem,
-//!         _ => return Err(Trap::new("failed to find host memory")),
-//!     };
+//! More crate features can be found in the [manifest] of Wasmtime itself for
+//! seeing what can be enabled and disabled.
 //!
-//!     // Use the `ptr` and `len` values to get a subslice of the wasm-memory
-//!     // which we'll attempt to interpret as utf-8.
-//!     let data = mem.data(&caller)
-//!         .get(ptr as u32 as usize..)
-//!         .and_then(|arr| arr.get(..len as u32 as usize));
-//!     let string = match data {
-//!         Some(data) => match str::from_utf8(data) {
-//!             Ok(s) => s,
-//!             Err(_) => return Err(Trap::new("invalid utf-8")),
-//!         },
-//!         None => return Err(Trap::new("pointer/length out of bounds")),
-//!     };
-//!     assert_eq!(string, "Hello, world!");
-//!     println!("{}", string);
-//!     Ok(())
-//! });
-//! let module = Module::new(
-//!     store.engine(),
-//!     r#"
-//!         (module
-//!             (import "" "" (func $log_str (param i32 i32)))
-//!             (func (export "foo")
-//!                 i32.const 4   ;; ptr
-//!                 i32.const 13  ;; len
-//!                 call $log_str)
-//!             (memory (export "memory") 1)
-//!             (data (i32.const 4) "Hello, world!"))
-//!     "#,
-//! )?;
-//! let instance = Instance::new(&mut store, &module, &[log_str.into()])?;
-//! let foo = instance.get_typed_func::<(), (), _>(&mut store, "foo")?;
-//! foo.call(&mut store, ())?;
-//! # Ok(())
-//! # }
-//! ```
+//! [manifest]: https://github.com/bytecodealliance/wasmtime/blob/main/crates/wasmtime/Cargo.toml
 
-#![allow(unknown_lints)]
-#![deny(missing_docs, rustdoc::broken_intra_doc_links)]
+#![deny(missing_docs)]
 #![doc(test(attr(deny(warnings))))]
 #![doc(test(attr(allow(dead_code, unused_variables, unused_mut))))]
-#![cfg_attr(nightlydoc, feature(doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
 #![cfg_attr(not(feature = "default"), allow(dead_code, unused_imports))]
+// Allow broken links when the default features is disabled because most of our
+// documentation is written for the "one build" of the `main` branch which has
+// most features enabled. This will present warnings in stripped-down doc builds
+// and will prevent the doc build from failing.
+#![cfg_attr(feature = "default", warn(rustdoc::broken_intra_doc_links))]
+#![no_std]
+#![expect(clippy::allow_attributes_without_reason, reason = "crate not migrated")]
 
+#[cfg(any(feature = "std", unix, windows))]
 #[macro_use]
-mod func;
+extern crate std;
+extern crate alloc;
 
-mod config;
-mod engine;
-mod externals;
-mod instance;
-mod limits;
-mod linker;
-mod memory;
-mod module;
-mod r#ref;
-mod signatures;
-mod store;
-mod trampoline;
-mod trap;
-mod types;
-mod values;
+pub(crate) mod prelude {
+    pub use crate::{Error, Result};
+    pub use anyhow::{anyhow, bail, ensure, format_err, Context};
+    pub use wasmtime_environ::prelude::*;
+}
 
-pub use crate::config::*;
-pub use crate::engine::*;
-pub use crate::externals::*;
-pub use crate::func::*;
-pub use crate::instance::{Instance, InstancePre};
-pub use crate::limits::*;
-pub use crate::linker::*;
-pub use crate::memory::*;
-pub use crate::module::{FrameInfo, FrameSymbol, Module};
-pub use crate::r#ref::ExternRef;
-pub use crate::store::{
-    AsContext, AsContextMut, CallHook, InterruptHandle, Store, StoreContext, StoreContextMut,
-};
-pub use crate::trap::*;
-pub use crate::types::*;
-pub use crate::values::*;
+pub(crate) use hashbrown::{hash_map, hash_set};
 
-cfg_if::cfg_if! {
-    if #[cfg(all(target_os = "macos", not(feature = "posix-signals-on-macos")))] {
-        // no extensions for macOS at this time
-    } else if #[cfg(unix)] {
-        pub mod unix;
-    } else if #[cfg(windows)] {
-        pub mod windows;
-    } else {
-        // ... unknown os!
+/// A helper macro to safely map `MaybeUninit<T>` to `MaybeUninit<U>` where `U`
+/// is a field projection within `T`.
+///
+/// This is intended to be invoked as:
+///
+/// ```ignore
+/// struct MyType {
+///     field: u32,
+/// }
+///
+/// let initial: &mut MaybeUninit<MyType> = ...;
+/// let field: &mut MaybeUninit<u32> = map_maybe_uninit!(initial.field);
+/// ```
+///
+/// Note that array accesses are also supported:
+///
+/// ```ignore
+///
+/// let initial: &mut MaybeUninit<[u32; 2]> = ...;
+/// let element: &mut MaybeUninit<u32> = map_maybe_uninit!(initial[1]);
+/// ```
+#[doc(hidden)]
+#[macro_export]
+macro_rules! map_maybe_uninit {
+    ($maybe_uninit:ident $($field:tt)*) => ({
+        #[allow(unused_unsafe)]
+        {
+            unsafe {
+                use $crate::MaybeUninitExt;
+
+                let m: &mut core::mem::MaybeUninit<_> = $maybe_uninit;
+                // Note the usage of `addr_of_mut!` here which is an attempt to "stay
+                // safe" here where we never accidentally create `&mut T` where `T` is
+                // actually uninitialized, hopefully appeasing the Rust unsafe
+                // guidelines gods.
+                m.map(|p| core::ptr::addr_of_mut!((*p)$($field)*))
+            }
+        }
+    })
+}
+
+#[doc(hidden)]
+pub trait MaybeUninitExt<T> {
+    /// Maps `MaybeUninit<T>` to `MaybeUninit<U>` using the closure provided.
+    ///
+    /// Note that this is `unsafe` as there is no guarantee that `U` comes from
+    /// `T`.
+    unsafe fn map<U>(&mut self, f: impl FnOnce(*mut T) -> *mut U)
+        -> &mut core::mem::MaybeUninit<U>;
+}
+
+impl<T> MaybeUninitExt<T> for core::mem::MaybeUninit<T> {
+    unsafe fn map<U>(
+        &mut self,
+        f: impl FnOnce(*mut T) -> *mut U,
+    ) -> &mut core::mem::MaybeUninit<U> {
+        let new_ptr = f(self.as_mut_ptr());
+        core::mem::transmute::<*mut U, &mut core::mem::MaybeUninit<U>>(new_ptr)
     }
 }
 
-fn _assert_send_sync() {
-    fn _assert<T: Send + Sync>() {}
-    fn _assert_send<T: Send>(_t: T) {}
-    _assert::<Engine>();
-    _assert::<Config>();
-    _assert::<InterruptHandle>();
-    _assert::<(Func, TypedFunc<(), ()>, Global, Table, Memory)>();
-    _assert::<Instance>();
-    _assert::<Module>();
-    _assert::<Store<()>>();
-    _assert::<StoreContext<'_, ()>>();
-    _assert::<StoreContextMut<'_, ()>>();
-    _assert::<Caller<'_, ()>>();
-    _assert::<Linker<()>>();
-    _assert::<Linker<*mut u8>>();
-    _assert::<ExternRef>();
-    _assert::<InstancePre<()>>();
-    _assert::<InstancePre<*mut u8>>();
+#[cfg(feature = "runtime")]
+mod runtime;
+#[cfg(feature = "runtime")]
+pub use runtime::*;
 
-    #[cfg(feature = "async")]
-    fn _call_async(s: &mut Store<()>, f: Func) {
-        _assert_send(f.call_async(&mut *s, &[], &mut []))
-    }
-    #[cfg(feature = "async")]
-    fn _typed_call_async(s: &mut Store<()>, f: TypedFunc<(), ()>) {
-        _assert_send(f.call_async(&mut *s, ()))
-    }
-    #[cfg(feature = "async")]
-    fn _instantiate_async(s: &mut Store<()>, m: &Module) {
-        _assert_send(Instance::new_async(s, m, &[]))
-    }
+#[cfg(any(feature = "cranelift", feature = "winch"))]
+mod compile;
+#[cfg(any(feature = "cranelift", feature = "winch"))]
+pub use compile::{CodeBuilder, CodeHint};
+
+mod config;
+mod engine;
+mod profiling_agent;
+
+pub use crate::config::*;
+pub use crate::engine::*;
+
+#[cfg(feature = "std")]
+mod sync_std;
+#[cfg(feature = "std")]
+use sync_std as sync;
+
+#[cfg_attr(feature = "std", allow(dead_code))]
+mod sync_nostd;
+#[cfg(not(feature = "std"))]
+use sync_nostd as sync;
+
+/// A convenience wrapper for `Result<T, anyhow::Error>`.
+///
+/// This type can be used to interact with `wasmtimes`'s extensive use
+/// of `anyhow::Error` while still not directly depending on `anyhow`.
+///
+/// This type alias is identical to `anyhow::Result`.
+#[doc(no_inline)]
+pub use anyhow::{Error, Result};
+
+/// A re-exported instance of Wasmtime's `wasmparser` dependency.
+///
+/// This may be useful for embedders that also use `wasmparser`
+/// directly: it allows embedders to ensure that they are using the same
+/// version as Wasmtime, both to eliminate redundant dependencies on
+/// multiple versions of the library, and to ensure compatibility in
+/// validation and feature support.
+///
+/// Note that this re-export is *not subject to semver*: we reserve the
+/// right to make patch releases of Wasmtime that bump the version of
+/// wasmparser used, and hence the version re-exported, in
+/// semver-incompatible ways. This is the tradeoff that the embedder
+/// needs to opt into: in order to stay exactly in sync with an internal
+/// detail of Wasmtime, the cost is visibility into potential internal
+/// version changes.
+#[cfg(feature = "reexport-wasmparser")]
+pub use wasmparser;
+
+fn _assert_send_and_sync<T: Send + Sync>() {}
+
+fn _assertions_lib() {
+    _assert_send_and_sync::<Engine>();
+    _assert_send_and_sync::<Config>();
+}
+
+#[cfg(feature = "runtime")]
+#[doc(hidden)]
+pub mod _internal {
+    // Exported just for the CLI.
+    pub use crate::runtime::vm::MmapVec;
 }

@@ -1,47 +1,378 @@
 //! Instruction operand sub-components (aka "parts"): definitions and printing.
 
-use super::regs::{self, show_ireg_sized};
-use super::EmitState;
+use super::regs::{self};
 use crate::ir::condcodes::{FloatCC, IntCC};
-use crate::ir::{MemFlags, Type};
+use crate::ir::types::*;
+use crate::ir::MemFlags;
+use crate::isa::x64::inst::regs::pretty_print_reg;
 use crate::isa::x64::inst::Inst;
 use crate::machinst::*;
-use regalloc::{
-    PrettyPrint, PrettyPrintSized, RealRegUniverse, Reg, RegClass, RegUsageCollector,
-    RegUsageMapper, Writable,
-};
 use smallvec::{smallvec, SmallVec};
 use std::fmt;
 use std::string::String;
 
-/// A possible addressing mode (amode) that can be used in instructions.
-/// These denote a 64-bit value only.
-#[derive(Clone, Debug)]
-pub enum Amode {
-    /// Immediate sign-extended and a Register.
-    ImmReg {
-        simm32: u32,
-        base: Reg,
-        flags: MemFlags,
-    },
+pub use crate::isa::x64::lower::isle::generated_code::DivSignedness;
 
-    /// sign-extend-32-to-64(Immediate) + Register1 + (Register2 << Shift)
-    ImmRegRegShift {
-        simm32: u32,
-        base: Reg,
-        index: Reg,
-        shift: u8, /* 0 .. 3 only */
-        flags: MemFlags,
-    },
-
-    /// sign-extend-32-to-64(Immediate) + RIP (instruction pointer).
-    /// To wit: not supported in 32-bits mode.
-    RipRelative { target: MachLabel },
+/// An extension trait for converting `Writable{Xmm,Gpr}` to `Writable<Reg>`.
+pub trait ToWritableReg {
+    /// Convert `Writable{Xmm,Gpr}` to `Writable<Reg>`.
+    fn to_writable_reg(&self) -> Writable<Reg>;
 }
 
+/// An extension trait for converting `Writable<Reg>` to `Writable{Xmm,Gpr}`.
+pub trait FromWritableReg: Sized {
+    /// Convert `Writable<Reg>` to `Writable{Xmm,Gpr}`.
+    fn from_writable_reg(w: Writable<Reg>) -> Option<Self>;
+}
+
+/// A macro for defining a newtype of `Reg` that enforces some invariant about
+/// the wrapped `Reg` (such as that it is of a particular register class).
+macro_rules! newtype_of_reg {
+    (
+        $newtype_reg:ident,
+        $newtype_writable_reg:ident,
+        $newtype_option_writable_reg:ident,
+        reg_mem: ($($newtype_reg_mem:ident $(aligned:$aligned:ident)?),*),
+        reg_mem_imm: ($($newtype_reg_mem_imm:ident $(aligned:$aligned_imm:ident)?),*),
+        $newtype_imm8_reg:ident,
+        |$check_reg:ident| $check:expr
+    ) => {
+        /// A newtype wrapper around `Reg`.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $newtype_reg(Reg);
+
+        impl PartialEq<Reg> for $newtype_reg {
+            fn eq(&self, other: &Reg) -> bool {
+                self.0 == *other
+            }
+        }
+
+        impl From<$newtype_reg> for Reg {
+            fn from(r: $newtype_reg) -> Self {
+                r.0
+            }
+        }
+
+        impl $newtype_reg {
+            /// Create this newtype from the given register, or return `None` if the register
+            /// is not a valid instance of this newtype.
+            pub fn new($check_reg: Reg) -> Option<Self> {
+                if $check {
+                    Some(Self($check_reg))
+                } else {
+                    None
+                }
+            }
+
+            /// Like `Self::new(r).unwrap()` but with a better panic message on
+            /// failure.
+            pub fn unwrap_new($check_reg: Reg) -> Self {
+                if $check {
+                    Self($check_reg)
+                } else {
+                    panic!(
+                        "cannot construct {} from register {:?} with register class {:?}",
+                        stringify!($newtype_reg),
+                        $check_reg,
+                        $check_reg.class(),
+                    )
+                }
+            }
+
+            /// Get this newtype's underlying `Reg`.
+            pub fn to_reg(self) -> Reg {
+                self.0
+            }
+        }
+
+        // Convenience impl so that people working with this newtype can use it
+        // "just like" a plain `Reg`.
+        //
+        // NB: We cannot implement `DerefMut` because that would let people do
+        // nasty stuff like `*my_gpr.deref_mut() = some_xmm_reg`, breaking the
+        // invariants that `Gpr` provides.
+        impl std::ops::Deref for $newtype_reg {
+            type Target = Reg;
+
+            fn deref(&self) -> &Reg {
+                &self.0
+            }
+        }
+
+        /// If you know what you're doing, you can explicitly mutably borrow the
+        /// underlying `Reg`. Don't make it point to the wrong type of register
+        /// please.
+        impl AsMut<Reg> for $newtype_reg {
+            fn as_mut(&mut self) -> &mut Reg {
+                &mut self.0
+            }
+        }
+
+        /// Writable Gpr.
+        pub type $newtype_writable_reg = Writable<$newtype_reg>;
+
+        #[allow(dead_code)] // Used by some newtypes and not others.
+        /// Optional writable Gpr.
+        pub type $newtype_option_writable_reg = Option<Writable<$newtype_reg>>;
+
+        impl ToWritableReg for $newtype_writable_reg {
+            fn to_writable_reg(&self) -> Writable<Reg> {
+                Writable::from_reg(self.to_reg().to_reg())
+            }
+        }
+
+        impl FromWritableReg for $newtype_writable_reg {
+            fn from_writable_reg(w: Writable<Reg>) -> Option<Self> {
+                Some(Writable::from_reg($newtype_reg::new(w.to_reg())?))
+            }
+        }
+
+        $(
+            /// A newtype wrapper around `RegMem` for general-purpose registers.
+            #[derive(Clone, Debug)]
+            pub struct $newtype_reg_mem(RegMem);
+
+            impl From<$newtype_reg_mem> for RegMem {
+                fn from(rm: $newtype_reg_mem) -> Self {
+                    rm.0
+                }
+            }
+            impl<'a> From<&'a $newtype_reg_mem> for &'a RegMem {
+                fn from(rm: &'a $newtype_reg_mem) -> &'a RegMem {
+                    &rm.0
+                }
+            }
+
+            impl From<$newtype_reg> for $newtype_reg_mem {
+                fn from(r: $newtype_reg) -> Self {
+                    $newtype_reg_mem(RegMem::reg(r.into()))
+                }
+            }
+
+            impl $newtype_reg_mem {
+                /// Construct a `RegMem` newtype from the given `RegMem`, or return
+                /// `None` if the `RegMem` is not a valid instance of this `RegMem`
+                /// newtype.
+                pub fn new(rm: RegMem) -> Option<Self> {
+                    match rm {
+                        RegMem::Mem { addr } => {
+                            let mut _allow = true;
+                            $(
+                                if $aligned {
+                                    _allow = addr.aligned();
+                                }
+                            )?
+                            if _allow {
+                                Some(Self(RegMem::Mem { addr }))
+                            } else {
+                                None
+                            }
+                        }
+                        RegMem::Reg { reg } => Some($newtype_reg::new(reg)?.into()),
+                    }
+                }
+
+                /// Like `Self::new(rm).unwrap()` but with better panic messages
+                /// in case of failure.
+                pub fn unwrap_new(rm: RegMem) -> Self {
+                    match rm {
+                        RegMem::Mem { addr } => {
+                            $(
+                                if $aligned && !addr.aligned() {
+                                    panic!(
+                                        "cannot create {} from an unaligned memory address: {addr:?}",
+                                        stringify!($newtype_reg_mem),
+                                    );
+                                }
+                            )?
+                            Self(RegMem::Mem { addr })
+                        }
+                        RegMem::Reg { reg } => $newtype_reg::unwrap_new(reg).into(),
+                    }
+                }
+
+                /// Convert this newtype into its underlying `RegMem`.
+                pub fn to_reg_mem(self) -> RegMem {
+                    self.0
+                }
+
+                #[allow(dead_code)] // Used by some newtypes and not others.
+                pub(crate) fn get_operands(&mut self, collector: &mut impl OperandVisitor) {
+                    self.0.get_operands(collector);
+                }
+            }
+            impl PrettyPrint for $newtype_reg_mem {
+                fn pretty_print(&self, size: u8) -> String {
+                    self.0.pretty_print(size)
+                }
+            }
+        )*
+
+        $(
+            /// A newtype wrapper around `RegMemImm`.
+            #[derive(Clone, Debug)]
+            pub struct $newtype_reg_mem_imm(RegMemImm);
+
+            impl From<$newtype_reg_mem_imm> for RegMemImm {
+                fn from(rmi: $newtype_reg_mem_imm) -> RegMemImm {
+                    rmi.0
+                }
+            }
+            impl<'a> From<&'a $newtype_reg_mem_imm> for &'a RegMemImm {
+                fn from(rmi: &'a $newtype_reg_mem_imm) -> &'a RegMemImm {
+                    &rmi.0
+                }
+            }
+
+            impl From<$newtype_reg> for $newtype_reg_mem_imm {
+                fn from(r: $newtype_reg) -> Self {
+                    $newtype_reg_mem_imm(RegMemImm::reg(r.into()))
+                }
+            }
+
+            impl $newtype_reg_mem_imm {
+                /// Construct this newtype from the given `RegMemImm`, or return
+                /// `None` if the `RegMemImm` is not a valid instance of this
+                /// newtype.
+                pub fn new(rmi: RegMemImm) -> Option<Self> {
+                    match rmi {
+                        RegMemImm::Imm { .. } => Some(Self(rmi)),
+                        RegMemImm::Mem { addr } => {
+                            let mut _allow = true;
+                            $(
+                                if $aligned_imm {
+                                    _allow = addr.aligned();
+                                }
+                            )?
+                            if _allow {
+                                Some(Self(RegMemImm::Mem { addr }))
+                            } else {
+                                None
+                            }
+                        }
+                        RegMemImm::Reg { reg } => Some($newtype_reg::new(reg)?.into()),
+                    }
+                }
+
+                /// Like `Self::new(rmi).unwrap()` but with better panic
+                /// messages in case of failure.
+                pub fn unwrap_new(rmi: RegMemImm) -> Self {
+                    match rmi {
+                        RegMemImm::Imm { .. } => Self(rmi),
+                        RegMemImm::Mem { addr } => {
+                            $(
+                                if $aligned_imm && !addr.aligned() {
+                                    panic!(
+                                        "cannot construct {} from unaligned memory address: {:?}",
+                                        stringify!($newtype_reg_mem_imm),
+                                        addr,
+                                    );
+                                }
+                            )?
+                            Self(RegMemImm::Mem { addr })
+
+                        }
+                        RegMemImm::Reg { reg } => $newtype_reg::unwrap_new(reg).into(),
+                    }
+                }
+
+                /// Convert this newtype into its underlying `RegMemImm`.
+                #[allow(dead_code)] // Used by some newtypes and not others.
+                pub fn to_reg_mem_imm(self) -> RegMemImm {
+                    self.0
+                }
+
+                #[allow(dead_code)] // Used by some newtypes and not others.
+                pub(crate) fn get_operands(&mut self, collector: &mut impl OperandVisitor) {
+                    self.0.get_operands(collector);
+                }
+            }
+
+            impl PrettyPrint for $newtype_reg_mem_imm {
+                fn pretty_print(&self, size: u8) -> String {
+                    self.0.pretty_print(size)
+                }
+            }
+        )*
+
+        /// A newtype wrapper around `Imm8Reg`.
+        #[derive(Clone, Debug)]
+        #[allow(dead_code)] // Used by some newtypes and not others.
+        pub struct $newtype_imm8_reg(Imm8Reg);
+
+        impl From<$newtype_reg> for $newtype_imm8_reg {
+            fn from(r: $newtype_reg) -> Self {
+                Self(Imm8Reg::Reg { reg: r.to_reg() })
+            }
+        }
+
+        impl $newtype_imm8_reg {
+            /// Construct this newtype from the given `Imm8Reg`, or return
+            /// `None` if the `Imm8Reg` is not a valid instance of this newtype.
+            #[allow(dead_code)] // Used by some newtypes and not others.
+            pub fn new(imm8_reg: Imm8Reg) -> Option<Self> {
+                match imm8_reg {
+                    Imm8Reg::Imm8 { .. } => Some(Self(imm8_reg)),
+                    Imm8Reg::Reg { reg } => Some($newtype_reg::new(reg)?.into()),
+                }
+            }
+
+            /// Like `Self::new(imm8_reg).unwrap()` but with better panic
+            /// messages on failure.
+            pub fn unwrap_new(imm8_reg: Imm8Reg) -> Self {
+                match imm8_reg {
+                    Imm8Reg::Imm8 { .. } => Self(imm8_reg),
+                    Imm8Reg::Reg { reg } => $newtype_reg::unwrap_new(reg).into(),
+                }
+            }
+
+            /// Borrow this newtype as its underlying `Imm8Reg`.
+            #[allow(dead_code)] // Used by some newtypes and not others.
+            pub fn as_imm8_reg(&self) -> &Imm8Reg {
+                &self.0
+            }
+
+            /// Borrow this newtype as its underlying `Imm8Reg`.
+            #[allow(dead_code)] // Used by some newtypes and not others.
+            pub fn as_imm8_reg_mut(&mut self) -> &mut Imm8Reg {
+                &mut self.0
+            }
+        }
+    };
+}
+
+// Define a newtype of `Reg` for general-purpose registers.
+newtype_of_reg!(
+    Gpr,
+    WritableGpr,
+    OptionWritableGpr,
+    reg_mem: (GprMem),
+    reg_mem_imm: (GprMemImm),
+    Imm8Gpr,
+    |reg| reg.class() == RegClass::Int
+);
+
+// Define a newtype of `Reg` for XMM registers.
+newtype_of_reg!(
+    Xmm,
+    WritableXmm,
+    OptionWritableXmm,
+    reg_mem: (XmmMem, XmmMemAligned aligned:true),
+    reg_mem_imm: (XmmMemImm, XmmMemAlignedImm aligned:true),
+    Imm8Xmm,
+    |reg| reg.class() == RegClass::Float
+);
+
+// N.B.: `Amode` is defined in `inst.isle`. We add some convenience
+// constructors here.
+
+// Re-export the type from the ISLE generated code.
+pub use crate::isa::x64::lower::isle::generated_code::Amode;
+
 impl Amode {
-    pub(crate) fn imm_reg(simm32: u32, base: Reg) -> Self {
-        debug_assert!(base.get_class() == RegClass::I64);
+    /// Create an immediate sign-extended and register addressing mode.
+    pub fn imm_reg(simm32: i32, base: Reg) -> Self {
+        debug_assert!(base.class() == RegClass::Int);
         Self::ImmReg {
             simm32,
             base,
@@ -49,9 +380,10 @@ impl Amode {
         }
     }
 
-    pub(crate) fn imm_reg_reg_shift(simm32: u32, base: Reg, index: Reg, shift: u8) -> Self {
-        debug_assert!(base.get_class() == RegClass::I64);
-        debug_assert!(index.get_class() == RegClass::I64);
+    /// Create a sign-extended-32-to-64 with register and shift addressing mode.
+    pub fn imm_reg_reg_shift(simm32: i32, base: Gpr, index: Gpr, shift: u8) -> Self {
+        debug_assert!(base.class() == RegClass::Int);
+        debug_assert!(index.class() == RegClass::Int);
         debug_assert!(shift <= 3);
         Self::ImmRegRegShift {
             simm32,
@@ -66,7 +398,8 @@ impl Amode {
         Self::RipRelative { target }
     }
 
-    pub(crate) fn with_flags(&self, flags: MemFlags) -> Self {
+    /// Set the specified [MemFlags] to the [Amode].
+    pub fn with_flags(&self, flags: MemFlags) -> Self {
         match self {
             &Self::ImmReg { simm32, base, .. } => Self::ImmReg {
                 simm32,
@@ -86,19 +419,41 @@ impl Amode {
                 shift,
                 flags,
             },
-            _ => panic!("Amode {:?} cannot take memflags", self),
+            _ => panic!("Amode {self:?} cannot take memflags"),
         }
     }
 
-    /// Add the regs mentioned by `self` to `collector`.
-    pub(crate) fn get_regs_as_uses(&self, collector: &mut RegUsageCollector) {
+    /// Add the registers mentioned by `self` to `collector`.
+    pub(crate) fn get_operands(&mut self, collector: &mut impl OperandVisitor) {
         match self {
             Amode::ImmReg { base, .. } => {
-                collector.add_use(*base);
+                if *base != regs::rbp() && *base != regs::rsp() {
+                    collector.reg_use(base);
+                }
             }
             Amode::ImmRegRegShift { base, index, .. } => {
-                collector.add_use(*base);
-                collector.add_use(*index);
+                debug_assert_ne!(base.to_reg(), regs::rbp());
+                debug_assert_ne!(base.to_reg(), regs::rsp());
+                collector.reg_use(base);
+                debug_assert_ne!(index.to_reg(), regs::rbp());
+                debug_assert_ne!(index.to_reg(), regs::rsp());
+                collector.reg_use(index);
+            }
+            Amode::RipRelative { .. } => {
+                // RIP isn't involved in regalloc.
+            }
+        }
+    }
+
+    /// Same as `get_operands`, but add the registers in the "late" phase.
+    pub(crate) fn get_operands_late(&mut self, collector: &mut impl OperandVisitor) {
+        match self {
+            Amode::ImmReg { base, .. } => {
+                collector.reg_late_use(base);
+            }
+            Amode::ImmRegRegShift { base, index, .. } => {
+                collector.reg_late_use(base);
+                collector.reg_late_use(index);
             }
             Amode::RipRelative { .. } => {
                 // RIP isn't involved in regalloc.
@@ -108,22 +463,34 @@ impl Amode {
 
     pub(crate) fn get_flags(&self) -> MemFlags {
         match self {
-            Amode::ImmReg { flags, .. } => *flags,
-            Amode::ImmRegRegShift { flags, .. } => *flags,
+            Amode::ImmReg { flags, .. } | Amode::ImmRegRegShift { flags, .. } => *flags,
             Amode::RipRelative { .. } => MemFlags::trusted(),
         }
     }
 
-    pub(crate) fn can_trap(&self) -> bool {
-        !self.get_flags().notrap()
+    /// Offset the amode by a fixed offset.
+    pub(crate) fn offset(&self, offset: i32) -> Self {
+        let mut ret = self.clone();
+        match &mut ret {
+            &mut Amode::ImmReg { ref mut simm32, .. } => *simm32 += offset,
+            &mut Amode::ImmRegRegShift { ref mut simm32, .. } => *simm32 += offset,
+            _ => panic!("Cannot offset amode: {self:?}"),
+        }
+        ret
+    }
+
+    pub(crate) fn aligned(&self) -> bool {
+        self.get_flags().aligned()
     }
 }
 
 impl PrettyPrint for Amode {
-    fn show_rru(&self, mb_rru: Option<&RealRegUniverse>) -> String {
+    fn pretty_print(&self, _size: u8) -> String {
         match self {
             Amode::ImmReg { simm32, base, .. } => {
-                format!("{}({})", *simm32 as i32, base.show_rru(mb_rru))
+                // Note: size is always 8; the address is 64 bits,
+                // even if the addressed operand is smaller.
+                format!("{}({})", *simm32, pretty_print_reg(*base, 8))
             }
             Amode::ImmRegRegShift {
                 simm32,
@@ -133,9 +500,9 @@ impl PrettyPrint for Amode {
                 ..
             } => format!(
                 "{}({},{},{})",
-                *simm32 as i32,
-                base.show_rru(mb_rru),
-                index.show_rru(mb_rru),
+                *simm32,
+                pretty_print_reg(base.to_reg(), 8),
+                pretty_print_reg(index.to_reg(), 8),
                 1 << shift
             ),
             Amode::RipRelative { ref target } => format!("label{}(%rip)", target.get()),
@@ -151,55 +518,89 @@ pub enum SyntheticAmode {
     /// A real amode.
     Real(Amode),
 
-    /// A (virtual) offset to the "nominal SP" value, which will be recomputed as we push and pop
-    /// within the function.
-    NominalSPOffset { simm32: u32 },
+    /// A (virtual) offset into the incoming argument area.
+    IncomingArg {
+        /// The downward offset from the start of the incoming argument area.
+        offset: u32,
+    },
+
+    /// A (virtual) offset to the slot area of the function frame, which lies just above the
+    /// outgoing arguments.
+    SlotOffset {
+        /// The offset into the slot area.
+        simm32: i32,
+    },
 
     /// A virtual offset to a constant that will be emitted in the constant section of the buffer.
     ConstantOffset(VCodeConstant),
 }
 
 impl SyntheticAmode {
-    pub(crate) fn nominal_sp_offset(simm32: u32) -> Self {
-        SyntheticAmode::NominalSPOffset { simm32 }
+    /// Create a real addressing mode.
+    pub fn real(amode: Amode) -> Self {
+        Self::Real(amode)
     }
 
-    /// Add the regs mentioned by `self` to `collector`.
-    pub(crate) fn get_regs_as_uses(&self, collector: &mut RegUsageCollector) {
+    pub(crate) fn slot_offset(simm32: i32) -> Self {
+        SyntheticAmode::SlotOffset { simm32 }
+    }
+
+    /// Add the registers mentioned by `self` to `collector`.
+    pub(crate) fn get_operands(&mut self, collector: &mut impl OperandVisitor) {
         match self {
-            SyntheticAmode::Real(addr) => addr.get_regs_as_uses(collector),
-            SyntheticAmode::NominalSPOffset { .. } => {
+            SyntheticAmode::Real(addr) => addr.get_operands(collector),
+            SyntheticAmode::IncomingArg { .. } => {
+                // Nothing to do; the base is known and isn't involved in regalloc.
+            }
+            SyntheticAmode::SlotOffset { .. } => {
                 // Nothing to do; the base is SP and isn't involved in regalloc.
             }
             SyntheticAmode::ConstantOffset(_) => {}
         }
     }
 
-    pub(crate) fn map_uses<RUM: RegUsageMapper>(&mut self, map: &RUM) {
+    /// Same as `get_operands`, but add the register in the "late" phase.
+    pub(crate) fn get_operands_late(&mut self, collector: &mut impl OperandVisitor) {
         match self {
-            SyntheticAmode::Real(addr) => addr.map_uses(map),
-            SyntheticAmode::NominalSPOffset { .. } => {
-                // Nothing to do.
+            SyntheticAmode::Real(addr) => addr.get_operands_late(collector),
+            SyntheticAmode::IncomingArg { .. } => {
+                // Nothing to do; the base is known and isn't involved in regalloc.
+            }
+            SyntheticAmode::SlotOffset { .. } => {
+                // Nothing to do; the base is SP and isn't involved in regalloc.
             }
             SyntheticAmode::ConstantOffset(_) => {}
         }
     }
 
-    pub(crate) fn finalize(&self, state: &mut EmitState, buffer: &MachBuffer<Inst>) -> Amode {
+    pub(crate) fn finalize(&self, frame: &FrameLayout, buffer: &mut MachBuffer<Inst>) -> Amode {
         match self {
             SyntheticAmode::Real(addr) => addr.clone(),
-            SyntheticAmode::NominalSPOffset { simm32 } => {
-                let off = *simm32 as i64 + state.virtual_sp_offset;
-                // TODO will require a sequence of add etc.
-                assert!(
-                    off <= u32::max_value() as i64,
-                    "amode finalize: add sequence NYI"
-                );
-                Amode::imm_reg(off as u32, regs::rsp())
+            SyntheticAmode::IncomingArg { offset } => {
+                // NOTE: this could be made relative to RSP by adding additional
+                // offsets from the frame_layout.
+                let args_max_fp_offset = frame.tail_args_size + frame.setup_area_size;
+                Amode::imm_reg(
+                    i32::try_from(args_max_fp_offset - offset).unwrap(),
+                    regs::rbp(),
+                )
+            }
+            SyntheticAmode::SlotOffset { simm32 } => {
+                let off = *simm32 as i64 + i64::from(frame.outgoing_args_size);
+                Amode::imm_reg(off.try_into().expect("invalid sp offset"), regs::rsp())
             }
             SyntheticAmode::ConstantOffset(c) => {
                 Amode::rip_relative(buffer.get_label_for_constant(*c))
             }
+        }
+    }
+
+    pub(crate) fn aligned(&self) -> bool {
+        match self {
+            SyntheticAmode::Real(addr) => addr.aligned(),
+            &SyntheticAmode::IncomingArg { .. }
+            | SyntheticAmode::SlotOffset { .. }
+            | SyntheticAmode::ConstantOffset { .. } => true,
         }
     }
 }
@@ -210,14 +611,24 @@ impl Into<SyntheticAmode> for Amode {
     }
 }
 
+impl Into<SyntheticAmode> for VCodeConstant {
+    fn into(self) -> SyntheticAmode {
+        SyntheticAmode::ConstantOffset(self)
+    }
+}
+
 impl PrettyPrint for SyntheticAmode {
-    fn show_rru(&self, mb_rru: Option<&RealRegUniverse>) -> String {
+    fn pretty_print(&self, _size: u8) -> String {
         match self {
-            SyntheticAmode::Real(addr) => addr.show_rru(mb_rru),
-            SyntheticAmode::NominalSPOffset { simm32 } => {
-                format!("rsp({} + virtual offset)", *simm32 as i32)
+            // See note in `Amode` regarding constant size of `8`.
+            SyntheticAmode::Real(addr) => addr.pretty_print(8),
+            &SyntheticAmode::IncomingArg { offset } => {
+                format!("rbp(stack args max - {offset})")
             }
-            SyntheticAmode::ConstantOffset(c) => format!("const({:?})", c),
+            SyntheticAmode::SlotOffset { simm32 } => {
+                format!("rsp({} + virtual offset)", *simm32)
+            }
+            SyntheticAmode::ConstantOffset(c) => format!("const({})", c.as_u32()),
         }
     }
 }
@@ -226,62 +637,108 @@ impl PrettyPrint for SyntheticAmode {
 /// denote an 8, 16, 32 or 64 bit value.  For the Immediate form, in the 8- and 16-bit case, only
 /// the lower 8 or 16 bits of `simm32` is relevant.  In the 64-bit case, the value denoted by
 /// `simm32` is its sign-extension out to 64 bits.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum RegMemImm {
-    Reg { reg: Reg },
-    Mem { addr: SyntheticAmode },
-    Imm { simm32: u32 },
+    /// A register operand.
+    Reg {
+        /// The underlying register.
+        reg: Reg,
+    },
+    /// A memory operand.
+    Mem {
+        /// The memory address.
+        addr: SyntheticAmode,
+    },
+    /// An immediate operand.
+    Imm {
+        /// The immediate value.
+        simm32: u32,
+    },
 }
 
 impl RegMemImm {
-    pub(crate) fn reg(reg: Reg) -> Self {
-        debug_assert!(reg.get_class() == RegClass::I64 || reg.get_class() == RegClass::V128);
+    /// Create a register operand.
+    pub fn reg(reg: Reg) -> Self {
+        debug_assert!(reg.class() == RegClass::Int || reg.class() == RegClass::Float);
         Self::Reg { reg }
     }
-    pub(crate) fn mem(addr: impl Into<SyntheticAmode>) -> Self {
+
+    /// Create a memory operand.
+    pub fn mem(addr: impl Into<SyntheticAmode>) -> Self {
         Self::Mem { addr: addr.into() }
     }
-    pub(crate) fn imm(simm32: u32) -> Self {
+
+    /// Create an immediate operand.
+    pub fn imm(simm32: u32) -> Self {
         Self::Imm { simm32 }
     }
 
     /// Asserts that in register mode, the reg class is the one that's expected.
     pub(crate) fn assert_regclass_is(&self, expected_reg_class: RegClass) {
         if let Self::Reg { reg } = self {
-            debug_assert_eq!(reg.get_class(), expected_reg_class);
+            debug_assert_eq!(reg.class(), expected_reg_class);
         }
     }
 
     /// Add the regs mentioned by `self` to `collector`.
-    pub(crate) fn get_regs_as_uses(&self, collector: &mut RegUsageCollector) {
+    pub(crate) fn get_operands(&mut self, collector: &mut impl OperandVisitor) {
         match self {
-            Self::Reg { reg } => collector.add_use(*reg),
-            Self::Mem { addr } => addr.get_regs_as_uses(collector),
+            Self::Reg { reg } => collector.reg_use(reg),
+            Self::Mem { addr } => addr.get_operands(collector),
             Self::Imm { .. } => {}
         }
     }
+}
 
-    pub(crate) fn to_reg(&self) -> Option<Reg> {
-        match self {
-            Self::Reg { reg } => Some(*reg),
-            _ => None,
+impl From<RegMem> for RegMemImm {
+    fn from(rm: RegMem) -> RegMemImm {
+        match rm {
+            RegMem::Reg { reg } => RegMemImm::Reg { reg },
+            RegMem::Mem { addr } => RegMemImm::Mem { addr },
         }
+    }
+}
+
+impl From<Reg> for RegMemImm {
+    fn from(reg: Reg) -> Self {
+        RegMemImm::Reg { reg }
     }
 }
 
 impl PrettyPrint for RegMemImm {
-    fn show_rru(&self, mb_rru: Option<&RealRegUniverse>) -> String {
-        self.show_rru_sized(mb_rru, 8)
+    fn pretty_print(&self, size: u8) -> String {
+        match self {
+            Self::Reg { reg } => pretty_print_reg(*reg, size),
+            Self::Mem { addr } => addr.pretty_print(size),
+            Self::Imm { simm32 } => format!("${}", *simm32 as i32),
+        }
     }
 }
 
-impl PrettyPrintSized for RegMemImm {
-    fn show_rru_sized(&self, mb_rru: Option<&RealRegUniverse>, size: u8) -> String {
-        match self {
-            Self::Reg { reg } => show_ireg_sized(*reg, mb_rru, size),
-            Self::Mem { addr } => addr.show_rru(mb_rru),
-            Self::Imm { simm32 } => format!("${}", *simm32 as i32),
-        }
+/// An operand which is either an 8-bit integer immediate or a register.
+#[derive(Clone, Debug)]
+pub enum Imm8Reg {
+    /// 8-bit immediate operand.
+    Imm8 {
+        /// The 8-bit immediate value.
+        imm: u8,
+    },
+    /// A register operand.
+    Reg {
+        /// The underlying register.
+        reg: Reg,
+    },
+}
+
+impl From<u8> for Imm8Reg {
+    fn from(imm: u8) -> Self {
+        Self::Imm8 { imm }
+    }
+}
+
+impl From<Reg> for Imm8Reg {
+    fn from(reg: Reg) -> Self {
+        Self::Reg { reg }
     }
 }
 
@@ -289,36 +746,47 @@ impl PrettyPrintSized for RegMemImm {
 /// 32, 64, or 128 bit value.
 #[derive(Clone, Debug)]
 pub enum RegMem {
-    Reg { reg: Reg },
-    Mem { addr: SyntheticAmode },
+    /// A register operand.
+    Reg {
+        /// The underlying register.
+        reg: Reg,
+    },
+    /// A memory operand.
+    Mem {
+        /// The memory address.
+        addr: SyntheticAmode,
+    },
 }
 
 impl RegMem {
-    pub(crate) fn reg(reg: Reg) -> Self {
-        debug_assert!(reg.get_class() == RegClass::I64 || reg.get_class() == RegClass::V128);
+    /// Create a register operand.
+    pub fn reg(reg: Reg) -> Self {
+        debug_assert!(reg.class() == RegClass::Int || reg.class() == RegClass::Float);
         Self::Reg { reg }
     }
-    pub(crate) fn mem(addr: impl Into<SyntheticAmode>) -> Self {
+
+    /// Create a memory operand.
+    pub fn mem(addr: impl Into<SyntheticAmode>) -> Self {
         Self::Mem { addr: addr.into() }
     }
     /// Asserts that in register mode, the reg class is the one that's expected.
     pub(crate) fn assert_regclass_is(&self, expected_reg_class: RegClass) {
         if let Self::Reg { reg } = self {
-            debug_assert_eq!(reg.get_class(), expected_reg_class);
+            debug_assert_eq!(reg.class(), expected_reg_class);
         }
     }
     /// Add the regs mentioned by `self` to `collector`.
-    pub(crate) fn get_regs_as_uses(&self, collector: &mut RegUsageCollector) {
+    pub(crate) fn get_operands(&mut self, collector: &mut impl OperandVisitor) {
         match self {
-            RegMem::Reg { reg } => collector.add_use(*reg),
-            RegMem::Mem { addr, .. } => addr.get_regs_as_uses(collector),
+            RegMem::Reg { reg } => collector.reg_use(reg),
+            RegMem::Mem { addr, .. } => addr.get_operands(collector),
         }
     }
-    pub(crate) fn to_reg(&self) -> Option<Reg> {
-        match self {
-            RegMem::Reg { reg } => Some(*reg),
-            _ => None,
-        }
+}
+
+impl From<Reg> for RegMem {
+    fn from(reg: Reg) -> RegMem {
+        RegMem::Reg { reg }
     }
 }
 
@@ -329,38 +797,31 @@ impl From<Writable<Reg>> for RegMem {
 }
 
 impl PrettyPrint for RegMem {
-    fn show_rru(&self, mb_rru: Option<&RealRegUniverse>) -> String {
-        self.show_rru_sized(mb_rru, 8)
-    }
-}
-
-impl PrettyPrintSized for RegMem {
-    fn show_rru_sized(&self, mb_rru: Option<&RealRegUniverse>, size: u8) -> String {
+    fn pretty_print(&self, size: u8) -> String {
         match self {
-            RegMem::Reg { reg } => show_ireg_sized(*reg, mb_rru, size),
-            RegMem::Mem { addr, .. } => addr.show_rru(mb_rru),
+            RegMem::Reg { reg } => pretty_print_reg(*reg, size),
+            RegMem::Mem { addr, .. } => addr.pretty_print(size),
         }
     }
 }
 
-/// Some basic ALU operations.  TODO: maybe add Adc, Sbb.
+/// Some basic ALU operations.
 #[derive(Copy, Clone, PartialEq)]
 pub enum AluRmiROpcode {
+    /// Add operation.
     Add,
+    /// Add with carry.
     Adc,
+    /// Integer subtraction.
     Sub,
+    /// Integer subtraction with borrow.
     Sbb,
+    /// Bitwise AND operation.
     And,
+    /// Bitwise inclusive OR.
     Or,
+    /// Bitwise exclusive OR.
     Xor,
-    /// The signless, non-extending (N x N -> N, for N in {32,64}) variant.
-    Mul,
-    /// 8-bit form of And. Handled separately as we don't have full 8-bit op
-    /// support (we just use wider instructions). Used only with some sequences
-    /// with SETcc.
-    And8,
-    /// 8-bit form of Or.
-    Or8,
 }
 
 impl fmt::Debug for AluRmiROpcode {
@@ -373,11 +834,8 @@ impl fmt::Debug for AluRmiROpcode {
             AluRmiROpcode::And => "and",
             AluRmiROpcode::Or => "or",
             AluRmiROpcode::Xor => "xor",
-            AluRmiROpcode::Mul => "imul",
-            AluRmiROpcode::And8 => "and",
-            AluRmiROpcode::Or8 => "or",
         };
-        write!(fmt, "{}", name)
+        write!(fmt, "{name}")
     }
 }
 
@@ -387,17 +845,27 @@ impl fmt::Display for AluRmiROpcode {
     }
 }
 
-impl AluRmiROpcode {
-    /// Is this a special-cased 8-bit ALU op?
-    pub fn is_8bit(self) -> bool {
+pub use crate::isa::x64::lower::isle::generated_code::AluRmROpcode;
+
+impl AluRmROpcode {
+    pub(crate) fn available_from(&self) -> SmallVec<[InstructionSet; 2]> {
         match self {
-            AluRmiROpcode::And8 | AluRmiROpcode::Or8 => true,
-            _ => false,
+            AluRmROpcode::Andn => smallvec![InstructionSet::BMI1],
+            AluRmROpcode::Sarx | AluRmROpcode::Shrx | AluRmROpcode::Shlx | AluRmROpcode::Bzhi => {
+                smallvec![InstructionSet::BMI2]
+            }
         }
     }
 }
 
+impl fmt::Display for AluRmROpcode {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(&format!("{self:?}").to_lowercase())
+    }
+}
+
 #[derive(Clone, PartialEq)]
+/// Unary operations requiring register or memory and register operands.
 pub enum UnaryRmROpcode {
     /// Bit-scan reverse.
     Bsr,
@@ -440,7 +908,44 @@ impl fmt::Display for UnaryRmROpcode {
     }
 }
 
+pub use crate::isa::x64::lower::isle::generated_code::UnaryRmRVexOpcode;
+
+impl UnaryRmRVexOpcode {
+    pub(crate) fn available_from(&self) -> SmallVec<[InstructionSet; 2]> {
+        match self {
+            UnaryRmRVexOpcode::Blsi | UnaryRmRVexOpcode::Blsmsk | UnaryRmRVexOpcode::Blsr => {
+                smallvec![InstructionSet::BMI1]
+            }
+        }
+    }
+}
+
+impl fmt::Display for UnaryRmRVexOpcode {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(&format!("{self:?}").to_lowercase())
+    }
+}
+
+pub use crate::isa::x64::lower::isle::generated_code::UnaryRmRImmVexOpcode;
+
+impl UnaryRmRImmVexOpcode {
+    pub(crate) fn available_from(&self) -> SmallVec<[InstructionSet; 2]> {
+        match self {
+            UnaryRmRImmVexOpcode::Rorx => {
+                smallvec![InstructionSet::BMI2]
+            }
+        }
+    }
+}
+
+impl fmt::Display for UnaryRmRImmVexOpcode {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(&format!("{self:?}").to_lowercase())
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
+/// Comparison operations.
 pub enum CmpOpcode {
     /// CMP instruction: compute `a - b` and set flags from result.
     Cmp,
@@ -452,6 +957,7 @@ pub enum CmpOpcode {
 pub(crate) enum InstructionSet {
     SSE,
     SSE2,
+    CMPXCHG16b,
     SSSE3,
     SSE41,
     SSE42,
@@ -460,6 +966,9 @@ pub(crate) enum InstructionSet {
     BMI1,
     #[allow(dead_code)] // never constructed (yet).
     BMI2,
+    FMA,
+    AVX,
+    AVX2,
     AVX512BITALG,
     AVX512DQ,
     AVX512F,
@@ -470,6 +979,7 @@ pub(crate) enum InstructionSet {
 /// Some SSE operations requiring 2 operands r/m and r.
 #[derive(Clone, Copy, PartialEq)]
 #[allow(dead_code)] // some variants here aren't used just yet
+#[allow(missing_docs)]
 pub enum SseOpcode {
     Addps,
     Addpd,
@@ -565,6 +1075,7 @@ pub enum SseOpcode {
     Pextrb,
     Pextrw,
     Pextrd,
+    Pextrq,
     Pinsrb,
     Pinsrw,
     Pinsrd,
@@ -645,8 +1156,20 @@ pub enum SseOpcode {
     Ucomiss,
     Ucomisd,
     Unpcklps,
+    Unpcklpd,
+    Unpckhps,
     Xorps,
     Xorpd,
+    Phaddw,
+    Phaddd,
+    Punpckhdq,
+    Punpckldq,
+    Punpckhqdq,
+    Punpcklqdq,
+    Pshuflw,
+    Pshufhw,
+    Pblendw,
+    Movddup,
 }
 
 impl SseOpcode {
@@ -687,6 +1210,7 @@ impl SseOpcode {
             | SseOpcode::Subss
             | SseOpcode::Ucomiss
             | SseOpcode::Unpcklps
+            | SseOpcode::Unpckhps
             | SseOpcode::Xorps => SSE,
 
             SseOpcode::Addpd
@@ -747,7 +1271,6 @@ impl SseOpcode {
             | SseOpcode::Pcmpgtd
             | SseOpcode::Pextrw
             | SseOpcode::Pinsrw
-            | SseOpcode::Pmaddubsw
             | SseOpcode::Pmaddwd
             | SseOpcode::Pmaxsw
             | SseOpcode::Pmaxub
@@ -786,14 +1309,25 @@ impl SseOpcode {
             | SseOpcode::Subpd
             | SseOpcode::Subsd
             | SseOpcode::Ucomisd
-            | SseOpcode::Xorpd => SSE2,
+            | SseOpcode::Xorpd
+            | SseOpcode::Punpckldq
+            | SseOpcode::Punpckhdq
+            | SseOpcode::Punpcklqdq
+            | SseOpcode::Punpckhqdq
+            | SseOpcode::Pshuflw
+            | SseOpcode::Pshufhw
+            | SseOpcode::Unpcklpd => SSE2,
 
             SseOpcode::Pabsb
             | SseOpcode::Pabsw
             | SseOpcode::Pabsd
             | SseOpcode::Palignr
             | SseOpcode::Pmulhrsw
-            | SseOpcode::Pshufb => SSSE3,
+            | SseOpcode::Pshufb
+            | SseOpcode::Phaddw
+            | SseOpcode::Phaddd
+            | SseOpcode::Pmaddubsw
+            | SseOpcode::Movddup => SSSE3,
 
             SseOpcode::Blendvpd
             | SseOpcode::Blendvps
@@ -803,6 +1337,7 @@ impl SseOpcode {
             | SseOpcode::Pcmpeqq
             | SseOpcode::Pextrb
             | SseOpcode::Pextrd
+            | SseOpcode::Pextrq
             | SseOpcode::Pinsrb
             | SseOpcode::Pinsrd
             | SseOpcode::Pmaxsb
@@ -831,7 +1366,8 @@ impl SseOpcode {
             | SseOpcode::Roundps
             | SseOpcode::Roundpd
             | SseOpcode::Roundss
-            | SseOpcode::Roundsd => SSE41,
+            | SseOpcode::Roundsd
+            | SseOpcode::Pblendw => SSE41,
 
             SseOpcode::Pcmpgtq => SSE42,
         }
@@ -842,6 +1378,26 @@ impl SseOpcode {
         match self {
             SseOpcode::Movd => 4,
             _ => 8,
+        }
+    }
+
+    /// Is `src2` with this opcode a scalar, as for lane insertions?
+    pub(crate) fn has_scalar_src2(self) -> bool {
+        match self {
+            SseOpcode::Pinsrb | SseOpcode::Pinsrw | SseOpcode::Pinsrd => true,
+            SseOpcode::Pmovsxbw
+            | SseOpcode::Pmovsxbd
+            | SseOpcode::Pmovsxbq
+            | SseOpcode::Pmovsxwd
+            | SseOpcode::Pmovsxwq
+            | SseOpcode::Pmovsxdq => true,
+            SseOpcode::Pmovzxbw
+            | SseOpcode::Pmovzxbd
+            | SseOpcode::Pmovzxbq
+            | SseOpcode::Pmovzxwd
+            | SseOpcode::Pmovzxwq
+            | SseOpcode::Pmovzxdq => true,
+            _ => false,
         }
     }
 }
@@ -943,6 +1499,7 @@ impl fmt::Debug for SseOpcode {
             SseOpcode::Pextrb => "pextrb",
             SseOpcode::Pextrw => "pextrw",
             SseOpcode::Pextrd => "pextrd",
+            SseOpcode::Pextrq => "pextrq",
             SseOpcode::Pinsrb => "pinsrb",
             SseOpcode::Pinsrw => "pinsrw",
             SseOpcode::Pinsrd => "pinsrd",
@@ -1023,10 +1580,22 @@ impl fmt::Debug for SseOpcode {
             SseOpcode::Ucomiss => "ucomiss",
             SseOpcode::Ucomisd => "ucomisd",
             SseOpcode::Unpcklps => "unpcklps",
+            SseOpcode::Unpckhps => "unpckhps",
             SseOpcode::Xorps => "xorps",
             SseOpcode::Xorpd => "xorpd",
+            SseOpcode::Phaddw => "phaddw",
+            SseOpcode::Phaddd => "phaddd",
+            SseOpcode::Punpckldq => "punpckldq",
+            SseOpcode::Punpckhdq => "punpckhdq",
+            SseOpcode::Punpcklqdq => "punpcklqdq",
+            SseOpcode::Punpckhqdq => "punpckhqdq",
+            SseOpcode::Pshuflw => "pshuflw",
+            SseOpcode::Pshufhw => "pshufhw",
+            SseOpcode::Pblendw => "pblendw",
+            SseOpcode::Movddup => "movddup",
+            SseOpcode::Unpcklpd => "unpcklpd",
         };
-        write!(fmt, "{}", name)
+        write!(fmt, "{name}")
     }
 }
 
@@ -1036,23 +1605,294 @@ impl fmt::Display for SseOpcode {
     }
 }
 
-#[derive(Clone, PartialEq)]
-pub enum Avx512Opcode {
-    Vcvtudq2ps,
-    Vpabsq,
-    Vpermi2b,
-    Vpmullq,
-    Vpopcntb,
+pub use crate::isa::x64::lower::isle::generated_code::AvxOpcode;
+
+impl AvxOpcode {
+    /// Which `InstructionSet`s support the opcode?
+    pub(crate) fn available_from(&self) -> SmallVec<[InstructionSet; 2]> {
+        match self {
+            AvxOpcode::Vfmadd213ss
+            | AvxOpcode::Vfmadd213sd
+            | AvxOpcode::Vfmadd213ps
+            | AvxOpcode::Vfmadd213pd
+            | AvxOpcode::Vfmadd132ss
+            | AvxOpcode::Vfmadd132sd
+            | AvxOpcode::Vfmadd132ps
+            | AvxOpcode::Vfmadd132pd
+            | AvxOpcode::Vfnmadd213ss
+            | AvxOpcode::Vfnmadd213sd
+            | AvxOpcode::Vfnmadd213ps
+            | AvxOpcode::Vfnmadd213pd
+            | AvxOpcode::Vfnmadd132ss
+            | AvxOpcode::Vfnmadd132sd
+            | AvxOpcode::Vfnmadd132ps
+            | AvxOpcode::Vfnmadd132pd
+            | AvxOpcode::Vfmsub213ss
+            | AvxOpcode::Vfmsub213sd
+            | AvxOpcode::Vfmsub213ps
+            | AvxOpcode::Vfmsub213pd
+            | AvxOpcode::Vfmsub132ss
+            | AvxOpcode::Vfmsub132sd
+            | AvxOpcode::Vfmsub132ps
+            | AvxOpcode::Vfmsub132pd
+            | AvxOpcode::Vfnmsub213ss
+            | AvxOpcode::Vfnmsub213sd
+            | AvxOpcode::Vfnmsub213ps
+            | AvxOpcode::Vfnmsub213pd
+            | AvxOpcode::Vfnmsub132ss
+            | AvxOpcode::Vfnmsub132sd
+            | AvxOpcode::Vfnmsub132ps
+            | AvxOpcode::Vfnmsub132pd => smallvec![InstructionSet::FMA],
+            AvxOpcode::Vminps
+            | AvxOpcode::Vminpd
+            | AvxOpcode::Vmaxps
+            | AvxOpcode::Vmaxpd
+            | AvxOpcode::Vandnps
+            | AvxOpcode::Vandnpd
+            | AvxOpcode::Vpandn
+            | AvxOpcode::Vcmpps
+            | AvxOpcode::Vcmppd
+            | AvxOpcode::Vpsrlw
+            | AvxOpcode::Vpsrld
+            | AvxOpcode::Vpsrlq
+            | AvxOpcode::Vpaddb
+            | AvxOpcode::Vpaddw
+            | AvxOpcode::Vpaddd
+            | AvxOpcode::Vpaddq
+            | AvxOpcode::Vpaddsb
+            | AvxOpcode::Vpaddsw
+            | AvxOpcode::Vpaddusb
+            | AvxOpcode::Vpaddusw
+            | AvxOpcode::Vpsubb
+            | AvxOpcode::Vpsubw
+            | AvxOpcode::Vpsubd
+            | AvxOpcode::Vpsubq
+            | AvxOpcode::Vpsubsb
+            | AvxOpcode::Vpsubsw
+            | AvxOpcode::Vpsubusb
+            | AvxOpcode::Vpsubusw
+            | AvxOpcode::Vpavgb
+            | AvxOpcode::Vpavgw
+            | AvxOpcode::Vpand
+            | AvxOpcode::Vandps
+            | AvxOpcode::Vandpd
+            | AvxOpcode::Vpor
+            | AvxOpcode::Vorps
+            | AvxOpcode::Vorpd
+            | AvxOpcode::Vpxor
+            | AvxOpcode::Vxorps
+            | AvxOpcode::Vxorpd
+            | AvxOpcode::Vpmullw
+            | AvxOpcode::Vpmulld
+            | AvxOpcode::Vpmulhw
+            | AvxOpcode::Vpmulhd
+            | AvxOpcode::Vpmulhrsw
+            | AvxOpcode::Vpmulhuw
+            | AvxOpcode::Vpmuldq
+            | AvxOpcode::Vpmuludq
+            | AvxOpcode::Vpunpckhwd
+            | AvxOpcode::Vpunpcklwd
+            | AvxOpcode::Vunpcklps
+            | AvxOpcode::Vunpckhps
+            | AvxOpcode::Vaddps
+            | AvxOpcode::Vaddpd
+            | AvxOpcode::Vsubps
+            | AvxOpcode::Vsubpd
+            | AvxOpcode::Vmulps
+            | AvxOpcode::Vmulpd
+            | AvxOpcode::Vdivps
+            | AvxOpcode::Vdivpd
+            | AvxOpcode::Vpcmpeqb
+            | AvxOpcode::Vpcmpeqw
+            | AvxOpcode::Vpcmpeqd
+            | AvxOpcode::Vpcmpeqq
+            | AvxOpcode::Vpcmpgtb
+            | AvxOpcode::Vpcmpgtw
+            | AvxOpcode::Vpcmpgtd
+            | AvxOpcode::Vpcmpgtq
+            | AvxOpcode::Vblendvps
+            | AvxOpcode::Vblendvpd
+            | AvxOpcode::Vpblendvb
+            | AvxOpcode::Vmovlhps
+            | AvxOpcode::Vpminsb
+            | AvxOpcode::Vpminsw
+            | AvxOpcode::Vpminsd
+            | AvxOpcode::Vpminub
+            | AvxOpcode::Vpminuw
+            | AvxOpcode::Vpminud
+            | AvxOpcode::Vpmaxsb
+            | AvxOpcode::Vpmaxsw
+            | AvxOpcode::Vpmaxsd
+            | AvxOpcode::Vpmaxub
+            | AvxOpcode::Vpmaxuw
+            | AvxOpcode::Vpmaxud
+            | AvxOpcode::Vpunpcklbw
+            | AvxOpcode::Vpunpckhbw
+            | AvxOpcode::Vpacksswb
+            | AvxOpcode::Vpackssdw
+            | AvxOpcode::Vpackuswb
+            | AvxOpcode::Vpackusdw
+            | AvxOpcode::Vpalignr
+            | AvxOpcode::Vpinsrb
+            | AvxOpcode::Vpinsrw
+            | AvxOpcode::Vpinsrd
+            | AvxOpcode::Vpinsrq
+            | AvxOpcode::Vpmaddwd
+            | AvxOpcode::Vpmaddubsw
+            | AvxOpcode::Vinsertps
+            | AvxOpcode::Vpshufb
+            | AvxOpcode::Vshufps
+            | AvxOpcode::Vpsllw
+            | AvxOpcode::Vpslld
+            | AvxOpcode::Vpsllq
+            | AvxOpcode::Vpsraw
+            | AvxOpcode::Vpsrad
+            | AvxOpcode::Vpmovsxbw
+            | AvxOpcode::Vpmovzxbw
+            | AvxOpcode::Vpmovsxwd
+            | AvxOpcode::Vpmovzxwd
+            | AvxOpcode::Vpmovsxdq
+            | AvxOpcode::Vpmovzxdq
+            | AvxOpcode::Vaddss
+            | AvxOpcode::Vaddsd
+            | AvxOpcode::Vmulss
+            | AvxOpcode::Vmulsd
+            | AvxOpcode::Vsubss
+            | AvxOpcode::Vsubsd
+            | AvxOpcode::Vdivss
+            | AvxOpcode::Vdivsd
+            | AvxOpcode::Vpabsb
+            | AvxOpcode::Vpabsw
+            | AvxOpcode::Vpabsd
+            | AvxOpcode::Vminss
+            | AvxOpcode::Vminsd
+            | AvxOpcode::Vmaxss
+            | AvxOpcode::Vmaxsd
+            | AvxOpcode::Vsqrtps
+            | AvxOpcode::Vsqrtpd
+            | AvxOpcode::Vroundpd
+            | AvxOpcode::Vroundps
+            | AvxOpcode::Vcvtdq2pd
+            | AvxOpcode::Vcvtdq2ps
+            | AvxOpcode::Vcvtpd2ps
+            | AvxOpcode::Vcvtps2pd
+            | AvxOpcode::Vcvttpd2dq
+            | AvxOpcode::Vcvttps2dq
+            | AvxOpcode::Vphaddw
+            | AvxOpcode::Vphaddd
+            | AvxOpcode::Vpunpckldq
+            | AvxOpcode::Vpunpckhdq
+            | AvxOpcode::Vpunpcklqdq
+            | AvxOpcode::Vpunpckhqdq
+            | AvxOpcode::Vpshuflw
+            | AvxOpcode::Vpshufhw
+            | AvxOpcode::Vpshufd
+            | AvxOpcode::Vmovss
+            | AvxOpcode::Vmovsd
+            | AvxOpcode::Vmovups
+            | AvxOpcode::Vmovupd
+            | AvxOpcode::Vmovdqu
+            | AvxOpcode::Vpextrb
+            | AvxOpcode::Vpextrw
+            | AvxOpcode::Vpextrd
+            | AvxOpcode::Vpextrq
+            | AvxOpcode::Vpblendw
+            | AvxOpcode::Vmovddup
+            | AvxOpcode::Vbroadcastss
+            | AvxOpcode::Vmovd
+            | AvxOpcode::Vmovq
+            | AvxOpcode::Vmovmskps
+            | AvxOpcode::Vmovmskpd
+            | AvxOpcode::Vpmovmskb
+            | AvxOpcode::Vcvtsi2ss
+            | AvxOpcode::Vcvtsi2sd
+            | AvxOpcode::Vcvtss2sd
+            | AvxOpcode::Vcvtsd2ss
+            | AvxOpcode::Vsqrtss
+            | AvxOpcode::Vsqrtsd
+            | AvxOpcode::Vroundss
+            | AvxOpcode::Vroundsd
+            | AvxOpcode::Vunpcklpd
+            | AvxOpcode::Vptest
+            | AvxOpcode::Vucomiss
+            | AvxOpcode::Vucomisd => {
+                smallvec![InstructionSet::AVX]
+            }
+
+            AvxOpcode::Vpbroadcastb | AvxOpcode::Vpbroadcastw | AvxOpcode::Vpbroadcastd => {
+                smallvec![InstructionSet::AVX2]
+            }
+        }
+    }
+
+    /// Is the opcode known to be commutative?
+    ///
+    /// Note that this method is not exhaustive, and there may be commutative
+    /// opcodes that we don't recognize as commutative.
+    pub(crate) fn is_commutative(&self) -> bool {
+        match *self {
+            AvxOpcode::Vpaddb
+            | AvxOpcode::Vpaddw
+            | AvxOpcode::Vpaddd
+            | AvxOpcode::Vpaddq
+            | AvxOpcode::Vpaddsb
+            | AvxOpcode::Vpaddsw
+            | AvxOpcode::Vpaddusb
+            | AvxOpcode::Vpaddusw
+            | AvxOpcode::Vpand
+            | AvxOpcode::Vandps
+            | AvxOpcode::Vandpd
+            | AvxOpcode::Vpor
+            | AvxOpcode::Vorps
+            | AvxOpcode::Vorpd
+            | AvxOpcode::Vpxor
+            | AvxOpcode::Vxorps
+            | AvxOpcode::Vxorpd
+            | AvxOpcode::Vpmuldq
+            | AvxOpcode::Vpmuludq
+            | AvxOpcode::Vaddps
+            | AvxOpcode::Vaddpd
+            | AvxOpcode::Vmulps
+            | AvxOpcode::Vmulpd
+            | AvxOpcode::Vpcmpeqb
+            | AvxOpcode::Vpcmpeqw
+            | AvxOpcode::Vpcmpeqd
+            | AvxOpcode::Vpcmpeqq
+            | AvxOpcode::Vaddss
+            | AvxOpcode::Vaddsd
+            | AvxOpcode::Vmulss
+            | AvxOpcode::Vmulsd => true,
+            _ => false,
+        }
+    }
 }
+
+impl fmt::Display for AvxOpcode {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        format!("{self:?}").to_lowercase().fmt(f)
+    }
+}
+
+#[derive(Copy, Clone, PartialEq)]
+#[allow(missing_docs)]
+pub enum Avx512TupleType {
+    Full,
+    FullMem,
+    Mem128,
+}
+
+pub use crate::isa::x64::lower::isle::generated_code::Avx512Opcode;
 
 impl Avx512Opcode {
     /// Which `InstructionSet`s support the opcode?
     pub(crate) fn available_from(&self) -> SmallVec<[InstructionSet; 2]> {
         match self {
-            Avx512Opcode::Vcvtudq2ps => {
+            Avx512Opcode::Vcvtudq2ps
+            | Avx512Opcode::Vpabsq
+            | Avx512Opcode::Vpsraq
+            | Avx512Opcode::VpsraqImm => {
                 smallvec![InstructionSet::AVX512F, InstructionSet::AVX512VL]
             }
-            Avx512Opcode::Vpabsq => smallvec![InstructionSet::AVX512F, InstructionSet::AVX512VL],
             Avx512Opcode::Vpermi2b => {
                 smallvec![InstructionSet::AVX512VL, InstructionSet::AVX512VBMI]
             }
@@ -1062,24 +1902,29 @@ impl Avx512Opcode {
             }
         }
     }
-}
 
-impl fmt::Debug for Avx512Opcode {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        let name = match self {
-            Avx512Opcode::Vcvtudq2ps => "vcvtudq2ps",
-            Avx512Opcode::Vpabsq => "vpabsq",
-            Avx512Opcode::Vpermi2b => "vpermi2b",
-            Avx512Opcode::Vpmullq => "vpmullq",
-            Avx512Opcode::Vpopcntb => "vpopcntb",
-        };
-        write!(fmt, "{}", name)
+    /// What is the "TupleType" of this opcode, which affects the scaling factor
+    /// for 8-bit displacements when this instruction uses memory operands.
+    ///
+    /// This can be found in the encoding table for each instruction and is
+    /// interpreted according to Table 2-34 and 2-35 in the Intel instruction
+    /// manual.
+    pub fn tuple_type(&self) -> Avx512TupleType {
+        use Avx512Opcode::*;
+        use Avx512TupleType::*;
+
+        match self {
+            Vcvtudq2ps | Vpabsq | Vpmullq | VpsraqImm => Full,
+            Vpermi2b | Vpopcntb => FullMem,
+            Vpsraq => Mem128,
+        }
     }
 }
 
 impl fmt::Display for Avx512Opcode {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Debug::fmt(self, f)
+        let s = format!("{self:?}");
+        f.write_str(&s.to_lowercase())
     }
 }
 
@@ -1089,8 +1934,11 @@ impl fmt::Display for Avx512Opcode {
 #[allow(dead_code)]
 #[derive(Clone, PartialEq)]
 pub enum ExtKind {
+    /// No extension.
     None,
+    /// Sign-extend.
     SignExtend,
+    /// Zero-extend.
     ZeroExtend,
 }
 
@@ -1139,6 +1987,15 @@ impl ExtMode {
             ExtMode::BQ | ExtMode::WQ | ExtMode::LQ => 8,
         }
     }
+
+    /// Source size, as an integer type.
+    pub(crate) fn src_type(&self) -> Type {
+        match self {
+            ExtMode::BL | ExtMode::BQ => I8,
+            ExtMode::WL | ExtMode::WQ => I16,
+            ExtMode::LQ => I32,
+        }
+    }
 }
 
 impl fmt::Debug for ExtMode {
@@ -1150,7 +2007,7 @@ impl fmt::Debug for ExtMode {
             ExtMode::WQ => "wq",
             ExtMode::LQ => "lq",
         };
-        write!(fmt, "{}", name)
+        write!(fmt, "{name}")
     }
 }
 
@@ -1163,12 +2020,15 @@ impl fmt::Display for ExtMode {
 /// These indicate the form of a scalar shift/rotate: left, signed right, unsigned right.
 #[derive(Clone, Copy)]
 pub enum ShiftKind {
+    /// Left shift.
     ShiftLeft,
     /// Inserts zeros in the most significant bits.
     ShiftRightLogical,
     /// Replicates the sign bit in the most significant bits.
     ShiftRightArithmetic,
+    /// Left rotation.
     RotateLeft,
+    /// Right rotation.
     RotateRight,
 }
 
@@ -1181,7 +2041,7 @@ impl fmt::Debug for ShiftKind {
             ShiftKind::RotateLeft => "rol",
             ShiftKind::RotateRight => "ror",
         };
-        write!(fmt, "{}", name)
+        write!(fmt, "{name}")
     }
 }
 
@@ -1191,34 +2051,9 @@ impl fmt::Display for ShiftKind {
     }
 }
 
-/// What kind of division or remainer instruction this is?
-#[derive(Clone)]
-pub enum DivOrRemKind {
-    SignedDiv,
-    UnsignedDiv,
-    SignedRem,
-    UnsignedRem,
-}
-
-impl DivOrRemKind {
-    pub(crate) fn is_signed(&self) -> bool {
-        match self {
-            DivOrRemKind::SignedDiv | DivOrRemKind::SignedRem => true,
-            _ => false,
-        }
-    }
-
-    pub(crate) fn is_div(&self) -> bool {
-        match self {
-            DivOrRemKind::SignedDiv | DivOrRemKind::UnsignedDiv => true,
-            _ => false,
-        }
-    }
-}
-
 /// These indicate condition code tests.  Not all are represented since not all are useful in
 /// compiler-generated code.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CC {
     ///  overflow
@@ -1276,8 +2111,6 @@ impl CC {
             IntCC::UnsignedGreaterThan => CC::NBE,
             IntCC::UnsignedLessThanOrEqual => CC::BE,
             IntCC::UnsignedLessThan => CC::B,
-            IntCC::Overflow => CC::O,
-            IntCC::NotOverflow => CC::NO,
         }
     }
 
@@ -1309,32 +2142,6 @@ impl CC {
         }
     }
 
-    pub(crate) fn from_floatcc(floatcc: FloatCC) -> Self {
-        match floatcc {
-            FloatCC::Ordered => CC::NP,
-            FloatCC::Unordered => CC::P,
-            // Alias for NE
-            FloatCC::OrderedNotEqual => CC::NZ,
-            // Alias for E
-            FloatCC::UnorderedOrEqual => CC::Z,
-            // Alias for A
-            FloatCC::GreaterThan => CC::NBE,
-            // Alias for AE
-            FloatCC::GreaterThanOrEqual => CC::NB,
-            FloatCC::UnorderedOrLessThan => CC::B,
-            FloatCC::UnorderedOrLessThanOrEqual => CC::BE,
-            FloatCC::Equal
-            | FloatCC::NotEqual
-            | FloatCC::LessThan
-            | FloatCC::LessThanOrEqual
-            | FloatCC::UnorderedOrGreaterThan
-            | FloatCC::UnorderedOrGreaterThanOrEqual => panic!(
-                "{:?} can't be lowered to a CC code; treat as special case.",
-                floatcc
-            ),
-        }
-    }
-
     pub(crate) fn get_enc(self) -> u8 {
         self as u8
     }
@@ -1360,7 +2167,7 @@ impl fmt::Debug for CC {
             CC::P => "p",
             CC::NP => "np",
         };
-        write!(fmt, "{}", name)
+        write!(fmt, "{name}")
     }
 }
 
@@ -1373,14 +2180,23 @@ impl fmt::Display for CC {
 /// Encode the ways that floats can be compared. This is used in float comparisons such as `cmpps`,
 /// e.g.; it is distinguished from other float comparisons (e.g. `ucomiss`) in that those use EFLAGS
 /// whereas [FcmpImm] is used as an immediate.
-pub(crate) enum FcmpImm {
+#[derive(Clone, Copy)]
+pub enum FcmpImm {
+    /// Equal comparison.
     Equal = 0x00,
+    /// Less than comparison.
     LessThan = 0x01,
+    /// Less than or equal comparison.
     LessThanOrEqual = 0x02,
+    /// Unordered.
     Unordered = 0x03,
+    /// Not equal comparison.
     NotEqual = 0x04,
+    /// Unordered of greater than or equal comparison.
     UnorderedOrGreaterThanOrEqual = 0x05,
+    /// Unordered or greater than comparison.
     UnorderedOrGreaterThan = 0x06,
+    /// Ordered.
     Ordered = 0x07,
 }
 
@@ -1401,7 +2217,7 @@ impl From<FloatCC> for FcmpImm {
             FloatCC::UnorderedOrGreaterThanOrEqual => FcmpImm::UnorderedOrGreaterThanOrEqual,
             FloatCC::UnorderedOrGreaterThan => FcmpImm::UnorderedOrGreaterThan,
             FloatCC::Ordered => FcmpImm::Ordered,
-            _ => panic!("unable to create comparison predicate for {}", cond),
+            _ => panic!("unable to create comparison predicate for {cond}"),
         }
     }
 }
@@ -1411,11 +2227,16 @@ impl From<FloatCC> for FcmpImm {
 /// (i.e. the rounding mode) which only take up the first two bits when encoded.
 /// However the rounding immediate which this field helps make up, also includes
 /// bits 3 and 4 which define the rounding select and precision mask respectively.
-/// These two bits are not defined here and are implictly set to zero when encoded.
-pub(crate) enum RoundImm {
+/// These two bits are not defined here and are implicitly set to zero when encoded.
+#[derive(Clone, Copy)]
+pub enum RoundImm {
+    /// Round to nearest mode.
     RoundNearest = 0x00,
+    /// Round down mode.
     RoundDown = 0x01,
+    /// Round up mode.
     RoundUp = 0x02,
+    /// Round to zero mode.
     RoundZero = 0x03,
 }
 
@@ -1428,9 +2249,13 @@ impl RoundImm {
 /// An operand's size in bits.
 #[derive(Clone, Copy, PartialEq)]
 pub enum OperandSize {
+    /// 8-bit.
     Size8,
+    /// 16-bit.
     Size16,
+    /// 32-bit.
     Size32,
+    /// 64-bit.
     Size64,
 }
 
@@ -1467,6 +2292,15 @@ impl OperandSize {
 
     pub(crate) fn to_bits(&self) -> u8 {
         self.to_bytes() * 8
+    }
+
+    pub(crate) fn to_type(&self) -> Type {
+        match self {
+            Self::Size8 => I8,
+            Self::Size16 => I16,
+            Self::Size32 => I32,
+            Self::Size64 => I64,
+        }
     }
 }
 

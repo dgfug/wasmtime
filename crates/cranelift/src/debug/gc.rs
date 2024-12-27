@@ -1,8 +1,10 @@
 use crate::debug::transform::AddressTransform;
+use crate::debug::{Compilation, Reader};
 use gimli::constants;
 use gimli::read;
-use gimli::{Reader, UnitSectionOffset};
+use gimli::UnitSectionOffset;
 use std::collections::{HashMap, HashSet};
+use wasmtime_environ::{PrimaryMap, StaticModuleIndex};
 
 #[derive(Debug)]
 pub struct Dependencies {
@@ -65,21 +67,26 @@ impl Dependencies {
     }
 }
 
-pub fn build_dependencies<R: Reader<Offset = usize>>(
-    dwarf: &read::Dwarf<R>,
-    at: &AddressTransform,
+pub fn build_dependencies(
+    compilation: &mut Compilation<'_>,
+    dwp: &Option<read::DwarfPackage<Reader<'_>>>,
+    at: &PrimaryMap<StaticModuleIndex, AddressTransform>,
 ) -> read::Result<Dependencies> {
     let mut deps = Dependencies::new();
-    let mut units = dwarf.units();
-    while let Some(unit) = units.next()? {
-        build_unit_dependencies(unit, dwarf, at, &mut deps)?;
+    for (i, translation) in compilation.translations.iter() {
+        let dwarf = &translation.debuginfo.dwarf;
+        let mut units = dwarf.units();
+        while let Some(unit) = units.next()? {
+            build_unit_dependencies(unit, dwarf, dwp, &at[i], &mut deps)?;
+        }
     }
     Ok(deps)
 }
 
-fn build_unit_dependencies<R: Reader<Offset = usize>>(
-    header: read::UnitHeader<R>,
-    dwarf: &read::Dwarf<R>,
+fn build_unit_dependencies(
+    header: read::UnitHeader<Reader<'_>>,
+    dwarf: &read::Dwarf<Reader<'_>>,
+    dwp: &Option<read::DwarfPackage<Reader<'_>>>,
     at: &AddressTransform,
     deps: &mut Dependencies,
 ) -> read::Result<()> {
@@ -87,33 +94,75 @@ fn build_unit_dependencies<R: Reader<Offset = usize>>(
     let mut tree = unit.entries_tree(None)?;
     let root = tree.root()?;
     build_die_dependencies(root, dwarf, &unit, at, deps)?;
+
+    if let Some(dwarf_package) = dwp {
+        if let Some(dwo_id) = unit.dwo_id {
+            if let Some(cu) = dwarf_package.find_cu(dwo_id, dwarf)? {
+                if let Some(unit_header) = cu.debug_info.units().next()? {
+                    build_unit_dependencies(unit_header, &cu, &None, at, deps)?;
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
-fn has_die_back_edge<R: Reader<Offset = usize>>(die: &read::DebuggingInformationEntry<R>) -> bool {
-    match die.tag() {
-        constants::DW_TAG_variable
-        | constants::DW_TAG_constant
-        | constants::DW_TAG_inlined_subroutine
-        | constants::DW_TAG_lexical_block
-        | constants::DW_TAG_label
-        | constants::DW_TAG_with_stmt
-        | constants::DW_TAG_try_block
-        | constants::DW_TAG_catch_block
-        | constants::DW_TAG_template_type_parameter
-        | constants::DW_TAG_enumerator
-        | constants::DW_TAG_member
-        | constants::DW_TAG_variant_part
-        | constants::DW_TAG_variant
-        | constants::DW_TAG_formal_parameter => true,
-        _ => false,
-    }
+fn has_die_back_edge(die: &read::DebuggingInformationEntry<Reader<'_>>) -> read::Result<bool> {
+    // DIEs can be broadly divided into three categories:
+    // 1. Extensions of their parents; effectively attributes: DW_TAG_variable, DW_TAG_member, etc.
+    // 2. Standalone entities referred to by other DIEs via 'reference' class attributes: types.
+    // 3. Structural entities that organize how the above relate to each other: namespaces.
+    // Here, we must make sure to return 'true' for DIEs in the first category since stripping them,
+    // provided their parent is alive, is always wrong. To be conservatively correct in the face
+    // of new/vendor tags, we maintain a "(mostly) known good" list of tags of the latter categories.
+    let result = match die.tag() {
+        constants::DW_TAG_array_type
+        | constants::DW_TAG_atomic_type
+        | constants::DW_TAG_base_type
+        | constants::DW_TAG_class_type
+        | constants::DW_TAG_const_type
+        | constants::DW_TAG_dwarf_procedure
+        | constants::DW_TAG_entry_point
+        | constants::DW_TAG_enumeration_type
+        | constants::DW_TAG_pointer_type
+        | constants::DW_TAG_ptr_to_member_type
+        | constants::DW_TAG_reference_type
+        | constants::DW_TAG_restrict_type
+        | constants::DW_TAG_rvalue_reference_type
+        | constants::DW_TAG_string_type
+        | constants::DW_TAG_structure_type
+        | constants::DW_TAG_typedef
+        | constants::DW_TAG_union_type
+        | constants::DW_TAG_unspecified_type
+        | constants::DW_TAG_volatile_type
+        | constants::DW_TAG_coarray_type
+        | constants::DW_TAG_common_block
+        | constants::DW_TAG_dynamic_type
+        | constants::DW_TAG_file_type
+        | constants::DW_TAG_immutable_type
+        | constants::DW_TAG_interface_type
+        | constants::DW_TAG_set_type
+        | constants::DW_TAG_shared_type
+        | constants::DW_TAG_subroutine_type
+        | constants::DW_TAG_packed_type
+        | constants::DW_TAG_template_alias
+        | constants::DW_TAG_namelist
+        | constants::DW_TAG_namespace
+        | constants::DW_TAG_imported_unit
+        | constants::DW_TAG_imported_declaration
+        | constants::DW_TAG_imported_module
+        | constants::DW_TAG_module => false,
+        constants::DW_TAG_subprogram => die.attr(constants::DW_AT_declaration)?.is_some(),
+        _ => true,
+    };
+    Ok(result)
 }
 
-fn has_valid_code_range<R: Reader<Offset = usize>>(
-    die: &read::DebuggingInformationEntry<R>,
-    dwarf: &read::Dwarf<R>,
-    unit: &read::Unit<R>,
+fn has_valid_code_range(
+    die: &read::DebuggingInformationEntry<Reader<'_>>,
+    dwarf: &read::Dwarf<Reader<'_>>,
+    unit: &read::Unit<Reader<'_>>,
     at: &AddressTransform,
 ) -> read::Result<bool> {
     match die.tag() {
@@ -186,10 +235,10 @@ fn has_valid_code_range<R: Reader<Offset = usize>>(
     Ok(false)
 }
 
-fn build_die_dependencies<R: Reader<Offset = usize>>(
-    die: read::EntriesTreeNode<R>,
-    dwarf: &read::Dwarf<R>,
-    unit: &read::Unit<R>,
+fn build_die_dependencies(
+    die: read::EntriesTreeNode<Reader<'_>>,
+    dwarf: &read::Dwarf<Reader<'_>>,
+    unit: &read::Unit<Reader<'_>>,
     at: &AddressTransform,
     deps: &mut Dependencies,
 ) -> read::Result<()> {
@@ -205,7 +254,7 @@ fn build_die_dependencies<R: Reader<Offset = usize>>(
         let child_entry = child.entry();
         let child_offset = child_entry.offset().to_unit_section_offset(unit);
         deps.add_edge(child_offset, offset);
-        if has_die_back_edge(child_entry) {
+        if has_die_back_edge(child_entry)? {
             deps.add_edge(offset, child_offset);
         }
         if has_valid_code_range(child_entry, dwarf, unit, at)? {
@@ -216,11 +265,11 @@ fn build_die_dependencies<R: Reader<Offset = usize>>(
     Ok(())
 }
 
-fn build_attr_dependencies<R: Reader<Offset = usize>>(
-    attr: &read::Attribute<R>,
+fn build_attr_dependencies(
+    attr: &read::Attribute<Reader<'_>>,
     offset: UnitSectionOffset,
-    _dwarf: &read::Dwarf<R>,
-    unit: &read::Unit<R>,
+    _dwarf: &read::Dwarf<Reader<'_>>,
+    unit: &read::Unit<Reader<'_>>,
     _at: &AddressTransform,
     deps: &mut Dependencies,
 ) -> read::Result<()> {

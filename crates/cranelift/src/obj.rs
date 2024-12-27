@@ -13,157 +13,68 @@
 //! function body, the imported wasm function do not. The trampolines symbol
 //! names have format "_trampoline_N", where N is `SignatureIndex`.
 
-use crate::debug::{DwarfSection, DwarfSectionRelocTarget};
-use crate::{CompiledFunction, Relocation, RelocationTarget};
+use crate::{CompiledFunction, RelocationTarget};
 use anyhow::Result;
-use cranelift_codegen::binemit::{Addend, Reloc};
-use cranelift_codegen::ir::LibCall;
-use cranelift_codegen::isa::{
-    unwind::{systemv, UnwindInfo},
-    TargetIsa,
-};
+use cranelift_codegen::binemit::Reloc;
+use cranelift_codegen::isa::unwind::{systemv, UnwindInfo};
 use cranelift_codegen::TextSectionBuilder;
+use cranelift_control::ControlPlane;
 use gimli::write::{Address, EhFrame, EndianVec, FrameTable, Writer};
 use gimli::RunTimeEndian;
-use object::write::{
-    Object, Relocation as ObjectRelocation, SectionId, StandardSegment, Symbol, SymbolId,
-    SymbolSection,
-};
-use object::{
-    Architecture, RelocationEncoding, RelocationKind, SectionKind, SymbolFlags, SymbolKind,
-    SymbolScope,
-};
+use object::write::{Object, SectionId, StandardSegment, Symbol, SymbolId, SymbolSection};
+use object::{Architecture, SectionFlags, SectionKind, SymbolFlags, SymbolKind, SymbolScope};
 use std::collections::HashMap;
-use std::convert::TryFrom;
-use std::mem;
 use std::ops::Range;
-use wasmtime_environ::obj;
-use wasmtime_environ::{
-    DefinedFuncIndex, EntityRef, FuncIndex, Module, PrimaryMap, SignatureIndex, Trampoline,
-};
+use wasmtime_environ::obj::{self, LibCall};
+use wasmtime_environ::{Compiler, TripleExt, Unsigned};
 
 const TEXT_SECTION_NAME: &[u8] = b".text";
 
-/// Iterates through all `LibCall` members and all runtime exported functions.
-#[macro_export]
-macro_rules! for_each_libcall {
-    ($op:ident) => {
-        $op![
-            (UdivI64, wasmtime_i64_udiv),
-            (UdivI64, wasmtime_i64_udiv),
-            (SdivI64, wasmtime_i64_sdiv),
-            (UremI64, wasmtime_i64_urem),
-            (SremI64, wasmtime_i64_srem),
-            (IshlI64, wasmtime_i64_ishl),
-            (UshrI64, wasmtime_i64_ushr),
-            (SshrI64, wasmtime_i64_sshr),
-            (CeilF32, wasmtime_f32_ceil),
-            (FloorF32, wasmtime_f32_floor),
-            (TruncF32, wasmtime_f32_trunc),
-            (NearestF32, wasmtime_f32_nearest),
-            (CeilF64, wasmtime_f64_ceil),
-            (FloorF64, wasmtime_f64_floor),
-            (TruncF64, wasmtime_f64_trunc),
-            (NearestF64, wasmtime_f64_nearest)
-        ];
-    };
-}
-
-fn write_libcall_symbols(obj: &mut Object) -> HashMap<LibCall, SymbolId> {
-    let mut libcalls = HashMap::new();
-    macro_rules! add_libcall_symbol {
-        [$(($libcall:ident, $export:ident)),*] => {{
-            $(
-                let symbol_id = obj.add_symbol(Symbol {
-                    name: stringify!($export).as_bytes().to_vec(),
-                    value: 0,
-                    size: 0,
-                    kind: SymbolKind::Text,
-                    scope: SymbolScope::Linkage,
-                    weak: true,
-                    section: SymbolSection::Undefined,
-                    flags: SymbolFlags::None,
-                });
-                libcalls.insert(LibCall::$libcall, symbol_id);
-            )+
-        }};
-    }
-    for_each_libcall!(add_libcall_symbol);
-
-    libcalls
-}
-
-/// A helper structure used to assemble the final text section of an exectuable,
+/// A helper structure used to assemble the final text section of an executable,
 /// plus unwinding information and other related details.
 ///
 /// This builder relies on Cranelift-specific internals but assembles into a
 /// generic `Object` which will get further appended to in a compiler-agnostic
 /// fashion later.
-pub struct ObjectBuilder<'a> {
+pub struct ModuleTextBuilder<'a> {
     /// The target that we're compiling for, used to query target-specific
     /// information as necessary.
-    isa: &'a dyn TargetIsa,
+    compiler: &'a dyn Compiler,
 
     /// The object file that we're generating code into.
-    obj: &'a mut Object,
+    obj: &'a mut Object<'static>,
 
     /// The WebAssembly module we're generating code for.
-    module: &'a Module,
-
-    /// Map of injected symbols for all possible libcalls, used whenever there's
-    /// a relocation against a libcall.
-    libcalls: HashMap<LibCall, SymbolId>,
-
-    windows_unwind_info_id: Option<SectionId>,
-
-    /// Packed form of windows unwind tables which, if present, will get emitted
-    /// to a windows-specific unwind info section.
-    windows_unwind_info: Vec<RUNTIME_FUNCTION>,
-
-    systemv_unwind_info_id: Option<SectionId>,
-
-    /// Pending unwinding information for DWARF-based platforms. This is used to
-    /// build a `.eh_frame` lookalike at the very end of object building.
-    systemv_unwind_info: Vec<(u64, &'a systemv::UnwindInfo)>,
-
-    /// The corresponding symbol for each function, inserted as they're defined.
-    ///
-    /// If an index isn't here yet then it hasn't been defined yet.
-    func_symbols: PrimaryMap<FuncIndex, SymbolId>,
-
-    /// `object`-crate identifier for the text section.
     text_section: SectionId,
 
-    /// Relocations to be added once we've got all function symbols available to
-    /// us. The first entry is the relocation that we're applying, relative
-    /// within a function, and the second entry here is the offset of the
-    /// function that contains this relocation.
-    relocations: Vec<(&'a Relocation, u64)>,
+    unwind_info: UnwindInfoBuilder<'a>,
 
     /// In-progress text section that we're using cranelift's `MachBuffer` to
     /// build to resolve relocations (calls) between functions.
-    pub text: Box<dyn TextSectionBuilder>,
+    text: Box<dyn TextSectionBuilder>,
 
-    /// The unwind info _must_ come directly after the text section. Our FDE's
-    /// instructions are encoded to rely on this placement. We use this `bool`
-    /// for debug assertions to ensure that we get the ordering correct.
-    added_unwind_info: bool,
+    /// Symbols defined in the object for libcalls that relocations are applied
+    /// against.
+    ///
+    /// Note that this isn't typically used. It's only used for SSE-disabled
+    /// builds without SIMD on x86_64 right now.
+    libcall_symbols: HashMap<LibCall, SymbolId>,
+
+    ctrl_plane: ControlPlane,
 }
 
-// This is a mirror of `RUNTIME_FUNCTION` in the Windows API, but defined here
-// to ensure everything is always `u32` and to have it available on all
-// platforms. Note that all of these specifiers here are relative to a "base
-// address" which we define as the base of where the text section is eventually
-// loaded.
-#[allow(non_camel_case_types)]
-struct RUNTIME_FUNCTION {
-    begin: u32,
-    end: u32,
-    unwind_address: u32,
-}
-
-impl<'a> ObjectBuilder<'a> {
-    pub fn new(obj: &'a mut Object, module: &'a Module, isa: &'a dyn TargetIsa) -> Self {
+impl<'a> ModuleTextBuilder<'a> {
+    /// Creates a new builder for the text section of an executable.
+    ///
+    /// The `.text` section will be appended to the specified `obj` along with
+    /// any unwinding or such information as necessary. The `num_funcs`
+    /// parameter indicates the number of times the `append_func` function will
+    /// be called. The `finish` function will panic if this contract is not met.
+    pub fn new(
+        obj: &'a mut Object<'static>,
+        compiler: &'a dyn Compiler,
+        text: Box<dyn TextSectionBuilder>,
+    ) -> Self {
         // Entire code (functions and trampolines) will be placed
         // in the ".text" section.
         let text_section = obj.add_section(
@@ -172,63 +83,54 @@ impl<'a> ObjectBuilder<'a> {
             SectionKind::Text,
         );
 
-        // Create symbols for imports -- needed during linking.
-        let mut func_symbols = PrimaryMap::with_capacity(module.functions.len());
-        for index in 0..module.num_imported_funcs {
-            let symbol_id = obj.add_symbol(Symbol {
-                name: obj::func_symbol_name(FuncIndex::new(index))
-                    .as_bytes()
-                    .to_vec(),
-                value: 0,
-                size: 0,
-                kind: SymbolKind::Text,
-                scope: SymbolScope::Linkage,
-                weak: false,
-                section: SymbolSection::Undefined,
-                flags: SymbolFlags::None,
-            });
-            func_symbols.push(symbol_id);
+        // If this target is Pulley then flag the text section as not needing the
+        // executable bit in virtual memory which means that the runtime won't
+        // try to call `Mmap::make_exectuable`, which makes Pulley more
+        // portable.
+        if compiler.triple().is_pulley() {
+            let section = obj.section_mut(text_section);
+            assert!(matches!(section.flags, SectionFlags::None));
+            section.flags = SectionFlags::Elf {
+                sh_flags: obj::SH_WASMTIME_NOT_EXECUTED,
+            };
         }
 
-        let libcalls = write_libcall_symbols(obj);
-
         Self {
-            isa,
+            compiler,
             obj,
-            module,
             text_section,
-            func_symbols,
-            libcalls,
-            windows_unwind_info_id: None,
-            windows_unwind_info: Vec::new(),
-            systemv_unwind_info_id: None,
-            systemv_unwind_info: Vec::new(),
-            relocations: Vec::new(),
-            text: match isa.get_mach_backend() {
-                Some(backend) => backend.text_section_builder(
-                    (module.functions.len() - module.num_imported_funcs) as u32,
-                ),
-                None => Box::new(DummyBuilder::default()),
-            },
-            added_unwind_info: false,
+            unwind_info: Default::default(),
+            text,
+            libcall_symbols: HashMap::default(),
+            ctrl_plane: ControlPlane::default(),
         }
     }
 
     /// Appends the `func` specified named `name` to this object.
     ///
+    /// The `resolve_reloc_target` closure is used to resolve a relocation
+    /// target to an adjacent function which has already been added or will be
+    /// added to this object. The argument is the relocation target specified
+    /// within `CompiledFunction` and the return value must be an index where
+    /// the target will be defined by the `n`th call to `append_func`.
+    ///
     /// Returns the symbol associated with the function as well as the range
     /// that the function resides within the text section.
-    fn append_func(
+    pub fn append_func(
         &mut self,
-        wat: bool,
-        name: Vec<u8>,
-        func: &'a CompiledFunction,
+        name: &str,
+        compiled_func: &'a CompiledFunction,
+        resolve_reloc_target: impl Fn(wasmtime_environ::RelocationTarget) -> usize,
     ) -> (SymbolId, Range<u64>) {
-        let body_len = func.body.len() as u64;
-        let off = self.text.append(wat, &func.body, 1);
+        let body = compiled_func.buffer.data();
+        let alignment = compiled_func.alignment;
+        let body_len = body.len() as u64;
+        let off = self
+            .text
+            .append(true, &body, alignment, &mut self.ctrl_plane);
 
         let symbol_id = self.obj.add_symbol(Symbol {
-            name,
+            name: name.as_bytes().to_vec(),
             value: off,
             size: body_len,
             kind: SymbolKind::Text,
@@ -238,272 +140,400 @@ impl<'a> ObjectBuilder<'a> {
             flags: SymbolFlags::None,
         });
 
-        match &func.unwind_info {
-            // Windows unwind information is preferred to come after the code
-            // itself. The information is appended here just after the function,
-            // aligned to 4-bytes as required by Windows.
-            //
-            // The location of the unwind info, and the function it describes,
-            // is then recorded in an unwind info table to get embedded into the
-            // object at the end of compilation.
-            Some(UnwindInfo::WindowsX64(info)) => {
-                // Windows prefers Unwind info after the code -- writing it here.
-                let unwind_size = info.emit_size();
-                let mut unwind_info = vec![0; unwind_size];
-                info.emit(&mut unwind_info);
-                let unwind_off = self.text.append(false, &unwind_info, 4);
-                self.windows_unwind_info.push(RUNTIME_FUNCTION {
-                    begin: u32::try_from(off).unwrap(),
-                    end: u32::try_from(off + body_len).unwrap(),
-                    unwind_address: u32::try_from(unwind_off).unwrap(),
-                });
-            }
-
-            // System-V is different enough that we just record the unwinding
-            // information to get processed at a later time.
-            Some(UnwindInfo::SystemV(info)) => {
-                self.systemv_unwind_info.push((off, info));
-            }
-
-            Some(_) => panic!("some unwind info isn't handled here"),
-            None => {}
+        if let Some(info) = compiled_func.unwind_info() {
+            self.unwind_info.push(off, body_len, info);
         }
 
-        for r in func.relocations.iter() {
-            let (symbol, symbol_offset) = match r.reloc_target {
+        for r in compiled_func.relocations() {
+            let reloc_offset = off + u64::from(r.offset);
+            match r.reloc_target {
                 // Relocations against user-defined functions means that this is
                 // a relocation against a module-local function, typically a
                 // call between functions. The `text` field is given priority to
                 // resolve this relocation before we actually emit an object
                 // file, but if it can't handle it then we pass through the
                 // relocation.
-                RelocationTarget::UserFunc(index) => {
-                    let defined_index = self.module.defined_func_index(index).unwrap();
-                    if self.text.resolve_reloc(
-                        off + u64::from(r.offset),
-                        r.reloc,
-                        r.addend,
-                        defined_index.as_u32(),
-                    ) {
+                RelocationTarget::Wasm(_) | RelocationTarget::Builtin(_) => {
+                    let target = resolve_reloc_target(r.reloc_target);
+                    if self
+                        .text
+                        .resolve_reloc(reloc_offset, r.reloc, r.addend, target)
+                    {
                         continue;
                     }
 
-                    // FIXME(#3009) once the old backend is removed all
-                    // inter-function relocations should be handled by
-                    // `self.text`. This can become `unreachable!()` in that
-                    // case.
-                    self.relocations.push((r, off));
-                    continue;
+                    // At this time it's expected that all relocations are
+                    // handled by `text.resolve_reloc`, and anything that isn't
+                    // handled is a bug in `text.resolve_reloc` or something
+                    // transitively there. If truly necessary, though, then this
+                    // loop could also be updated to forward the relocation to
+                    // the final object file as well.
+                    panic!(
+                        "unresolved relocation could not be processed against \
+                         {:?}: {r:?}",
+                        r.reloc_target,
+                    );
                 }
 
-                // These relocations, unlike against user funcs above, typically
-                // involve absolute addresses and need to get resolved at load
-                // time. These are persisted immediately into the object file.
+                // Relocations against libcalls are not common at this time and
+                // are only used in non-default configurations that disable wasm
+                // SIMD, disable SSE features, and for wasm modules that still
+                // use floating point operations.
                 //
-                // FIXME: these, like user-defined-functions, should probably
-                // use relative jumps and avoid absolute relocations. They don't
-                // seem too common though so aren't necessarily that important
-                // to optimize.
-                RelocationTarget::LibCall(call) => (self.libcalls[&call], 0),
-            };
-            let (kind, encoding, size) = match r.reloc {
-                Reloc::Abs4 => (RelocationKind::Absolute, RelocationEncoding::Generic, 32),
-                Reloc::Abs8 => (RelocationKind::Absolute, RelocationEncoding::Generic, 64),
+                // Currently these relocations are all expected to be absolute
+                // 8-byte relocations so that's asserted here and then encoded
+                // directly into the object as a normal object relocation. This
+                // is processed at module load time to resolve the relocations.
+                RelocationTarget::HostLibcall(call) => {
+                    let symbol = *self.libcall_symbols.entry(call).or_insert_with(|| {
+                        self.obj.add_symbol(Symbol {
+                            name: call.symbol().as_bytes().to_vec(),
+                            value: 0,
+                            size: 0,
+                            kind: SymbolKind::Text,
+                            scope: SymbolScope::Linkage,
+                            weak: false,
+                            section: SymbolSection::Undefined,
+                            flags: SymbolFlags::None,
+                        })
+                    });
+                    let flags = match r.reloc {
+                        Reloc::Abs8 => object::RelocationFlags::Generic {
+                            encoding: object::RelocationEncoding::Generic,
+                            kind: object::RelocationKind::Absolute,
+                            size: 64,
+                        },
+                        other => unimplemented!("unimplemented relocation kind {other:?}"),
+                    };
+                    self.obj
+                        .add_relocation(
+                            self.text_section,
+                            object::write::Relocation {
+                                symbol,
+                                flags,
+                                offset: reloc_offset,
+                                addend: r.addend,
+                            },
+                        )
+                        .unwrap();
+                }
 
-                other => unimplemented!("Unimplemented relocation {:?}", other),
+                // This relocation is used to fill in which hostcall id is
+                // desired within the `call_indirect_host` opcode of Pulley
+                // itself. The relocation target is the start of the instruction
+                // and the goal is to insert the static signature number, `n`,
+                // into the instruction.
+                //
+                // At this time the instruction looks like:
+                //
+                //      +------+------+------+------+
+                //      | OP   | OP_EXTENDED |  N   |
+                //      +------+------+------+------+
+                //
+                // This 4-byte encoding has `OP` indicating this is an "extended
+                // opcode" where `OP_EXTENDED` is a 16-bit extended opcode.
+                // The `N` byte is the index of the signature being called and
+                // is what's b eing filled in.
+                //
+                // See the `test_call_indirect_host_width` in
+                // `pulley/tests/all.rs` for this guarantee as well.
+                #[cfg(feature = "pulley")]
+                RelocationTarget::PulleyHostcall(n) => {
+                    use pulley_interpreter::encode::Encode;
+
+                    assert_eq!(pulley_interpreter::CallIndirectHost::WIDTH, 4);
+                    let byte = u8::try_from(n).unwrap();
+                    self.text.write(reloc_offset + 3, &[byte]);
+                }
+
+                #[cfg(not(feature = "pulley"))]
+                RelocationTarget::PulleyHostcall(_) => unreachable!(),
             };
-            self.obj
-                .add_relocation(
-                    self.text_section,
-                    ObjectRelocation {
-                        offset: off + r.offset as u64,
-                        size,
-                        kind,
-                        encoding,
-                        symbol,
-                        addend: r.addend.wrapping_add(symbol_offset as i64),
-                    },
-                )
-                .unwrap();
         }
         (symbol_id, off..off + body_len)
     }
 
-    /// Appends a function to this object file.
+    /// Forces "veneers" to be used for inter-function calls in the text
+    /// section which means that in-bounds optimized addresses are never used.
     ///
-    /// This is expected to be called in-order for ascending `index` values.
-    pub fn func(&mut self, index: DefinedFuncIndex, func: &'a CompiledFunction) -> Range<u64> {
-        assert!(!self.added_unwind_info);
-        let index = self.module.func_index(index);
-        let name = obj::func_symbol_name(index);
-        let (symbol_id, range) = self.append_func(true, name.into_bytes(), func);
-        assert_eq!(self.func_symbols.push(symbol_id), index);
-        range
+    /// This is only useful for debugging cranelift itself and typically this
+    /// option is disabled.
+    pub fn force_veneers(&mut self) {
+        self.text.force_veneers();
     }
 
-    pub fn trampoline(&mut self, sig: SignatureIndex, func: &'a CompiledFunction) -> Trampoline {
-        assert!(!self.added_unwind_info);
-        let name = obj::trampoline_symbol_name(sig);
-        let (_, range) = self.append_func(false, name.into_bytes(), func);
-        Trampoline {
-            signature: sig,
-            start: range.start,
-            length: u32::try_from(range.end - range.start).unwrap(),
+    /// Appends the specified amount of bytes of padding into the text section.
+    ///
+    /// This is only useful when fuzzing and/or debugging cranelift itself and
+    /// for production scenarios `padding` is 0 and this function does nothing.
+    pub fn append_padding(&mut self, padding: usize) {
+        if padding == 0 {
+            return;
         }
+        self.text
+            .append(false, &vec![0; padding], 1, &mut self.ctrl_plane);
     }
 
-    pub fn dwarf_sections(&mut self, sections: &[DwarfSection]) -> Result<()> {
-        assert!(
-            self.added_unwind_info,
-            "can't add dwarf yet; unwind info must directly follow the text section"
-        );
-
-        // If we have DWARF data, write it in the object file.
-        let (debug_bodies, debug_relocs): (Vec<_>, Vec<_>) = sections
-            .iter()
-            .map(|s| ((s.name, &s.body), (s.name, &s.relocs)))
-            .unzip();
-        let mut dwarf_sections_ids = HashMap::new();
-        for (name, body) in debug_bodies {
-            let segment = self.obj.segment_name(StandardSegment::Debug).to_vec();
-            let section_id =
-                self.obj
-                    .add_section(segment, name.as_bytes().to_vec(), SectionKind::Debug);
-            dwarf_sections_ids.insert(name, section_id);
-            self.obj.append_section_data(section_id, &body, 1);
-        }
-
-        // Write all debug data relocations.
-        for (name, relocs) in debug_relocs {
-            let section_id = *dwarf_sections_ids.get(name).unwrap();
-            for reloc in relocs {
-                let target_symbol = match reloc.target {
-                    DwarfSectionRelocTarget::Func(index) => {
-                        self.func_symbols[self.module.func_index(DefinedFuncIndex::new(index))]
-                    }
-                    DwarfSectionRelocTarget::Section(name) => {
-                        self.obj.section_symbol(dwarf_sections_ids[name])
-                    }
-                };
-                self.obj.add_relocation(
-                    section_id,
-                    ObjectRelocation {
-                        offset: u64::from(reloc.offset),
-                        size: reloc.size << 3,
-                        kind: RelocationKind::Absolute,
-                        encoding: RelocationEncoding::Generic,
-                        symbol: target_symbol,
-                        addend: i64::from(reloc.addend),
-                    },
-                )?;
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn unwind_info(&mut self) {
-        assert!(!self.added_unwind_info);
-
-        if self.windows_unwind_info.len() > 0 {
-            let segment = self.obj.segment_name(StandardSegment::Data).to_vec();
-            self.windows_unwind_info_id = Some(self.obj.add_section(
-                segment,
-                b"_wasmtime_winx64_unwind".to_vec(),
-                SectionKind::ReadOnlyData,
-            ));
-        }
-        if self.systemv_unwind_info.len() > 0 {
-            let segment = self.obj.segment_name(StandardSegment::Data).to_vec();
-            self.systemv_unwind_info_id = Some(self.obj.add_section(
-                segment,
-                b".eh_frame".to_vec(),
-                SectionKind::ReadOnlyData,
-            ));
-        }
-
-        self.added_unwind_info = true;
-    }
-
-    pub fn finish(&mut self) -> Result<()> {
-        // Now that all function symbols are available register all final
-        // relocations between functions.
-        //
-        // FIXME(#3009) once the old backend is removed this loop should be
-        // deleted since there won't be any relocations here.
-        for (r, off) in mem::take(&mut self.relocations) {
-            let symbol = match r.reloc_target {
-                RelocationTarget::UserFunc(index) => self.func_symbols[index],
-                _ => unreachable!("should be handled in `append_func`"),
-            };
-            let (kind, encoding, size) = match r.reloc {
-                Reloc::X86CallPCRel4 => {
-                    (RelocationKind::Relative, RelocationEncoding::X86Branch, 32)
-                }
-                other => unimplemented!("Unimplemented relocation {:?}", other),
-            };
-            self.obj.add_relocation(
-                self.text_section,
-                ObjectRelocation {
-                    offset: off + u64::from(r.offset),
-                    size,
-                    kind,
-                    encoding,
-                    symbol,
-                    addend: r.addend,
-                },
-            )?;
-        }
-
+    /// Indicates that the text section has been written completely and this
+    /// will finish appending it to the original object.
+    ///
+    /// Note that this will also write out the unwind information sections if
+    /// necessary.
+    pub fn finish(mut self) {
         // Finish up the text section now that we're done adding functions.
-        let text = self.text.finish();
+        let text = self.text.finish(&mut self.ctrl_plane);
         self.obj
             .section_mut(self.text_section)
-            .set_data(text, self.isa.code_section_alignment());
+            .set_data(text, self.compiler.page_size_align());
 
-        // With all functions added we can also emit the fully-formed unwinding
-        // information sections.
-        if self.windows_unwind_info.len() > 0 {
-            self.append_windows_unwind_info();
+        // Append the unwind information for all our functions, if necessary.
+        self.unwind_info
+            .append_section(self.compiler, self.obj, self.text_section);
+    }
+}
+
+/// Builder used to create unwind information for a set of functions added to a
+/// text section.
+#[derive(Default)]
+struct UnwindInfoBuilder<'a> {
+    windows_xdata: Vec<u8>,
+    windows_pdata: Vec<RUNTIME_FUNCTION>,
+    systemv_unwind_info: Vec<(u64, &'a systemv::UnwindInfo)>,
+}
+
+// This is a mirror of `RUNTIME_FUNCTION` in the Windows API, but defined here
+// to ensure everything is always `u32` and to have it available on all
+// platforms. Note that all of these specifiers here are relative to a "base
+// address" which we define as the base of where the text section is eventually
+// loaded.
+#[expect(non_camel_case_types, reason = "matching Windows style, not Rust")]
+struct RUNTIME_FUNCTION {
+    begin: u32,
+    end: u32,
+    unwind_address: u32,
+}
+
+impl<'a> UnwindInfoBuilder<'a> {
+    /// Pushes the unwind information for a function into this builder.
+    ///
+    /// The function being described must be located at `function_offset` within
+    /// the text section itself, and the function's size is specified by
+    /// `function_len`.
+    ///
+    /// The `info` should come from Cranelift. and is handled here depending on
+    /// its flavor.
+    fn push(&mut self, function_offset: u64, function_len: u64, info: &'a UnwindInfo) {
+        match info {
+            // Windows unwind information is stored in two locations:
+            //
+            // * First is the actual unwinding information which is stored
+            //   in the `.xdata` section. This is where `info`'s emitted
+            //   information will go into.
+            // * Second are pointers to connect all this unwind information,
+            //   stored in the `.pdata` section. The `.pdata` section is an
+            //   array of `RUNTIME_FUNCTION` structures.
+            //
+            // Due to how these will be loaded at runtime the `.pdata` isn't
+            // actually assembled byte-wise here. Instead that's deferred to
+            // happen later during `write_windows_unwind_info` which will apply
+            // a further offset to `unwind_address`.
+            //
+            // FIXME: in theory we could "intern" the `unwind_info` value
+            // here within the `.xdata` section. Most of our unwind
+            // information for functions is probably pretty similar in which
+            // case the `.xdata` could be quite small and `.pdata` could
+            // have multiple functions point to the same unwinding
+            // information.
+            UnwindInfo::WindowsX64(info) => {
+                let unwind_size = info.emit_size();
+                let mut unwind_info = vec![0; unwind_size];
+                info.emit(&mut unwind_info);
+
+                // `.xdata` entries are always 4-byte aligned
+                while self.windows_xdata.len() % 4 != 0 {
+                    self.windows_xdata.push(0x00);
+                }
+                let unwind_address = self.windows_xdata.len();
+                self.windows_xdata.extend_from_slice(&unwind_info);
+
+                // Record a `RUNTIME_FUNCTION` which this will point to.
+                self.windows_pdata.push(RUNTIME_FUNCTION {
+                    begin: u32::try_from(function_offset).unwrap(),
+                    end: u32::try_from(function_offset + function_len).unwrap(),
+                    unwind_address: u32::try_from(unwind_address).unwrap(),
+                });
+            }
+
+            // See https://learn.microsoft.com/en-us/cpp/build/arm64-exception-handling
+            UnwindInfo::WindowsArm64(info) => {
+                let code_words = info.code_words();
+                let mut unwind_codes = vec![0; (code_words * 4) as usize];
+                info.emit(&mut unwind_codes);
+
+                // `.xdata` entries are always 4-byte aligned
+                while self.windows_xdata.len() % 4 != 0 {
+                    self.windows_xdata.push(0x00);
+                }
+
+                // First word:
+                // 0-17:    Function Length
+                // 18-19:   Version (must be 0)
+                // 20:      X bit (is exception data present?)
+                // 21:      E bit (has single packed epilogue?)
+                // 22-26:   Epilogue count
+                // 27-31:   Code words count
+                let requires_extended_counts = code_words > (1 << 5);
+                let encoded_function_len = function_len / 4;
+                assert!(encoded_function_len < (1 << 18), "function too large");
+                let mut word1 = u32::try_from(encoded_function_len).unwrap();
+                if !requires_extended_counts {
+                    word1 |= u32::from(code_words) << 27;
+                }
+                let unwind_address = self.windows_xdata.len();
+                self.windows_xdata.extend_from_slice(&word1.to_le_bytes());
+
+                if requires_extended_counts {
+                    // Extended counts word:
+                    // 0-15:    Epilogue count
+                    // 16-23:   Code words count
+                    let extended_counts_word = (code_words as u32) << 16;
+                    self.windows_xdata
+                        .extend_from_slice(&extended_counts_word.to_le_bytes());
+                }
+
+                // Skip epilogue information: Per comment on [`UnwindInst`], we
+                // do not emit information about epilogues.
+
+                // Emit the unwind codes.
+                self.windows_xdata.extend_from_slice(&unwind_codes);
+
+                // Record a `RUNTIME_FUNCTION` which this will point to.
+                // NOTE: `end` is not used, so leave it as 0.
+                self.windows_pdata.push(RUNTIME_FUNCTION {
+                    begin: u32::try_from(function_offset).unwrap(),
+                    end: 0,
+                    unwind_address: u32::try_from(unwind_address).unwrap(),
+                });
+            }
+
+            // System-V is different enough that we just record the unwinding
+            // information to get processed at a later time.
+            UnwindInfo::SystemV(info) => {
+                self.systemv_unwind_info.push((function_offset, info));
+            }
+
+            _ => panic!("some unwind info isn't handled here"),
         }
+    }
+
+    /// Appends the unwind information section, if any, to the `obj` specified.
+    ///
+    /// This function must be called immediately after the text section was
+    /// added to a builder. The unwind information section must trail the text
+    /// section immediately.
+    ///
+    /// The `text_section`'s section identifier is passed into this function.
+    fn append_section(
+        &self,
+        compiler: &dyn Compiler,
+        obj: &mut Object<'_>,
+        text_section: SectionId,
+    ) {
+        // This write will align the text section to a page boundary and then
+        // return the offset at that point. This gives us the full size of the
+        // text section at that point, after alignment.
+        let text_section_size =
+            obj.append_section_data(text_section, &[], compiler.page_size_align());
+
+        if self.windows_xdata.len() > 0 {
+            assert!(self.systemv_unwind_info.len() == 0);
+            // The `.xdata` section must come first to be just-after the `.text`
+            // section for the reasons documented in `write_windows_unwind_info`
+            // below.
+            let segment = obj.segment_name(StandardSegment::Data).to_vec();
+            let xdata_id = obj.add_section(segment, b".xdata".to_vec(), SectionKind::ReadOnlyData);
+            let segment = obj.segment_name(StandardSegment::Data).to_vec();
+            let pdata_id = obj.add_section(segment, b".pdata".to_vec(), SectionKind::ReadOnlyData);
+            self.write_windows_unwind_info(obj, xdata_id, pdata_id, text_section_size);
+        }
+
         if self.systemv_unwind_info.len() > 0 {
-            self.append_systemv_unwind_info();
+            let segment = obj.segment_name(StandardSegment::Data).to_vec();
+            let section_id =
+                obj.add_section(segment, b".eh_frame".to_vec(), SectionKind::ReadOnlyData);
+            self.write_systemv_unwind_info(compiler, obj, section_id, text_section_size)
         }
-
-        Ok(())
     }
 
     /// This function appends a nonstandard section to the object which is only
-    /// used during `CodeMemory::allocate_for_object`.
+    /// used during `CodeMemory::publish`.
     ///
     /// This custom section effectively stores a `[RUNTIME_FUNCTION; N]` into
     /// the object file itself. This way registration of unwind info can simply
     /// pass this slice to the OS itself and there's no need to recalculate
     /// anything on the other end of loading a module from a precompiled object.
-    fn append_windows_unwind_info(&mut self) {
-        // Currently the binary format supported here only supports
-        // little-endian for x86_64, or at least that's all where it's tested.
-        // This may need updates for other platforms.
-        assert_eq!(self.obj.architecture(), Architecture::X86_64);
+    ///
+    /// Support for reading this is in `crates/jit/src/unwind/winx64.rs`.
+    fn write_windows_unwind_info(
+        &self,
+        obj: &mut Object<'_>,
+        xdata_id: SectionId,
+        pdata_id: SectionId,
+        text_section_size: u64,
+    ) {
+        // Append the `.xdata` section, or the actual unwinding information
+        // codes and such which were built as we found unwind information for
+        // functions.
+        obj.append_section_data(xdata_id, &self.windows_xdata, 4);
 
-        let section_id = self.windows_unwind_info_id.unwrap();
+        // Next append the `.pdata` section, or the array of `RUNTIME_FUNCTION`
+        // structures stored in the binary.
+        //
+        // This memory will be passed at runtime to `RtlAddFunctionTable` which
+        // takes a "base address" and the entries within `RUNTIME_FUNCTION` are
+        // all relative to this base address. The base address we pass is the
+        // address of the text section itself so all the pointers here must be
+        // text-section-relative. The `begin` and `end` fields for the function
+        // it describes are already text-section-relative, but the
+        // `unwind_address` field needs to be updated here since the value
+        // stored right now is `xdata`-section-relative. We know that the
+        // `xdata` section follows the `.text` section so the
+        // `text_section_size` is added in to calculate the final
+        // `.text`-section-relative address of the unwind information.
+        let xdata_rva = |address| {
+            let address = u64::from(address);
+            let address = address + text_section_size;
+            u32::try_from(address).unwrap()
+        };
+        let pdata = match obj.architecture() {
+            Architecture::X86_64 => {
+                let mut pdata = Vec::with_capacity(self.windows_pdata.len() * 3 * 4);
+                for info in self.windows_pdata.iter() {
+                    pdata.extend_from_slice(&info.begin.to_le_bytes());
+                    pdata.extend_from_slice(&info.end.to_le_bytes());
+                    pdata.extend_from_slice(&xdata_rva(info.unwind_address).to_le_bytes());
+                }
+                pdata
+            }
 
-        // Page-align the text section so the unwind info can reside on a
-        // separate page that doesn't need executable permissions.
-        self.obj
-            .append_section_data(self.text_section, &[], self.isa.code_section_alignment());
+            Architecture::Aarch64 => {
+                // Windows Arm64 .pdata also supports packed unwind data, but
+                // we're not currently using that.
+                let mut pdata = Vec::with_capacity(self.windows_pdata.len() * 2 * 4);
+                for info in self.windows_pdata.iter() {
+                    pdata.extend_from_slice(&info.begin.to_le_bytes());
+                    pdata.extend_from_slice(&xdata_rva(info.unwind_address).to_le_bytes());
+                }
+                pdata
+            }
 
-        let mut unwind_info = Vec::with_capacity(self.windows_unwind_info.len() * 3 * 4);
-        for info in self.windows_unwind_info.iter() {
-            unwind_info.extend_from_slice(&info.begin.to_le_bytes());
-            unwind_info.extend_from_slice(&info.end.to_le_bytes());
-            unwind_info.extend_from_slice(&info.unwind_address.to_le_bytes());
-        }
-        self.obj.append_section_data(section_id, &unwind_info, 4);
+            _ => unimplemented!("unsupported architecture for windows unwind info"),
+        };
+        obj.append_section_data(pdata_id, &pdata, 4);
     }
 
     /// This function appends a nonstandard section to the object which is only
-    /// used during `CodeMemory::allocate_for_object`.
+    /// used during `CodeMemory::publish`.
     ///
     /// This will generate a `.eh_frame` section, but not one that can be
     /// naively loaded. The goal of this section is that we can create the
@@ -540,22 +570,21 @@ impl<'a> ObjectBuilder<'a> {
     /// This allows `.eh_frame` to have different virtual memory permissions,
     /// such as being purely read-only instead of read/execute like the code
     /// bits.
-    fn append_systemv_unwind_info(&mut self) {
-        let section_id = self.systemv_unwind_info_id.unwrap();
-        let mut cie = self
-            .isa
-            .create_systemv_cie()
-            .expect("must be able to create a CIE for system-v unwind info");
+    fn write_systemv_unwind_info(
+        &self,
+        compiler: &dyn Compiler,
+        obj: &mut Object<'_>,
+        section_id: SectionId,
+        text_section_size: u64,
+    ) {
+        let mut cie = match compiler.create_systemv_cie() {
+            Some(cie) => cie,
+            None => return,
+        };
         let mut table = FrameTable::default();
         cie.fde_address_encoding = gimli::constants::DW_EH_PE_pcrel;
         let cie_id = table.add_cie(cie);
 
-        // This write will align the text section to a page boundary
-        // and then return the offset at that point. This gives us the full size
-        // of the text section at that point, after alignment.
-        let text_section_size =
-            self.obj
-                .append_section_data(self.text_section, &[], self.isa.code_section_alignment());
         for (text_section_off, unwind_info) in self.systemv_unwind_info.iter() {
             let backwards_off = text_section_size - text_section_off;
             let actual_offset = -i64::try_from(backwards_off).unwrap();
@@ -563,10 +592,10 @@ impl<'a> ObjectBuilder<'a> {
             // unwinders just use this constant for a relative addition with the
             // address of the FDE, which means that the sign doesn't actually
             // matter.
-            let fde = unwind_info.to_fde(Address::Constant(actual_offset as u64));
+            let fde = unwind_info.to_fde(Address::Constant(actual_offset.unsigned()));
             table.add_fde(cie_id, fde);
         }
-        let endian = match self.isa.triple().endianness().unwrap() {
+        let endian = match compiler.triple().endianness().unwrap() {
             target_lexicon::Endianness::Little => RunTimeEndian::Little,
             target_lexicon::Endianness::Big => RunTimeEndian::Big,
         };
@@ -577,8 +606,7 @@ impl<'a> ObjectBuilder<'a> {
         // a 0 is written at the end of the table for those implementations.
         let mut endian_vec = (eh_frame.0).0;
         endian_vec.write_u32(0).unwrap();
-        self.obj
-            .append_section_data(section_id, endian_vec.slice(), 1);
+        obj.append_section_data(section_id, endian_vec.slice(), 1);
 
         use gimli::constants;
         use gimli::write::Error;
@@ -625,39 +653,5 @@ impl<'a> ObjectBuilder<'a> {
                 self.write_eh_pointer_data(val, eh_pe.format(), size)
             }
         }
-    }
-}
-
-#[derive(Default)]
-struct DummyBuilder {
-    data: Vec<u8>,
-}
-
-impl TextSectionBuilder for DummyBuilder {
-    fn append(&mut self, _named: bool, func: &[u8], align: u32) -> u64 {
-        while self.data.len() % align as usize != 0 {
-            self.data.push(0);
-        }
-        let pos = self.data.len() as u64;
-        self.data.extend_from_slice(func);
-        pos
-    }
-
-    fn resolve_reloc(
-        &mut self,
-        _offset: u64,
-        _reloc: Reloc,
-        _addend: Addend,
-        _target: u32,
-    ) -> bool {
-        false
-    }
-
-    fn force_veneers(&mut self) {
-        // not implemented
-    }
-
-    fn finish(&mut self) -> Vec<u8> {
-        mem::take(&mut self.data)
     }
 }

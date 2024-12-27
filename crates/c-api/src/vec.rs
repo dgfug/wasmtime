@@ -19,7 +19,7 @@ impl wasm_name_t {
 macro_rules! declare_vecs {
     (
         $((
-            name: $name:ident,
+            name: $name:ident $(<$lt:tt>)?,
             ty: $elem_ty:ty,
             new: $new:ident,
             empty: $empty:ident,
@@ -29,13 +29,12 @@ macro_rules! declare_vecs {
         ))*
     ) => {$(
         #[repr(C)]
-        #[derive(Clone)]
-        pub struct $name {
+        pub struct $name $(<$lt>)? {
             size: usize,
             data: *mut $elem_ty,
         }
 
-        impl $name {
+        impl$(<$lt>)? $name $(<$lt>)? {
             pub fn set_buffer(&mut self, buffer: Vec<$elem_ty>) {
                 let mut vec = buffer.into_boxed_slice();
                 self.size = vec.len();
@@ -80,7 +79,13 @@ macro_rules! declare_vecs {
             }
         }
 
-        impl From<Vec<$elem_ty>> for $name {
+        impl$(<$lt>)? Clone for $name $(<$lt>)? {
+            fn clone(&self) -> Self {
+                self.as_slice().to_vec().into()
+            }
+        }
+
+        impl$(<$lt>)? From<Vec<$elem_ty>> for $name $(<$lt>)? {
             fn from(vec: Vec<$elem_ty>) -> Self {
                 let mut vec = vec.into_boxed_slice();
                 let result = $name {
@@ -92,7 +97,7 @@ macro_rules! declare_vecs {
             }
         }
 
-        impl Drop for $name {
+        impl$(<$lt>)? Drop for $name $(<$lt>)? {
             fn drop(&mut self) {
                 drop(self.take());
             }
@@ -110,22 +115,25 @@ macro_rules! declare_vecs {
         }
 
         #[no_mangle]
-        pub unsafe extern "C" fn $new(
-            out: &mut $name,
+        pub unsafe extern "C" fn $new $(<$lt>)? (
+            out: &mut $name $(<$lt>)?,
             size: usize,
             ptr: *const $elem_ty,
         ) {
-            let slice = slice::from_raw_parts(ptr, size);
-            out.set_buffer(slice.to_vec());
+            let vec = (0..size).map(|i| ptr.add(i).read()).collect();
+            out.set_buffer(vec);
         }
 
         #[no_mangle]
-        pub extern "C" fn $copy(out: &mut $name, src: &$name) {
+        pub extern "C" fn $copy $(<$lt>)? (
+            out: &mut $name $(<$lt>)?,
+            src: &$name $(<$lt>)?,
+        ) {
             out.set_buffer(src.as_slice().to_vec());
         }
 
         #[no_mangle]
-        pub extern "C" fn $delete(out: &mut $name) {
+        pub extern "C" fn $delete $(<$lt>)? (out: &mut $name $(<$lt>)?) {
             out.take();
         }
     )*};
@@ -223,8 +231,8 @@ declare_vecs! {
         delete: wasm_val_vec_delete,
     )
     (
-        name: wasm_frame_vec_t,
-        ty: Option<Box<wasm_frame_t>>,
+        name: wasm_frame_vec_t<'a>,
+        ty: Option<Box<wasm_frame_t<'a>>>,
         new: wasm_frame_vec_new,
         empty: wasm_frame_vec_new_empty,
         uninit: wasm_frame_vec_new_uninitialized,

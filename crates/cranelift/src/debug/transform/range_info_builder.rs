@@ -1,9 +1,8 @@
 use super::address_transform::AddressTransform;
-use super::{DebugInputContext, Reader};
+use super::Reader;
 use anyhow::Error;
 use gimli::{write, AttributeValue, DebuggingInformationEntry, RangeListsOffset, Unit};
-use more_asserts::assert_lt;
-use wasmtime_environ::{DefinedFuncIndex, EntityRef};
+use wasmtime_environ::DefinedFuncIndex;
 
 pub(crate) enum RangeInfoBuilder {
     Undefined,
@@ -17,15 +16,13 @@ impl RangeInfoBuilder {
         dwarf: &gimli::Dwarf<R>,
         unit: &Unit<R, R::Offset>,
         entry: &DebuggingInformationEntry<R>,
-        context: &DebugInputContext<R>,
-        cu_low_pc: u64,
     ) -> Result<Self, Error>
     where
         R: Reader,
     {
         if let Some(AttributeValue::RangeListsRef(r)) = entry.attr_value(gimli::DW_AT_ranges)? {
             let r = dwarf.ranges_offset_from_raw(unit, r);
-            return RangeInfoBuilder::from_ranges_ref(unit, r, context, cu_low_pc);
+            return RangeInfoBuilder::from_ranges_ref(dwarf, unit, r);
         };
 
         let low_pc =
@@ -34,7 +31,7 @@ impl RangeInfoBuilder {
             } else if let Some(AttributeValue::DebugAddrIndex(i)) =
                 entry.attr_value(gimli::DW_AT_low_pc)?
             {
-                context.debug_addr.get_address(4, unit.addr_base, i)?
+                dwarf.address(unit, i)?
             } else {
                 return Ok(RangeInfoBuilder::Undefined);
             };
@@ -49,22 +46,14 @@ impl RangeInfoBuilder {
     }
 
     pub(crate) fn from_ranges_ref<R>(
+        dwarf: &gimli::Dwarf<R>,
         unit: &Unit<R, R::Offset>,
         ranges: RangeListsOffset,
-        context: &DebugInputContext<R>,
-        cu_low_pc: u64,
     ) -> Result<Self, Error>
     where
         R: Reader,
     {
-        let unit_encoding = unit.encoding();
-        let mut ranges = context.rnglists.ranges(
-            ranges,
-            unit_encoding,
-            cu_low_pc,
-            &context.debug_addr,
-            unit.addr_base,
-        )?;
+        let mut ranges = dwarf.ranges(unit, ranges)?;
         let mut result = Vec::new();
         while let Some(range) = ranges.next()? {
             if range.begin >= range.end {
@@ -84,32 +73,23 @@ impl RangeInfoBuilder {
         dwarf: &gimli::Dwarf<R>,
         unit: &Unit<R, R::Offset>,
         entry: &DebuggingInformationEntry<R>,
-        context: &DebugInputContext<R>,
         addr_tr: &AddressTransform,
-        cu_low_pc: u64,
     ) -> Result<Self, Error>
     where
         R: Reader,
     {
-        let unit_encoding = unit.encoding();
         let addr =
             if let Some(AttributeValue::Addr(addr)) = entry.attr_value(gimli::DW_AT_low_pc)? {
                 addr
             } else if let Some(AttributeValue::DebugAddrIndex(i)) =
                 entry.attr_value(gimli::DW_AT_low_pc)?
             {
-                context.debug_addr.get_address(4, unit.addr_base, i)?
+                dwarf.address(unit, i)?
             } else if let Some(AttributeValue::RangeListsRef(r)) =
                 entry.attr_value(gimli::DW_AT_ranges)?
             {
                 let r = dwarf.ranges_offset_from_raw(unit, r);
-                let mut ranges = context.rnglists.ranges(
-                    r,
-                    unit_encoding,
-                    cu_low_pc,
-                    &context.debug_addr,
-                    unit.addr_base,
-                )?;
+                let mut ranges = dwarf.ranges(unit, r)?;
                 if let Some(range) = ranges.next()? {
                     range.begin
                 } else {
@@ -146,7 +126,20 @@ impl RangeInfoBuilder {
                 for (begin, end) in ranges {
                     result.extend(addr_tr.translate_ranges(*begin, *end));
                 }
-                if result.len() != 1 {
+
+                // If we're seeing the ranges for a `DW_TAG_compile_unit` DIE
+                // then don't use `DW_AT_low_pc` and `DW_AT_high_pc`. These
+                // attributes, if set, will configure the base address of all
+                // location lists that this unit refers to. Currently this
+                // debug transform does not take this base address into account
+                // when generate the `.debug_loc` section. Consequently when a
+                // compile unit is configured here the `DW_AT_ranges` attribute
+                // is unconditionally used instead of
+                // `DW_AT_low_pc`/`DW_AT_high_pc`.
+                let is_attr_for_compile_unit =
+                    out_unit.get(current_scope_id).tag() == gimli::DW_TAG_compile_unit;
+
+                if result.len() != 1 || is_attr_for_compile_unit {
                     let range_list = result
                         .iter()
                         .map(|tr| write::Range::StartLength {
@@ -173,8 +166,8 @@ impl RangeInfoBuilder {
                 }
             }
             RangeInfoBuilder::Function(index) => {
+                let symbol = addr_tr.map()[*index].symbol;
                 let range = addr_tr.func_range(*index);
-                let symbol = index.index();
                 let addr = write::Address::Symbol {
                     symbol,
                     addend: range.0 as i64,
@@ -206,7 +199,7 @@ impl RangeInfoBuilder {
         if let RangeInfoBuilder::Ranges(ranges) = self {
             let mut range_list = Vec::new();
             for (begin, end) in ranges {
-                assert_lt!(begin, end);
+                assert!(begin < end);
                 range_list.extend(addr_tr.translate_ranges(*begin, *end).map(|tr| {
                     write::Range::StartLength {
                         begin: tr.0,

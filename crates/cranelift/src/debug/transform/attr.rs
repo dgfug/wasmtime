@@ -2,13 +2,10 @@ use super::address_transform::AddressTransform;
 use super::expression::{compile_expression, CompiledExpression, FunctionFrameInfo};
 use super::range_info_builder::RangeInfoBuilder;
 use super::refs::{PendingDebugInfoRefs, PendingUnitRefs};
-use super::{DebugInputContext, Reader, TransformError};
+use super::{Reader, TransformError};
 use anyhow::{bail, Error};
 use cranelift_codegen::isa::TargetIsa;
-use gimli::{
-    write, AttributeValue, DebugLineOffset, DebugLineStr, DebugStr, DebugStrOffsets,
-    DebuggingInformationEntry, Unit,
-};
+use gimli::{write, AttributeValue, DebugLineOffset, DebuggingInformationEntry, Unit};
 
 #[derive(Debug)]
 pub(crate) enum FileAttributeContext<'a> {
@@ -39,14 +36,12 @@ pub(crate) fn clone_die_attributes<'a, R>(
     dwarf: &gimli::Dwarf<R>,
     unit: &Unit<R, R::Offset>,
     entry: &DebuggingInformationEntry<R>,
-    context: &DebugInputContext<R>,
     addr_tr: &'a AddressTransform,
     frame_info: Option<&FunctionFrameInfo>,
     out_unit: &mut write::Unit,
     current_scope_id: write::UnitEntryId,
     subprogram_range_builder: Option<RangeInfoBuilder>,
     scope_ranges: Option<&Vec<(u64, u64)>>,
-    cu_low_pc: u64,
     out_strings: &mut write::StringTable,
     pending_die_refs: &mut PendingUnitRefs,
     pending_di_refs: &mut PendingDebugInfoRefs,
@@ -64,44 +59,48 @@ where
         // FIXME for CU: currently address_transform operate on a single
         // function range, and when CU spans multiple ranges the
         // transformation may be incomplete.
-        RangeInfoBuilder::from(dwarf, unit, entry, context, cu_low_pc)?
+        RangeInfoBuilder::from(dwarf, unit, entry)?
     };
     range_info.build(addr_tr, out_unit, current_scope_id);
 
     let mut attrs = entry.attrs();
     while let Some(attr) = attrs.next()? {
-        let attr_value = match attr.value() {
-            AttributeValue::Addr(_) | AttributeValue::DebugAddrIndex(_)
-                if attr.name() == gimli::DW_AT_low_pc =>
-            {
+        match attr.name() {
+            gimli::DW_AT_low_pc | gimli::DW_AT_high_pc | gimli::DW_AT_ranges => {
+                // Handled by RangeInfoBuilder.
                 continue;
             }
-            AttributeValue::Udata(_) if attr.name() == gimli::DW_AT_high_pc => {
+            gimli::DW_AT_str_offsets_base
+            | gimli::DW_AT_addr_base
+            | gimli::DW_AT_rnglists_base
+            | gimli::DW_AT_loclists_base
+            | gimli::DW_AT_dwo_name
+            | gimli::DW_AT_GNU_addr_base
+            | gimli::DW_AT_GNU_ranges_base
+            | gimli::DW_AT_GNU_dwo_name
+            | gimli::DW_AT_GNU_dwo_id => {
+                // DWARF encoding details that we don't need to copy.
                 continue;
             }
-            AttributeValue::RangeListsRef(_) if attr.name() == gimli::DW_AT_ranges => {
-                continue;
-            }
-            AttributeValue::Exprloc(_) if attr.name() == gimli::DW_AT_frame_base => {
-                continue;
-            }
-            AttributeValue::DebugAddrBase(_) | AttributeValue::DebugStrOffsetsBase(_) => {
-                continue;
-            }
-
+            _ => {}
+        }
+        let attr_value = attr.value();
+        let out_attr_value = match attr_value {
             AttributeValue::Addr(u) => {
                 let addr = addr_tr.translate(u).unwrap_or(write::Address::Constant(0));
                 write::AttributeValue::Address(addr)
             }
             AttributeValue::DebugAddrIndex(i) => {
-                let u = context.debug_addr.get_address(4, unit.addr_base, i)?;
+                let u = dwarf.address(unit, i)?;
                 let addr = addr_tr.translate(u).unwrap_or(write::Address::Constant(0));
                 write::AttributeValue::Address(addr)
             }
+            AttributeValue::Block(d) => write::AttributeValue::Block(d.to_slice()?.into_owned()),
             AttributeValue::Udata(u) => write::AttributeValue::Udata(u),
             AttributeValue::Data1(d) => write::AttributeValue::Data1(d),
             AttributeValue::Data2(d) => write::AttributeValue::Data2(d),
             AttributeValue::Data4(d) => write::AttributeValue::Data4(d),
+            AttributeValue::Data8(d) => write::AttributeValue::Data8(d),
             AttributeValue::Sdata(d) => write::AttributeValue::Sdata(d),
             AttributeValue::Flag(f) => write::AttributeValue::Flag(f),
             AttributeValue::DebugLineRef(line_program_offset) => {
@@ -121,37 +120,40 @@ where
                     ..
                 } = file_context
                 {
-                    write::AttributeValue::FileIndex(Some(file_map[(i - file_index_base) as usize]))
+                    let index = usize::try_from(i - file_index_base)
+                        .ok()
+                        .and_then(|i| file_map.get(i).copied());
+                    match index {
+                        Some(index) => write::AttributeValue::FileIndex(Some(index)),
+                        // This was seen to be invalid in #8884 and #8904 so
+                        // ignore this seemingly invalid DWARF from LLVM
+                        None => continue,
+                    }
                 } else {
                     return Err(TransformError("unexpected file index attribute").into());
                 }
             }
-            AttributeValue::DebugStrRef(str_offset) => {
-                let s = context.debug_str.get_str(str_offset)?.to_slice()?.to_vec();
+            AttributeValue::DebugStrRef(_) | AttributeValue::DebugStrOffsetsIndex(_) => {
+                let s = dwarf
+                    .attr_string(unit, attr_value)?
+                    .to_string_lossy()?
+                    .into_owned();
                 write::AttributeValue::StringRef(out_strings.add(s))
             }
-            AttributeValue::DebugStrOffsetsIndex(i) => {
-                let str_offset = context.debug_str_offsets.get_str_offset(
-                    gimli::Format::Dwarf32,
-                    unit.str_offsets_base,
-                    i,
-                )?;
-                let s = context.debug_str.get_str(str_offset)?.to_slice()?.to_vec();
-                write::AttributeValue::StringRef(out_strings.add(s))
-            }
-            AttributeValue::RangeListsRef(r) => {
-                let r = dwarf.ranges_offset_from_raw(unit, r);
-                let range_info = RangeInfoBuilder::from_ranges_ref(unit, r, context, cu_low_pc)?;
+            AttributeValue::RangeListsRef(_) | AttributeValue::DebugRngListsIndex(_) => {
+                let r = dwarf.attr_ranges_offset(unit, attr_value)?.unwrap();
+                let range_info = RangeInfoBuilder::from_ranges_ref(dwarf, unit, r)?;
                 let range_list_id = range_info.build_ranges(addr_tr, &mut out_unit.ranges);
                 write::AttributeValue::RangeListRef(range_list_id)
             }
-            AttributeValue::LocationListsRef(r) => {
+            AttributeValue::LocationListsRef(_) | AttributeValue::DebugLocListsIndex(_) => {
+                let r = dwarf.attr_locations_offset(unit, attr_value)?.unwrap();
                 let low_pc = 0;
-                let mut locs = context.loclists.locations(
+                let mut locs = dwarf.locations.locations(
                     r,
                     unit_encoding,
                     low_pc,
-                    &context.debug_addr,
+                    &dwarf.debug_addr,
                     unit.addr_base,
                 )?;
                 let frame_base =
@@ -201,6 +203,13 @@ where
                 }
                 let list_id = out_unit.locations.add(write::LocationList(result.unwrap()));
                 write::AttributeValue::LocationListRef(list_id)
+            }
+            AttributeValue::Exprloc(_) if attr.name() == gimli::DW_AT_frame_base => {
+                // We do not really "rewrite" the frame base so much as replace it outright.
+                // References to it through the DW_OP_fbreg opcode will be expanded below.
+                let mut cfa = write::Expression::new();
+                cfa.op(gimli::DW_OP_call_frame_cfa);
+                write::AttributeValue::Exprloc(cfa)
             }
             AttributeValue::Exprloc(ref expr) => {
                 let frame_base =
@@ -290,50 +299,11 @@ where
                 pending_di_refs.insert(current_scope_id, attr.name(), offset);
                 continue;
             }
+            AttributeValue::String(d) => write::AttributeValue::String(d.to_slice()?.into_owned()),
             a => bail!("Unexpected attribute: {:?}", a),
         };
         let current_scope = out_unit.get_mut(current_scope_id);
-        current_scope.set(attr.name(), attr_value);
+        current_scope.set(attr.name(), out_attr_value);
     }
     Ok(())
-}
-
-pub(crate) fn clone_attr_string<R>(
-    attr_value: &AttributeValue<R>,
-    form: gimli::DwForm,
-    unit: &Unit<R, R::Offset>,
-    debug_str: &DebugStr<R>,
-    debug_str_offsets: &DebugStrOffsets<R>,
-    debug_line_str: &DebugLineStr<R>,
-    out_strings: &mut write::StringTable,
-) -> Result<write::LineString, Error>
-where
-    R: Reader,
-{
-    let content = match attr_value {
-        AttributeValue::DebugStrRef(str_offset) => {
-            debug_str.get_str(*str_offset)?.to_slice()?.to_vec()
-        }
-        AttributeValue::DebugStrOffsetsIndex(i) => {
-            let str_offset = debug_str_offsets.get_str_offset(
-                gimli::Format::Dwarf32,
-                unit.str_offsets_base,
-                *i,
-            )?;
-            debug_str.get_str(str_offset)?.to_slice()?.to_vec()
-        }
-        AttributeValue::DebugLineStrRef(str_offset) => {
-            debug_line_str.get_str(*str_offset)?.to_slice()?.to_vec()
-        }
-        AttributeValue::String(b) => b.to_slice()?.to_vec(),
-        v => bail!("Unexpected attribute value: {:?}", v),
-    };
-    Ok(match form {
-        gimli::DW_FORM_strp => {
-            let id = out_strings.add(content);
-            write::LineString::StringRef(id)
-        }
-        gimli::DW_FORM_string => write::LineString::String(content),
-        _ => bail!("DW_FORM_line_strp or other not supported"),
-    })
 }

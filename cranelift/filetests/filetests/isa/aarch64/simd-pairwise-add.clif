@@ -1,7 +1,5 @@
-test compile
-set unwind_info=false
+test compile precise-output
 target aarch64
-
 
 function %fn1(i8x16) -> i16x8 {
 block0(v0: i8x16):
@@ -11,21 +9,17 @@ block0(v0: i8x16):
   return v3
 }
 
-; check: saddlp v0.8h, v0.16b
-; nextln: ret
+; VCode:
+; block0:
+;   saddlp v0.8h, v0.16b
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   saddlp v0.8h, v0.16b
+;   ret
 
-function %fn2(i8x16) -> i16x8 {
-block0(v0: i8x16):
-  v1 = uwiden_low v0
-  v2 = uwiden_high v0
-  v3 = iadd_pairwise v1, v2
-  return v3
-}
-
-; check: uaddlp v0.8h, v0.16b
-; nextln: ret
-
-function %fn3(i16x8) -> i32x4 {
+function %fn2(i16x8) -> i32x4 {
 block0(v0: i16x8):
   v1 = swiden_low v0
   v2 = swiden_high v0
@@ -33,8 +27,33 @@ block0(v0: i16x8):
   return v3
 }
 
-; check: saddlp v0.4s, v0.8h
-; nextln: ret
+; VCode:
+; block0:
+;   saddlp v0.4s, v0.8h
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   saddlp v0.4s, v0.8h
+;   ret
+
+function %fn3(i8x16) -> i16x8 {
+block0(v0: i8x16):
+  v1 = uwiden_low v0
+  v2 = uwiden_high v0
+  v3 = iadd_pairwise v1, v2
+  return v3
+}
+
+; VCode:
+; block0:
+;   uaddlp v0.8h, v0.16b
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   uaddlp v0.8h, v0.16b
+;   ret
 
 function %fn4(i16x8) -> i32x4 {
 block0(v0: i16x8):
@@ -44,57 +63,13 @@ block0(v0: i16x8):
   return v3
 }
 
-; check: uaddlp v0.4s, v0.8h
-; nextln: ret
+; VCode:
+; block0:
+;   uaddlp v0.4s, v0.8h
+;   ret
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   uaddlp v0.4s, v0.8h
+;   ret
 
-function %fn5(i8x16, i8x16) -> i16x8 {
-block0(v0: i8x16, v1: i8x16):
-  v2 = swiden_low v0
-  v3 = swiden_high v1
-  v4 = iadd_pairwise v2, v3
-  return v4
-}
-
-; check: sxtl v0.8h, v0.8b
-; nextln: sxtl2 v1.8h, v1.16b
-; nextln: addp v0.8h, v0.8h, v1.8h
-; nextln: ret
-
-function %fn6(i8x16, i8x16) -> i16x8 {
-block0(v0: i8x16, v1: i8x16):
-  v2 = uwiden_low v0
-  v3 = uwiden_high v1
-  v4 = iadd_pairwise v2, v3
-  return v4
-}
-
-; check: uxtl v0.8h, v0.8b
-; nextln: uxtl2 v1.8h, v1.16b
-; nextln: addp v0.8h, v0.8h, v1.8h
-; nextln: ret
-
-function %fn7(i8x16) -> i16x8 {
-block0(v0: i8x16):
-  v1 = uwiden_low v0
-  v2 = swiden_high v0
-  v3 = iadd_pairwise v1, v2
-  return v3
-}
-
-; check: uxtl v1.8h, v0.8b
-; nextln: sxtl2 v0.8h, v0.16b
-; nextln: addp v0.8h, v1.8h, v0.8h
-; nextln: ret
-
-function %fn8(i8x16) -> i16x8 {
-block0(v0: i8x16):
-  v1 = swiden_low v0
-  v2 = uwiden_high v0
-  v3 = iadd_pairwise v1, v2
-  return v3
-}
-
-; check: sxtl v1.8h, v0.8b
-; nextln: uxtl2 v0.8h, v0.16b
-; nextln: addp v0.8h, v1.8h, v0.8h
-; nextln: ret

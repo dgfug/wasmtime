@@ -1,13 +1,11 @@
 //! Data structure for tracking the (possibly multiple) registers that hold one
 //! SSA `Value`.
 
-use regalloc::{RealReg, Reg, VirtualReg, Writable};
+use regalloc2::{PReg, VReg};
+
+use super::{RealReg, Reg, VirtualReg, Writable};
 use std::fmt::Debug;
 
-#[cfg(feature = "arm32")]
-const VALUE_REGS_PARTS: usize = 4;
-
-#[cfg(not(feature = "arm32"))]
 const VALUE_REGS_PARTS: usize = 2;
 
 /// Location at which a `Value` is stored in register(s): the value is located
@@ -19,13 +17,29 @@ const VALUE_REGS_PARTS: usize = 2;
 /// By convention, the register parts are kept in machine-endian order here.
 ///
 /// N.B.: we cap the capacity of this at four (when any 32-bit target is
-/// enabled) or two (otherwise), and we use special in-band sentinal `Reg`
+/// enabled) or two (otherwise), and we use special in-band sentinel `Reg`
 /// values (`Reg::invalid()`) to avoid the need to carry a separate length. This
 /// allows the struct to be `Copy` (no heap or drop overhead) and be only 16 or
 /// 8 bytes, which is important for compiler performance.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ValueRegs<R: Clone + Copy + Debug + PartialEq + Eq + InvalidSentinel> {
     parts: [R; VALUE_REGS_PARTS],
+}
+
+impl<R: Clone + Copy + Debug + PartialEq + Eq + InvalidSentinel> Debug for ValueRegs<R> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut f = f.debug_tuple("ValueRegs");
+        let mut last_valid = true;
+        for part in self.parts {
+            if part.is_invalid_sentinel() {
+                last_valid = false;
+            } else {
+                debug_assert!(last_valid);
+                f.field(&part);
+            }
+        }
+        f.finish()
+    }
 }
 
 /// A type with an "invalid" sentinel value.
@@ -39,17 +53,17 @@ pub trait InvalidSentinel: Copy + Eq {
 }
 impl InvalidSentinel for Reg {
     fn invalid_sentinel() -> Self {
-        Reg::invalid()
+        Reg::from(VReg::invalid())
     }
 }
 impl InvalidSentinel for VirtualReg {
     fn invalid_sentinel() -> Self {
-        VirtualReg::invalid()
+        VirtualReg::from(VReg::invalid())
     }
 }
 impl InvalidSentinel for RealReg {
     fn invalid_sentinel() -> Self {
-        RealReg::invalid()
+        RealReg::from(PReg::invalid())
     }
 }
 impl InvalidSentinel for Writable<Reg> {
@@ -84,65 +98,18 @@ impl<R: Clone + Copy + Debug + PartialEq + Eq + InvalidSentinel> ValueRegs<R> {
         }
     }
 
-    /// Return an iterator over the registers storing this value.
+    /// Return a slice of the registers storing this value.
     pub fn regs(&self) -> &[R] {
         &self.parts[0..self.len()]
     }
-}
 
-#[cfg(feature = "arm32")]
-impl<R: Clone + Copy + Debug + PartialEq + Eq + InvalidSentinel> ValueRegs<R> {
-    /// Create a Value-in-R location for a value stored in one register.
-    pub fn one(reg: R) -> Self {
-        ValueRegs {
-            parts: [
-                reg,
-                R::invalid_sentinel(),
-                R::invalid_sentinel(),
-                R::invalid_sentinel(),
-            ],
-        }
-    }
-    /// Create a Value-in-R location for a value stored in two registers.
-    pub fn two(r1: R, r2: R) -> Self {
-        ValueRegs {
-            parts: [r1, r2, R::invalid_sentinel(), R::invalid_sentinel()],
-        }
-    }
-    /// Create a Value-in-R location for a value stored in four registers.
-    pub fn four(r1: R, r2: R, r3: R, r4: R) -> Self {
-        ValueRegs {
-            parts: [r1, r2, r3, r4],
-        }
-    }
-
-    /// Return the number of registers used.
-    pub fn len(self) -> usize {
-        // If rustc/LLVM is smart enough, this might even be vectorized...
-        (self.parts[0] != R::invalid_sentinel()) as usize
-            + (self.parts[1] != R::invalid_sentinel()) as usize
-            + (self.parts[2] != R::invalid_sentinel()) as usize
-            + (self.parts[3] != R::invalid_sentinel()) as usize
-    }
-
-    /// Map individual registers via a map function.
-    pub fn map<NewR, F>(self, f: F) -> ValueRegs<NewR>
-    where
-        NewR: Clone + Copy + Debug + PartialEq + Eq + InvalidSentinel,
-        F: Fn(R) -> NewR,
-    {
-        ValueRegs {
-            parts: [
-                f(self.parts[0]),
-                f(self.parts[1]),
-                f(self.parts[2]),
-                f(self.parts[3]),
-            ],
-        }
+    /// Return a mutable slice of the registers storing this value.
+    pub fn regs_mut(&mut self) -> &mut [R] {
+        let len = self.len();
+        &mut self.parts[0..len]
     }
 }
 
-#[cfg(not(feature = "arm32"))]
 impl<R: Clone + Copy + Debug + PartialEq + Eq + InvalidSentinel> ValueRegs<R> {
     /// Create a Value-in-R location for a value stored in one register.
     pub fn one(reg: R) -> Self {

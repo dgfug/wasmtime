@@ -1,9 +1,13 @@
 //! Fuzzing infrastructure for Wasmtime.
 
-#![deny(missing_docs, missing_debug_implementations)]
+#![deny(missing_docs)]
 
+pub use wasm_mutate;
+pub use wasm_smith;
 pub mod generators;
+pub mod mutators;
 pub mod oracles;
+pub mod single_module_fuzzer;
 
 /// One time start up initialization for fuzzing:
 ///
@@ -18,7 +22,7 @@ pub mod oracles;
 /// `Arbitrary` implementation is not derived and does interesting things, then
 /// the `Arbitrary` implementation should call this function, since it runs
 /// before the fuzz target itself.
-pub(crate) fn init_fuzzing() {
+pub fn init_fuzzing() {
     static INIT: std::sync::Once = std::sync::Once::new();
 
     INIT.call_once(|| {
@@ -28,19 +32,4 @@ pub(crate) fn init_fuzzing() {
             .num_threads(1)
             .build_global();
     })
-}
-
-/// Create default fuzzing config with given strategy
-pub fn fuzz_default_config(strategy: wasmtime::Strategy) -> anyhow::Result<wasmtime::Config> {
-    init_fuzzing();
-    let mut config = wasmtime::Config::new();
-    config
-        .cranelift_nan_canonicalization(true)
-        .wasm_bulk_memory(true)
-        .wasm_reference_types(true)
-        .wasm_module_linking(true)
-        .wasm_multi_memory(true)
-        .wasm_memory64(true)
-        .strategy(strategy)?;
-    Ok(config)
 }

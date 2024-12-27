@@ -1,45 +1,20 @@
 //! Run the tests in a single test file.
 
 use crate::new_subtest;
-use crate::subtest::{Context, SubTest};
-use anyhow::Context as _;
-use cranelift_codegen::ir::Function;
+use crate::subtest::SubTest;
+use anyhow::{bail, Context as _, Result};
 use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::print_errors::pretty_verifier_error;
-use cranelift_codegen::settings::Flags;
+use cranelift_codegen::settings::{Flags, FlagsOrIsa};
 use cranelift_codegen::timing;
 use cranelift_codegen::verify_function;
-use cranelift_reader::{parse_test, Feature, IsaSpec, ParseOptions, TestFile};
+use cranelift_reader::{parse_test, IsaSpec, Location, ParseOptions, TestFile};
 use log::info;
-use std::borrow::Cow;
+use std::cell::Cell;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::str::Lines;
 use std::time;
-
-/// Skip the tests which define features and for which there's a feature mismatch.
-///
-/// When a test must be skipped, returns an Option with a string containing an explanation why;
-/// otherwise, return None.
-fn skip_feature_mismatches(testfile: &TestFile) -> Option<&'static str> {
-    let mut has_experimental_arm32 = false;
-
-    for feature in &testfile.features {
-        if let Feature::With(name) = feature {
-            match *name {
-                "experimental_arm32" => has_experimental_arm32 = true,
-                _ => {}
-            }
-        }
-    }
-
-    // Don't run tests if the experimental support for arm32 is disabled.
-    #[cfg(not(feature = "experimental_arm32"))]
-    if has_experimental_arm32 {
-        return Some("missing support for experimental_arm32");
-    }
-
-    None
-}
 
 /// Load `path` and run the test in it.
 ///
@@ -54,9 +29,11 @@ pub fn run(
     let started = time::Instant::now();
     let buffer =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+
     let options = ParseOptions {
         target,
         passes,
+        machine_code_cfg_info: true,
         ..ParseOptions::default()
     };
 
@@ -64,9 +41,11 @@ pub fn run(
         Ok(testfile) => testfile,
         Err(e) => {
             if e.is_warning {
-                println!(
+                log::warn!(
                     "skipping test {:?} (line {}): {}",
-                    path, e.location.line_number, e.message
+                    path,
+                    e.location.line_number,
+                    e.message
                 );
                 return Ok(started.elapsed());
             }
@@ -75,11 +54,6 @@ pub fn run(
                 .into();
         }
     };
-
-    if let Some(msg) = skip_feature_mismatches(&testfile) {
-        println!("skipped {:?}: {}", path, msg);
-        return Ok(started.elapsed());
-    }
 
     if testfile.functions.is_empty() {
         anyhow::bail!("no functions found");
@@ -104,35 +78,36 @@ pub fn run(
     tests.sort_by_key(|st| (st.is_mutating(), st.needs_verifier()));
 
     // Expand the tests into (test, flags, isa) tuples.
-    let mut tuples = test_tuples(&tests, &testfile.isa_spec, flags)?;
+    let tuples = test_tuples(&tests, &testfile.isa_spec, flags)?;
 
-    // Isolate the last test in the hope that this is the only mutating test.
-    // If so, we can completely avoid cloning functions.
-    let last_tuple = match tuples.pop() {
-        None => anyhow::bail!("no test commands found"),
-        Some(t) => t,
-    };
+    // Bail if the test has no runnable commands
+    if tuples.is_empty() {
+        anyhow::bail!("no test commands found");
+    }
 
+    let mut file_update = FileUpdate::new(&path);
     let file_path = path.to_string_lossy();
-    for (func, details) in testfile.functions {
-        let mut context = Context {
-            preamble_comments: &testfile.preamble_comments,
-            details,
-            verified: false,
-            flags,
-            isa: None,
-            file_path: file_path.as_ref(),
-        };
-
-        for tuple in &tuples {
-            run_one_test(*tuple, Cow::Borrowed(&func), &mut context)?;
+    for (test, flags, isa) in &tuples {
+        // Should we run the verifier before this test?
+        if test.needs_verifier() {
+            let fisa = FlagsOrIsa { flags, isa: *isa };
+            verify_testfile(&testfile, fisa)?;
         }
-        // Run the last test with an owned function which means it won't need to clone it before
-        // mutating.
-        run_one_test(last_tuple, Cow::Owned(func), &mut context)?;
+
+        test.run_target(&testfile, &mut file_update, file_path.as_ref(), flags, *isa)?;
     }
 
     Ok(started.elapsed())
+}
+
+// Verifies all functions in a testfile
+fn verify_testfile(testfile: &TestFile, fisa: FlagsOrIsa) -> anyhow::Result<()> {
+    for (func, _) in &testfile.functions {
+        verify_function(func, fisa)
+            .map_err(|errors| anyhow::anyhow!("{}", pretty_verifier_error(&func, None, errors)))?;
+    }
+
+    Ok(())
 }
 
 // Given a slice of tests, generate a vector of (test, flags, isa) tuples.
@@ -165,25 +140,87 @@ fn test_tuples<'a>(
     Ok(out)
 }
 
-fn run_one_test<'a>(
-    tuple: (&'a dyn SubTest, &'a Flags, Option<&'a dyn TargetIsa>),
-    func: Cow<Function>,
-    context: &mut Context<'a>,
-) -> anyhow::Result<()> {
-    let (test, flags, isa) = tuple;
-    let name = format!("{}({})", test.name(), func.name);
-    info!("Test: {} {}", name, isa.map_or("-", TargetIsa::name));
+/// A helper struct to update a file in-place as test expectations are
+/// automatically updated.
+///
+/// This structure automatically handles multiple edits to one file. Our edits
+/// are line-based but if editing a previous portion of the file adds lines then
+/// all future edits need to know to skip over those previous lines. Note that
+/// this assumes that edits are done front-to-back.
+pub struct FileUpdate {
+    path: PathBuf,
+    line_diff: Cell<isize>,
+    last_update: Cell<usize>,
+}
 
-    context.flags = flags;
-    context.isa = isa;
-
-    // Should we run the verifier before this test?
-    if !context.verified && test.needs_verifier() {
-        verify_function(&func, context.flags_or_isa())
-            .map_err(|errors| anyhow::anyhow!("{}", pretty_verifier_error(&func, None, errors)))?;
-        context.verified = true;
+impl FileUpdate {
+    fn new(path: &Path) -> FileUpdate {
+        FileUpdate {
+            path: path.to_path_buf(),
+            line_diff: Cell::new(0),
+            last_update: Cell::new(0),
+        }
     }
 
-    test.run(func, context).context(test.name())?;
-    Ok(())
+    /// Updates the file that this structure references at the `location`
+    /// specified.
+    ///
+    /// The closure `f` is given first a buffer to push the new test into along
+    /// with a lines iterator for the old test.
+    pub fn update_at(
+        &self,
+        location: &Location,
+        f: impl FnOnce(&mut String, &mut Lines<'_>),
+    ) -> Result<()> {
+        // This is required for correctness of this update.
+        assert!(location.line_number > self.last_update.get());
+        self.last_update.set(location.line_number);
+
+        // Read the old test file and calculate the new line number we're
+        // preserving up to based on how many lines prior to this have been
+        // removed or added.
+        let old_test = std::fs::read_to_string(&self.path)?;
+        let mut new_test = String::new();
+        let mut lines = old_test.lines();
+        let lines_to_preserve =
+            (((location.line_number - 1) as isize) + self.line_diff.get()) as usize;
+
+        // Push everything leading up to the start of the function
+        for _ in 0..lines_to_preserve {
+            new_test.push_str(lines.next().unwrap());
+            new_test.push_str("\n");
+        }
+
+        // Push the whole function, leading up to the trailing `}`
+        let mut first = true;
+        while let Some(line) = lines.next() {
+            if first && !line.starts_with("function") {
+                bail!(
+                    "line {} in test file {:?} did not start with `function`, \
+                     cannot automatically update test",
+                    location.line_number,
+                    self.path,
+                );
+            }
+            first = false;
+            new_test.push_str(line);
+            new_test.push_str("\n");
+            if line.starts_with("}") {
+                break;
+            }
+        }
+
+        // Use our custom update function to further update the test.
+        f(&mut new_test, &mut lines);
+
+        // Record the difference in line count so future updates can be adjusted
+        // accordingly, and then write the file back out to the filesystem.
+        let old_line_count = old_test.lines().count();
+        let new_line_count = new_test.lines().count();
+        self.line_diff
+            .set(self.line_diff.get() + (new_line_count as isize - old_line_count as isize));
+
+        std::fs::write(&self.path, new_test)?;
+        Ok(())
+    }
 }

@@ -5,11 +5,12 @@ use crate::dominator_tree::DominatorTree;
 use crate::entity::entity_impl;
 use crate::entity::SecondaryMap;
 use crate::entity::{Keys, PrimaryMap};
-use crate::flowgraph::{BlockPredecessor, ControlFlowGraph};
+use crate::flowgraph::ControlFlowGraph;
 use crate::ir::{Block, Function, Layout};
 use crate::packed_option::PackedOption;
 use crate::timing;
 use alloc::vec::Vec;
+use smallvec::SmallVec;
 
 /// A opaque reference to a code loop.
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -29,6 +30,48 @@ pub struct LoopAnalysis {
 struct LoopData {
     header: Block,
     parent: PackedOption<Loop>,
+    level: LoopLevel,
+}
+
+/// A level in a loop nest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LoopLevel(u8);
+impl LoopLevel {
+    const INVALID: u8 = u8::MAX;
+
+    /// Get the root level (no loop).
+    pub fn root() -> Self {
+        Self(0)
+    }
+    /// Get the loop level.
+    pub fn level(self) -> usize {
+        self.0 as usize
+    }
+    /// Invalid loop level.
+    pub fn invalid() -> Self {
+        Self(Self::INVALID)
+    }
+    /// One loop level deeper.
+    pub fn inc(self) -> Self {
+        if self.0 == (Self::INVALID - 1) {
+            self
+        } else {
+            Self(self.0 + 1)
+        }
+    }
+    /// A clamped loop level from a larger-width (usize) depth.
+    pub fn clamped(level: usize) -> Self {
+        Self(
+            u8::try_from(std::cmp::min(level, (Self::INVALID as usize) - 1))
+                .expect("Clamped value must always convert"),
+        )
+    }
+}
+
+impl std::default::Default for LoopLevel {
+    fn default() -> Self {
+        LoopLevel::invalid()
+    }
 }
 
 impl LoopData {
@@ -37,6 +80,7 @@ impl LoopData {
         Self {
             header,
             parent: parent.into(),
+            level: LoopLevel::invalid(),
         }
     }
 }
@@ -71,6 +115,17 @@ impl LoopAnalysis {
         self.loops[lp].parent.expand()
     }
 
+    /// Return the innermost loop for a given block.
+    pub fn innermost_loop(&self, block: Block) -> Option<Loop> {
+        self.block_loop_map[block].expand()
+    }
+
+    /// Determine if a Block is a loop header. If so, return the loop.
+    pub fn is_loop_header(&self, block: Block) -> Option<Loop> {
+        self.innermost_loop(block)
+            .filter(|&lp| self.loop_header(lp) == block)
+    }
+
     /// Determine if a Block belongs to a loop by running a finger along the loop tree.
     ///
     /// Returns `true` if `block` is in loop `lp`.
@@ -96,6 +151,12 @@ impl LoopAnalysis {
         }
         false
     }
+
+    /// Returns the loop-nest level of a given block.
+    pub fn loop_level(&self, block: Block) -> LoopLevel {
+        self.innermost_loop(block)
+            .map_or(LoopLevel(0), |lp| self.loops[lp].level)
+    }
 }
 
 impl LoopAnalysis {
@@ -107,6 +168,7 @@ impl LoopAnalysis {
         self.block_loop_map.resize(func.dfg.num_blocks());
         self.find_loop_headers(cfg, domtree, &func.layout);
         self.discover_loop_blocks(cfg, domtree, &func.layout);
+        self.assign_loop_levels();
         self.valid = true;
     }
 
@@ -128,6 +190,19 @@ impl LoopAnalysis {
         self.valid = false;
     }
 
+    // Determines if a block dominates any predecessor
+    // and thus is a loop header.
+    fn is_block_loop_header(
+        block: Block,
+        cfg: &ControlFlowGraph,
+        domtree: &DominatorTree,
+        layout: &Layout,
+    ) -> bool {
+        // A block is a loop header if it dominates any of its predecessors.
+        cfg.pred_iter(block)
+            .any(|pred| domtree.dominates(block, pred.inst, layout))
+    }
+
     // Traverses the CFG in reverse postorder and create a loop object for every block having a
     // back edge.
     fn find_loop_headers(
@@ -136,21 +211,13 @@ impl LoopAnalysis {
         domtree: &DominatorTree,
         layout: &Layout,
     ) {
-        // We traverse the CFG in reverse postorder
-        for &block in domtree.cfg_postorder().iter().rev() {
-            for BlockPredecessor {
-                inst: pred_inst, ..
-            } in cfg.pred_iter(block)
-            {
-                // If the block dominates one of its predecessors it is a back edge
-                if domtree.dominates(block, pred_inst, layout) {
-                    // This block is a loop header, so we create its associated loop
-                    let lp = self.loops.push(LoopData::new(block, None));
-                    self.block_loop_map[block] = lp.into();
-                    break;
-                    // We break because we only need one back edge to identify a loop header.
-                }
-            }
+        for &block in domtree
+            .cfg_rpo()
+            .filter(|&&block| Self::is_block_loop_header(block, cfg, domtree, layout))
+        {
+            // This block is a loop header, so we create its associated loop
+            let lp = self.loops.push(LoopData::new(block, None));
+            self.block_loop_map[block] = lp.into();
         }
     }
 
@@ -167,16 +234,15 @@ impl LoopAnalysis {
         // We handle each loop header in reverse order, corresponding to a pseudo postorder
         // traversal of the graph.
         for lp in self.loops().rev() {
-            for BlockPredecessor {
-                block: pred,
-                inst: pred_inst,
-            } in cfg.pred_iter(self.loops[lp].header)
-            {
-                // We follow the back edges
-                if domtree.dominates(self.loops[lp].header, pred_inst, layout) {
-                    stack.push(pred);
-                }
-            }
+            // Push all predecessors of this header that it dominates onto the stack.
+            stack.extend(
+                cfg.pred_iter(self.loops[lp].header)
+                    .filter(|pred| {
+                        // We follow the back edges
+                        domtree.dominates(self.loops[lp].header, pred.inst, layout)
+                    })
+                    .map(|pred| pred.block),
+            );
             while let Some(node) = stack.pop() {
                 let continue_dfs: Option<Block>;
                 match self.block_loop_map[node].expand() {
@@ -221,8 +287,28 @@ impl LoopAnalysis {
                 // Now we have handled the popped node and need to continue the DFS by adding the
                 // predecessors of that node
                 if let Some(continue_dfs) = continue_dfs {
-                    for BlockPredecessor { block: pred, .. } in cfg.pred_iter(continue_dfs) {
-                        stack.push(pred)
+                    stack.extend(cfg.pred_iter(continue_dfs).map(|pred| pred.block));
+                }
+            }
+        }
+    }
+
+    fn assign_loop_levels(&mut self) {
+        let mut stack: SmallVec<[Loop; 8]> = SmallVec::new();
+        for lp in self.loops.keys() {
+            if self.loops[lp].level == LoopLevel::invalid() {
+                stack.push(lp);
+                while let Some(&lp) = stack.last() {
+                    if let Some(parent) = self.loops[lp].parent.into() {
+                        if self.loops[parent].level != LoopLevel::invalid() {
+                            self.loops[lp].level = self.loops[parent].level.inc();
+                            stack.pop();
+                        } else {
+                            stack.push(parent);
+                        }
+                    } else {
+                        self.loops[lp].level = LoopLevel::root().inc();
+                        stack.pop();
                     }
                 }
             }
@@ -246,6 +332,7 @@ mod tests {
         let block1 = func.dfg.make_block();
         let block2 = func.dfg.make_block();
         let block3 = func.dfg.make_block();
+        let block4 = func.dfg.make_block();
         let cond = func.dfg.append_block_param(block0, types::I32);
 
         {
@@ -258,11 +345,13 @@ mod tests {
             cur.ins().jump(block2, &[]);
 
             cur.insert_block(block2);
-            cur.ins().brnz(cond, block1, &[]);
-            cur.ins().jump(block3, &[]);
+            cur.ins().brif(cond, block1, &[], block3, &[]);
 
             cur.insert_block(block3);
-            cur.ins().brnz(cond, block0, &[]);
+            cur.ins().brif(cond, block0, &[], block4, &[]);
+
+            cur.insert_block(block4);
+            cur.ins().return_(&[]);
         }
 
         let mut loop_analysis = LoopAnalysis::new();
@@ -286,6 +375,10 @@ mod tests {
         assert_eq!(loop_analysis.is_in_loop(block2, loops[0]), true);
         assert_eq!(loop_analysis.is_in_loop(block3, loops[0]), true);
         assert_eq!(loop_analysis.is_in_loop(block0, loops[1]), false);
+        assert_eq!(loop_analysis.loop_level(block0).level(), 1);
+        assert_eq!(loop_analysis.loop_level(block1).level(), 2);
+        assert_eq!(loop_analysis.loop_level(block2).level(), 2);
+        assert_eq!(loop_analysis.loop_level(block3).level(), 1);
     }
 
     #[test]
@@ -297,53 +390,58 @@ mod tests {
         let block3 = func.dfg.make_block();
         let block4 = func.dfg.make_block();
         let block5 = func.dfg.make_block();
+        let block6 = func.dfg.make_block();
         let cond = func.dfg.append_block_param(block0, types::I32);
 
         {
             let mut cur = FuncCursor::new(&mut func);
 
             cur.insert_block(block0);
-            cur.ins().brnz(cond, block1, &[]);
-            cur.ins().jump(block3, &[]);
+            cur.ins().brif(cond, block1, &[], block3, &[]);
 
             cur.insert_block(block1);
             cur.ins().jump(block2, &[]);
 
             cur.insert_block(block2);
-            cur.ins().brnz(cond, block1, &[]);
-            cur.ins().jump(block5, &[]);
+            cur.ins().brif(cond, block1, &[], block5, &[]);
 
             cur.insert_block(block3);
             cur.ins().jump(block4, &[]);
 
             cur.insert_block(block4);
-            cur.ins().brnz(cond, block3, &[]);
-            cur.ins().jump(block5, &[]);
+            cur.ins().brif(cond, block3, &[], block5, &[]);
 
             cur.insert_block(block5);
-            cur.ins().brnz(cond, block0, &[]);
+            cur.ins().brif(cond, block0, &[], block6, &[]);
+
+            cur.insert_block(block6);
+            cur.ins().return_(&[]);
         }
 
         let mut loop_analysis = LoopAnalysis::new();
-        let mut cfg = ControlFlowGraph::new();
-        let mut domtree = DominatorTree::new();
-        cfg.compute(&func);
-        domtree.compute(&func, &cfg);
+        let cfg = ControlFlowGraph::with_function(&func);
+        let domtree = DominatorTree::with_function(&func, &cfg);
         loop_analysis.compute(&func, &cfg, &domtree);
 
         let loops = loop_analysis.loops().collect::<Vec<Loop>>();
         assert_eq!(loops.len(), 3);
         assert_eq!(loop_analysis.loop_header(loops[0]), block0);
-        assert_eq!(loop_analysis.loop_header(loops[1]), block1);
-        assert_eq!(loop_analysis.loop_header(loops[2]), block3);
+        assert_eq!(loop_analysis.loop_header(loops[1]), block3);
+        assert_eq!(loop_analysis.loop_header(loops[2]), block1);
         assert_eq!(loop_analysis.loop_parent(loops[1]), Some(loops[0]));
         assert_eq!(loop_analysis.loop_parent(loops[2]), Some(loops[0]));
         assert_eq!(loop_analysis.loop_parent(loops[0]), None);
         assert_eq!(loop_analysis.is_in_loop(block0, loops[0]), true);
-        assert_eq!(loop_analysis.is_in_loop(block1, loops[1]), true);
-        assert_eq!(loop_analysis.is_in_loop(block2, loops[1]), true);
-        assert_eq!(loop_analysis.is_in_loop(block3, loops[2]), true);
-        assert_eq!(loop_analysis.is_in_loop(block4, loops[2]), true);
+        assert_eq!(loop_analysis.is_in_loop(block1, loops[2]), true);
+        assert_eq!(loop_analysis.is_in_loop(block2, loops[2]), true);
+        assert_eq!(loop_analysis.is_in_loop(block3, loops[1]), true);
+        assert_eq!(loop_analysis.is_in_loop(block4, loops[1]), true);
         assert_eq!(loop_analysis.is_in_loop(block5, loops[0]), true);
+        assert_eq!(loop_analysis.loop_level(block0).level(), 1);
+        assert_eq!(loop_analysis.loop_level(block1).level(), 2);
+        assert_eq!(loop_analysis.loop_level(block2).level(), 2);
+        assert_eq!(loop_analysis.loop_level(block3).level(), 2);
+        assert_eq!(loop_analysis.loop_level(block4).level(), 2);
+        assert_eq!(loop_analysis.loop_level(block5).level(), 1);
     }
 }

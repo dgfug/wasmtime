@@ -17,14 +17,14 @@ use std::time::Duration;
 
 // wrapped, so we have named section in config,
 // also, for possible future compatibility
-#[derive(Deserialize, Debug)]
+#[derive(serde_derive::Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 struct Config {
     cache: CacheConfig,
 }
 
 /// Global configuration for how the cache is managed
-#[derive(Deserialize, Debug, Clone)]
+#[derive(serde_derive::Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct CacheConfig {
     enabled: bool,
@@ -137,7 +137,7 @@ pub fn create_new_config<P: AsRef<Path> + Debug>(config_file: Option<P>) -> Resu
 enabled = true
 ";
 
-    fs::write(&config_file, &content).with_context(|| {
+    fs::write(&config_file, content).with_context(|| {
         format!(
             "Failed to flush config to the disk, path: {}",
             config_file.display(),
@@ -153,11 +153,11 @@ const ZSTD_COMPRESSION_LEVELS: std::ops::RangeInclusive<i32> = 0..=21;
 // Default settings, you're welcome to tune them!
 // TODO: what do we want to warn users about?
 
-// At the moment of writing, the modules couldn't depend on anothers,
+// At the moment of writing, the modules couldn't depend on another,
 // so we have at most one module per wasmtime instance
 // if changed, update cli-cache.md
 const DEFAULT_WORKER_EVENT_QUEUE_SIZE: u64 = 0x10;
-const WORKER_EVENT_QUEUE_SIZE_WARNING_TRESHOLD: u64 = 3;
+const WORKER_EVENT_QUEUE_SIZE_WARNING_THRESHOLD: u64 = 3;
 // should be quick and provide good enough compression
 // if changed, update cli-cache.md
 const DEFAULT_BASELINE_COMPRESSION_LEVEL: i32 = zstd::DEFAULT_COMPRESSION_LEVEL;
@@ -366,7 +366,7 @@ impl CacheConfig {
 
     fn spawn_worker(&mut self) {
         if self.enabled {
-            self.worker = Some(Worker::start_new(self, None));
+            self.worker = Some(Worker::start_new(self));
         }
     }
 
@@ -407,11 +407,11 @@ impl CacheConfig {
         match (entity_exists, user_custom_file) {
             (false, false) => Ok(Self::new_cache_enabled_template()),
             _ => {
-                let bytes = fs::read(&config_file).context(format!(
+                let contents = fs::read_to_string(&config_file).context(format!(
                     "failed to read config file: {}",
                     config_file.display()
                 ))?;
-                let config = toml::from_slice::<Config>(&bytes[..]).context(format!(
+                let config = toml::from_str::<Config>(&contents).context(format!(
                     "failed to parse config file: {}",
                     config_file.display()
                 ))?;
@@ -460,7 +460,7 @@ impl CacheConfig {
             self.worker_event_queue_size = Some(DEFAULT_WORKER_EVENT_QUEUE_SIZE);
         }
 
-        if self.worker_event_queue_size.unwrap() < WORKER_EVENT_QUEUE_SIZE_WARNING_TRESHOLD {
+        if self.worker_event_queue_size.unwrap() < WORKER_EVENT_QUEUE_SIZE_WARNING_THRESHOLD {
             warn!("Detected small worker event queue size. Some messages might be lost.");
         }
     }

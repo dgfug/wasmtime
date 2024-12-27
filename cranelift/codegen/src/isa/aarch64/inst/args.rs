@@ -1,28 +1,22 @@
 //! AArch64 ISA definitions: instruction arguments.
 
-// Some variants are never constructed, but we still want them as options in the future.
-#![allow(dead_code)]
-
 use crate::ir::types::*;
-use crate::ir::Type;
 use crate::isa::aarch64::inst::*;
-use crate::machinst::{ty_bits, MachLabel};
-
-use regalloc::{PrettyPrint, RealRegUniverse, Reg, Writable};
-
-use core::convert::Into;
-use std::string::String;
 
 //=============================================================================
 // Instruction sub-components: shift and extend descriptors
 
 /// A shift operator for a register or immediate.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ShiftOp {
+    /// Logical shift left.
     LSL = 0b00,
+    /// Logical shift right.
     LSR = 0b01,
+    /// Arithmetic shift right.
     ASR = 0b10,
+    /// Rotate right.
     ROR = 0b11,
 }
 
@@ -62,13 +56,16 @@ impl ShiftOpShiftImm {
 }
 
 /// A shift operator with an amount, guaranteed to be within range.
-#[derive(Clone, Debug)]
+#[derive(Copy, Clone, Debug)]
 pub struct ShiftOpAndAmt {
+    /// The shift operator.
     op: ShiftOp,
+    /// The shift operator amount.
     shift: ShiftOpShiftImm,
 }
 
 impl ShiftOpAndAmt {
+    /// Create a new shift operator with an amount.
     pub fn new(op: ShiftOp, shift: ShiftOpShiftImm) -> ShiftOpAndAmt {
         ShiftOpAndAmt { op, shift }
     }
@@ -88,13 +85,21 @@ impl ShiftOpAndAmt {
 #[derive(Clone, Copy, Debug)]
 #[repr(u8)]
 pub enum ExtendOp {
+    /// Unsigned extend byte.
     UXTB = 0b000,
+    /// Unsigned extend halfword.
     UXTH = 0b001,
+    /// Unsigned extend word.
     UXTW = 0b010,
+    /// Unsigned extend doubleword.
     UXTX = 0b011,
+    /// Signed extend byte.
     SXTB = 0b100,
+    /// Signed extend halfword.
     SXTH = 0b101,
+    /// Signed extend word.
     SXTW = 0b110,
+    /// Signed extend doubleword.
     SXTX = 0b111,
 }
 
@@ -115,70 +120,9 @@ pub enum MemLabel {
     /// offset from this instruction. This form must be used at emission time;
     /// see `memlabel_finalize()` for how other forms are lowered to this one.
     PCRel(i32),
-}
-
-/// An addressing mode specified for a load/store operation.
-#[derive(Clone, Debug)]
-pub enum AMode {
-    //
-    // Real ARM64 addressing modes:
-    //
-    /// "post-indexed" mode as per AArch64 docs: postincrement reg after address computation.
-    PostIndexed(Writable<Reg>, SImm9),
-    /// "pre-indexed" mode as per AArch64 docs: preincrement reg before address computation.
-    PreIndexed(Writable<Reg>, SImm9),
-
-    // N.B.: RegReg, RegScaled, and RegScaledExtended all correspond to
-    // what the ISA calls the "register offset" addressing mode. We split out
-    // several options here for more ergonomic codegen.
-    /// Register plus register offset.
-    RegReg(Reg, Reg),
-
-    /// Register plus register offset, scaled by type's size.
-    RegScaled(Reg, Reg, Type),
-
-    /// Register plus register offset, scaled by type's size, with index sign- or zero-extended
-    /// first.
-    RegScaledExtended(Reg, Reg, Type, ExtendOp),
-
-    /// Register plus register offset, with index sign- or zero-extended first.
-    RegExtended(Reg, Reg, ExtendOp),
-
-    /// Unscaled signed 9-bit immediate offset from reg.
-    Unscaled(Reg, SImm9),
-
-    /// Scaled (by size of a type) unsigned 12-bit immediate offset from reg.
-    UnsignedOffset(Reg, UImm12Scaled),
-
-    //
-    // virtual addressing modes that are lowered at emission time:
-    //
-    /// Reference to a "label": e.g., a symbol.
-    Label(MemLabel),
-
-    /// Arbitrary offset from a register. Converted to generation of large
-    /// offsets with multiple instructions as necessary during code emission.
-    RegOffset(Reg, i64, Type),
-
-    /// Offset from the stack pointer.
-    SPOffset(i64, Type),
-
-    /// Offset from the frame pointer.
-    FPOffset(i64, Type),
-
-    /// Offset from the "nominal stack pointer", which is where the real SP is
-    /// just after stack and spill slots are allocated in the function prologue.
-    /// At emission time, this is converted to `SPOffset` with a fixup added to
-    /// the offset constant. The fixup is a running value that is tracked as
-    /// emission iterates through instructions in linear order, and can be
-    /// adjusted up and down with [Inst::VirtualSPOffsetAdj].
-    ///
-    /// The standard ABI is in charge of handling this (by emitting the
-    /// adjustment meta-instructions). It maintains the invariant that "nominal
-    /// SP" is where the actual SP is after the function prologue and before
-    /// clobber pushes. See the diagram in the documentation for
-    /// [crate::isa::aarch64::abi](the ABI module) for more details.
-    NominalSPOffset(i64, Type),
+    /// An address that refers to a label within a `MachBuffer`, for example a
+    /// constant that lives in the pool at the end of the function.
+    Mach(MachLabel),
 }
 
 impl AMode {
@@ -186,51 +130,24 @@ impl AMode {
     pub fn reg(reg: Reg) -> AMode {
         // Use UnsignedOffset rather than Unscaled to use ldr rather than ldur.
         // This also does not use PostIndexed / PreIndexed as they update the register.
-        AMode::UnsignedOffset(reg, UImm12Scaled::zero(I64))
-    }
-
-    /// Memory reference using the sum of two registers as an address.
-    pub fn reg_plus_reg(reg1: Reg, reg2: Reg) -> AMode {
-        AMode::RegReg(reg1, reg2)
-    }
-
-    /// Memory reference using `reg1 + sizeof(ty) * reg2` as an address.
-    pub fn reg_plus_reg_scaled(reg1: Reg, reg2: Reg, ty: Type) -> AMode {
-        AMode::RegScaled(reg1, reg2, ty)
+        AMode::UnsignedOffset {
+            rn: reg,
+            uimm12: UImm12Scaled::zero(I64),
+        }
     }
 
     /// Memory reference using `reg1 + sizeof(ty) * reg2` as an address, with `reg2` sign- or
     /// zero-extended as per `op`.
-    pub fn reg_plus_reg_scaled_extended(reg1: Reg, reg2: Reg, ty: Type, op: ExtendOp) -> AMode {
-        AMode::RegScaledExtended(reg1, reg2, ty, op)
-    }
-
-    /// Memory reference to a label: a global function or value, or data in the constant pool.
-    pub fn label(label: MemLabel) -> AMode {
-        AMode::Label(label)
-    }
-
-    /// Does the address resolve to just a register value, with no offset or
-    /// other computation?
-    pub fn is_reg(&self) -> Option<Reg> {
-        match self {
-            &AMode::UnsignedOffset(r, uimm12) if uimm12.value() == 0 => Some(r),
-            &AMode::Unscaled(r, imm9) if imm9.value() == 0 => Some(r),
-            &AMode::RegOffset(r, off, _) if off == 0 => Some(r),
-            &AMode::FPOffset(off, _) if off == 0 => Some(fp_reg()),
-            &AMode::SPOffset(off, _) if off == 0 => Some(stack_reg()),
-            _ => None,
+    pub fn reg_plus_reg_scaled_extended(reg1: Reg, reg2: Reg, op: ExtendOp) -> AMode {
+        AMode::RegScaledExtended {
+            rn: reg1,
+            rm: reg2,
+            extendop: op,
         }
     }
 }
 
-/// A memory argument to a load/store-pair.
-#[derive(Clone, Debug)]
-pub enum PairAMode {
-    SignedOffset(Reg, SImm7Scaled),
-    PreIndexed(Writable<Reg>, SImm7Scaled),
-    PostIndexed(Writable<Reg>, SImm7Scaled),
-}
+pub use crate::isa::aarch64::lower::isle::generated_code::PairAMode;
 
 //=============================================================================
 // Instruction sub-components (conditions, branches and branch targets):
@@ -240,21 +157,37 @@ pub enum PairAMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Cond {
+    /// Equal.
     Eq = 0,
+    /// Not equal.
     Ne = 1,
+    /// Unsigned greater than or equal to.
     Hs = 2,
+    /// Unsigned less than.
     Lo = 3,
+    /// Minus, negative.
     Mi = 4,
+    /// Positive or zero.
     Pl = 5,
+    /// Signed overflow.
     Vs = 6,
+    /// No signed overflow.
     Vc = 7,
+    /// Unsigned greater than.
     Hi = 8,
+    /// Unsigned less than or equal to.
     Ls = 9,
+    /// Signed greater or equal to.
     Ge = 10,
+    /// Signed less than.
     Lt = 11,
+    /// Signed greater than.
     Gt = 12,
+    /// Signed less than or equal.
     Le = 13,
+    /// Always executed.
     Al = 14,
+    /// Always executed.
     Nv = 15,
 }
 
@@ -300,9 +233,9 @@ impl Cond {
 #[derive(Clone, Copy, Debug)]
 pub enum CondBrKind {
     /// Condition: given register is zero.
-    Zero(Reg),
+    Zero(Reg, OperandSize),
     /// Condition: given register is nonzero.
-    NotZero(Reg),
+    NotZero(Reg, OperandSize),
     /// Condition: the given condition-code test is true.
     Cond(Cond),
 }
@@ -311,8 +244,8 @@ impl CondBrKind {
     /// Return the inverted branch condition.
     pub fn invert(self) -> CondBrKind {
         match self {
-            CondBrKind::Zero(reg) => CondBrKind::NotZero(reg),
-            CondBrKind::NotZero(reg) => CondBrKind::Zero(reg),
+            CondBrKind::Zero(reg, size) => CondBrKind::NotZero(reg, size),
+            CondBrKind::NotZero(reg, size) => CondBrKind::Zero(reg, size),
             CondBrKind::Cond(c) => CondBrKind::Cond(c.invert()),
         }
     }
@@ -339,175 +272,179 @@ impl BranchTarget {
     }
 
     /// Return the target's offset, if specified, or zero if label-based.
+    pub fn as_offset14_or_zero(self) -> u32 {
+        self.as_offset_bounded(14)
+    }
+
+    /// Return the target's offset, if specified, or zero if label-based.
     pub fn as_offset19_or_zero(self) -> u32 {
-        let off = match self {
-            BranchTarget::ResolvedOffset(off) => off >> 2,
-            _ => 0,
-        };
-        assert!(off <= 0x3ffff);
-        assert!(off >= -0x40000);
-        (off as u32) & 0x7ffff
+        self.as_offset_bounded(19)
     }
 
     /// Return the target's offset, if specified, or zero if label-based.
     pub fn as_offset26_or_zero(self) -> u32 {
+        self.as_offset_bounded(26)
+    }
+
+    fn as_offset_bounded(self, bits: u32) -> u32 {
         let off = match self {
             BranchTarget::ResolvedOffset(off) => off >> 2,
             _ => 0,
         };
-        assert!(off <= 0x1ffffff);
-        assert!(off >= -0x2000000);
-        (off as u32) & 0x3ffffff
+        let hi = (1 << (bits - 1)) - 1;
+        let lo = -(1 << bits - 1);
+        assert!(off <= hi);
+        assert!(off >= lo);
+        (off as u32) & ((1 << bits) - 1)
     }
 }
 
 impl PrettyPrint for ShiftOpAndAmt {
-    fn show_rru(&self, _mb_rru: Option<&RealRegUniverse>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         format!("{:?} {}", self.op(), self.amt().value())
     }
 }
 
 impl PrettyPrint for ExtendOp {
-    fn show_rru(&self, _mb_rru: Option<&RealRegUniverse>) -> String {
-        format!("{:?}", self)
+    fn pretty_print(&self, _: u8) -> String {
+        format!("{self:?}")
     }
 }
 
 impl PrettyPrint for MemLabel {
-    fn show_rru(&self, _mb_rru: Option<&RealRegUniverse>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         match self {
-            &MemLabel::PCRel(off) => format!("pc+{}", off),
+            MemLabel::PCRel(off) => format!("pc+{off}"),
+            MemLabel::Mach(off) => format!("label({})", off.get()),
         }
     }
 }
 
-fn shift_for_type(ty: Type) -> usize {
-    match ty.bytes() {
+fn shift_for_type(size_bytes: u8) -> usize {
+    match size_bytes {
         1 => 0,
         2 => 1,
         4 => 2,
         8 => 3,
         16 => 4,
-        _ => panic!("unknown type: {}", ty),
+        _ => panic!("unknown type size: {size_bytes}"),
     }
 }
 
 impl PrettyPrint for AMode {
-    fn show_rru(&self, mb_rru: Option<&RealRegUniverse>) -> String {
+    fn pretty_print(&self, size_bytes: u8) -> String {
+        debug_assert!(size_bytes != 0);
         match self {
-            &AMode::Unscaled(reg, simm9) => {
+            &AMode::Unscaled { rn, simm9 } => {
+                let reg = pretty_print_reg(rn);
                 if simm9.value != 0 {
-                    format!("[{}, {}]", reg.show_rru(mb_rru), simm9.show_rru(mb_rru))
+                    let simm9 = simm9.pretty_print(8);
+                    format!("[{reg}, {simm9}]")
                 } else {
-                    format!("[{}]", reg.show_rru(mb_rru))
+                    format!("[{reg}]")
                 }
             }
-            &AMode::UnsignedOffset(reg, uimm12) => {
-                if uimm12.value != 0 {
-                    format!("[{}, {}]", reg.show_rru(mb_rru), uimm12.show_rru(mb_rru))
+            &AMode::UnsignedOffset { rn, uimm12 } => {
+                let reg = pretty_print_reg(rn);
+                if uimm12.value() != 0 {
+                    let uimm12 = uimm12.pretty_print(8);
+                    format!("[{reg}, {uimm12}]")
                 } else {
-                    format!("[{}]", reg.show_rru(mb_rru))
+                    format!("[{reg}]")
                 }
             }
-            &AMode::RegReg(r1, r2) => {
-                format!("[{}, {}]", r1.show_rru(mb_rru), r2.show_rru(mb_rru),)
+            &AMode::RegReg { rn, rm } => {
+                let r1 = pretty_print_reg(rn);
+                let r2 = pretty_print_reg(rm);
+                format!("[{r1}, {r2}]")
             }
-            &AMode::RegScaled(r1, r2, ty) => {
-                let shift = shift_for_type(ty);
-                format!(
-                    "[{}, {}, LSL #{}]",
-                    r1.show_rru(mb_rru),
-                    r2.show_rru(mb_rru),
-                    shift,
-                )
+            &AMode::RegScaled { rn, rm } => {
+                let r1 = pretty_print_reg(rn);
+                let r2 = pretty_print_reg(rm);
+                let shift = shift_for_type(size_bytes);
+                format!("[{r1}, {r2}, LSL #{shift}]")
             }
-            &AMode::RegScaledExtended(r1, r2, ty, op) => {
-                let shift = shift_for_type(ty);
-                let size = match op {
+            &AMode::RegScaledExtended { rn, rm, extendop } => {
+                let shift = shift_for_type(size_bytes);
+                let size = match extendop {
                     ExtendOp::SXTW | ExtendOp::UXTW => OperandSize::Size32,
                     _ => OperandSize::Size64,
                 };
-                let op = op.show_rru(mb_rru);
-                format!(
-                    "[{}, {}, {} #{}]",
-                    r1.show_rru(mb_rru),
-                    show_ireg_sized(r2, mb_rru, size),
-                    op,
-                    shift
-                )
+                let r1 = pretty_print_reg(rn);
+                let r2 = pretty_print_ireg(rm, size);
+                let op = extendop.pretty_print(0);
+                format!("[{r1}, {r2}, {op} #{shift}]")
             }
-            &AMode::RegExtended(r1, r2, op) => {
-                let size = match op {
+            &AMode::RegExtended { rn, rm, extendop } => {
+                let size = match extendop {
                     ExtendOp::SXTW | ExtendOp::UXTW => OperandSize::Size32,
                     _ => OperandSize::Size64,
                 };
-                let op = op.show_rru(mb_rru);
-                format!(
-                    "[{}, {}, {}]",
-                    r1.show_rru(mb_rru),
-                    show_ireg_sized(r2, mb_rru, size),
-                    op,
-                )
+                let r1 = pretty_print_reg(rn);
+                let r2 = pretty_print_ireg(rm, size);
+                let op = extendop.pretty_print(0);
+                format!("[{r1}, {r2}, {op}]")
             }
-            &AMode::Label(ref label) => label.show_rru(mb_rru),
-            &AMode::PreIndexed(r, simm9) => format!(
-                "[{}, {}]!",
-                r.to_reg().show_rru(mb_rru),
-                simm9.show_rru(mb_rru)
-            ),
-            &AMode::PostIndexed(r, simm9) => format!(
-                "[{}], {}",
-                r.to_reg().show_rru(mb_rru),
-                simm9.show_rru(mb_rru)
-            ),
+            &AMode::Label { ref label } => label.pretty_print(0),
+            &AMode::SPPreIndexed { simm9 } => {
+                let simm9 = simm9.pretty_print(8);
+                format!("[sp, {simm9}]!")
+            }
+            &AMode::SPPostIndexed { simm9 } => {
+                let simm9 = simm9.pretty_print(8);
+                format!("[sp], {simm9}")
+            }
+            AMode::Const { addr } => format!("[const({})]", addr.as_u32()),
+
             // Eliminated by `mem_finalize()`.
-            &AMode::SPOffset(..)
-            | &AMode::FPOffset(..)
-            | &AMode::NominalSPOffset(..)
-            | &AMode::RegOffset(..) => {
-                panic!("Unexpected pseudo mem-arg mode (stack-offset or generic reg-offset)!")
+            &AMode::SPOffset { .. }
+            | &AMode::FPOffset { .. }
+            | &AMode::IncomingArg { .. }
+            | &AMode::SlotOffset { .. }
+            | &AMode::RegOffset { .. } => {
+                panic!("Unexpected pseudo mem-arg mode: {self:?}")
             }
         }
     }
 }
 
 impl PrettyPrint for PairAMode {
-    fn show_rru(&self, mb_rru: Option<&RealRegUniverse>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         match self {
-            &PairAMode::SignedOffset(reg, simm7) => {
+            &PairAMode::SignedOffset { reg, simm7 } => {
+                let reg = pretty_print_reg(reg);
                 if simm7.value != 0 {
-                    format!("[{}, {}]", reg.show_rru(mb_rru), simm7.show_rru(mb_rru))
+                    let simm7 = simm7.pretty_print(8);
+                    format!("[{reg}, {simm7}]")
                 } else {
-                    format!("[{}]", reg.show_rru(mb_rru))
+                    format!("[{reg}]")
                 }
             }
-            &PairAMode::PreIndexed(reg, simm7) => format!(
-                "[{}, {}]!",
-                reg.to_reg().show_rru(mb_rru),
-                simm7.show_rru(mb_rru)
-            ),
-            &PairAMode::PostIndexed(reg, simm7) => format!(
-                "[{}], {}",
-                reg.to_reg().show_rru(mb_rru),
-                simm7.show_rru(mb_rru)
-            ),
+            &PairAMode::SPPreIndexed { simm7 } => {
+                let simm7 = simm7.pretty_print(8);
+                format!("[sp, {simm7}]!")
+            }
+            &PairAMode::SPPostIndexed { simm7 } => {
+                let simm7 = simm7.pretty_print(8);
+                format!("[sp], {simm7}")
+            }
         }
     }
 }
 
 impl PrettyPrint for Cond {
-    fn show_rru(&self, _mb_rru: Option<&RealRegUniverse>) -> String {
-        let mut s = format!("{:?}", self);
+    fn pretty_print(&self, _: u8) -> String {
+        let mut s = format!("{self:?}");
         s.make_ascii_lowercase();
         s
     }
 }
 
 impl PrettyPrint for BranchTarget {
-    fn show_rru(&self, _mb_rru: Option<&RealRegUniverse>) -> String {
+    fn pretty_print(&self, _: u8) -> String {
         match self {
             &BranchTarget::Label(label) => format!("label{:?}", label.get()),
-            &BranchTarget::ResolvedOffset(off) => format!("{}", off),
+            &BranchTarget::ResolvedOffset(off) => format!("{off}"),
         }
     }
 }
@@ -516,7 +453,9 @@ impl PrettyPrint for BranchTarget {
 /// 64-bit variants of many instructions (and integer registers).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OperandSize {
+    /// 32-bit.
     Size32,
+    /// 64-bit.
     Size64,
 }
 
@@ -525,18 +464,12 @@ impl OperandSize {
     pub fn is32(self) -> bool {
         self == OperandSize::Size32
     }
+
     /// 64-bit case?
     pub fn is64(self) -> bool {
         self == OperandSize::Size64
     }
-    /// Convert from an `is32` boolean flag to an `OperandSize`.
-    pub fn from_is32(is32: bool) -> OperandSize {
-        if is32 {
-            OperandSize::Size32
-        } else {
-            OperandSize::Size64
-        }
-    }
+
     /// Convert from a needed width to the smallest size that fits.
     pub fn from_bits<I: Into<usize>>(bits: I) -> OperandSize {
         let bits: usize = bits.into();
@@ -545,6 +478,14 @@ impl OperandSize {
             OperandSize::Size32
         } else {
             OperandSize::Size64
+        }
+    }
+
+    /// Return the operand size in bits.
+    pub fn bits(&self) -> u8 {
+        match self {
+            OperandSize::Size32 => 32,
+            OperandSize::Size64 => 64,
         }
     }
 
@@ -563,10 +504,21 @@ impl OperandSize {
         }
     }
 
+    /// Register interpretation bit.
+    /// When 0, the register is interpreted as the 32-bit version.
+    /// When 1, the register is interpreted as the 64-bit version.
     pub fn sf_bit(&self) -> u32 {
         match self {
             OperandSize::Size32 => 0,
             OperandSize::Size64 => 1,
+        }
+    }
+
+    /// The maximum unsigned value representable in a value of this size.
+    pub fn max_value(&self) -> u64 {
+        match self {
+            OperandSize::Size32 => u32::MAX as u64,
+            OperandSize::Size64 => u64::MAX,
         }
     }
 }
@@ -574,48 +526,26 @@ impl OperandSize {
 /// Type used to communicate the size of a scalar SIMD & FP operand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScalarSize {
+    /// 8-bit.
     Size8,
+    /// 16-bit.
     Size16,
+    /// 32-bit.
     Size32,
+    /// 64-bit.
     Size64,
+    /// 128-bit.
     Size128,
 }
 
 impl ScalarSize {
-    /// Convert from a needed width to the smallest size that fits.
-    pub fn from_bits<I: Into<usize>>(bits: I) -> ScalarSize {
-        match bits.into().next_power_of_two() {
-            8 => ScalarSize::Size8,
-            16 => ScalarSize::Size16,
-            32 => ScalarSize::Size32,
-            64 => ScalarSize::Size64,
-            128 => ScalarSize::Size128,
-            w => panic!("Unexpected type width: {}", w),
-        }
-    }
-
     /// Convert to an integer operand size.
     pub fn operand_size(&self) -> OperandSize {
         match self {
-            ScalarSize::Size32 => OperandSize::Size32,
+            ScalarSize::Size8 | ScalarSize::Size16 | ScalarSize::Size32 => OperandSize::Size32,
             ScalarSize::Size64 => OperandSize::Size64,
-            _ => panic!("Unexpected operand_size request for: {:?}", self),
+            _ => panic!("Unexpected operand_size request for: {self:?}"),
         }
-    }
-
-    /// Convert from an integer operand size.
-    pub fn from_operand_size(size: OperandSize) -> ScalarSize {
-        match size {
-            OperandSize::Size32 => ScalarSize::Size32,
-            OperandSize::Size64 => ScalarSize::Size64,
-        }
-    }
-
-    /// Convert from a type into the smallest size that fits.
-    pub fn from_ty(ty: Type) -> ScalarSize {
-        debug_assert!(!ty.is_vector());
-
-        Self::from_bits(ty_bits(ty))
     }
 
     /// Return the encoding bits that are used by some scalar FP instructions
@@ -625,7 +555,40 @@ impl ScalarSize {
             ScalarSize::Size16 => 0b11,
             ScalarSize::Size32 => 0b00,
             ScalarSize::Size64 => 0b01,
-            _ => panic!("Unexpected scalar FP operand size: {:?}", self),
+            _ => panic!("Unexpected scalar FP operand size: {self:?}"),
+        }
+    }
+
+    /// Return the widened version of the scalar size.
+    pub fn widen(&self) -> ScalarSize {
+        match self {
+            ScalarSize::Size8 => ScalarSize::Size16,
+            ScalarSize::Size16 => ScalarSize::Size32,
+            ScalarSize::Size32 => ScalarSize::Size64,
+            ScalarSize::Size64 => ScalarSize::Size128,
+            ScalarSize::Size128 => panic!("can't widen 128-bits"),
+        }
+    }
+
+    /// Return the narrowed version of the scalar size.
+    pub fn narrow(&self) -> ScalarSize {
+        match self {
+            ScalarSize::Size8 => panic!("can't narrow 8-bits"),
+            ScalarSize::Size16 => ScalarSize::Size8,
+            ScalarSize::Size32 => ScalarSize::Size16,
+            ScalarSize::Size64 => ScalarSize::Size32,
+            ScalarSize::Size128 => ScalarSize::Size64,
+        }
+    }
+
+    /// Return a type with the same size as this scalar.
+    pub fn ty(&self) -> Type {
+        match self {
+            ScalarSize::Size8 => I8,
+            ScalarSize::Size16 => I16,
+            ScalarSize::Size32 => I32,
+            ScalarSize::Size64 => I64,
+            ScalarSize::Size128 => I128,
         }
     }
 }
@@ -633,12 +596,19 @@ impl ScalarSize {
 /// Type used to communicate the size of a vector operand.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VectorSize {
+    /// 8-bit, 8 lanes.
     Size8x8,
+    /// 8 bit, 16 lanes.
     Size8x16,
+    /// 16-bit, 4 lanes.
     Size16x4,
+    /// 16-bit, 8 lanes.
     Size16x8,
+    /// 32-bit, 2 lanes.
     Size32x2,
+    /// 32-bit, 4 lanes.
     Size32x4,
+    /// 64-bit, 2 lanes.
     Size64x2,
 }
 
@@ -653,30 +623,7 @@ impl VectorSize {
             (ScalarSize::Size32, false) => VectorSize::Size32x2,
             (ScalarSize::Size32, true) => VectorSize::Size32x4,
             (ScalarSize::Size64, true) => VectorSize::Size64x2,
-            _ => panic!("Unexpected scalar FP operand size: {:?}", size),
-        }
-    }
-
-    /// Convert from a type into a vector operand size.
-    pub fn from_ty(ty: Type) -> VectorSize {
-        debug_assert!(ty.is_vector());
-
-        match ty {
-            B8X16 => VectorSize::Size8x16,
-            B16X8 => VectorSize::Size16x8,
-            B32X4 => VectorSize::Size32x4,
-            B64X2 => VectorSize::Size64x2,
-            F32X2 => VectorSize::Size32x2,
-            F32X4 => VectorSize::Size32x4,
-            F64X2 => VectorSize::Size64x2,
-            I8X8 => VectorSize::Size8x8,
-            I8X16 => VectorSize::Size8x16,
-            I16X4 => VectorSize::Size16x4,
-            I16X8 => VectorSize::Size16x8,
-            I32X2 => VectorSize::Size32x2,
-            I32X4 => VectorSize::Size32x4,
-            I64X2 => VectorSize::Size64x2,
-            _ => unimplemented!("Unsupported type: {}", ty),
+            _ => panic!("Unexpected scalar FP operand size: {size:?}"),
         }
     }
 
@@ -691,16 +638,14 @@ impl VectorSize {
     /// Get the scalar operand size that corresponds to a lane of a vector with a certain size.
     pub fn lane_size(&self) -> ScalarSize {
         match self {
-            VectorSize::Size8x8 => ScalarSize::Size8,
-            VectorSize::Size8x16 => ScalarSize::Size8,
-            VectorSize::Size16x4 => ScalarSize::Size16,
-            VectorSize::Size16x8 => ScalarSize::Size16,
-            VectorSize::Size32x2 => ScalarSize::Size32,
-            VectorSize::Size32x4 => ScalarSize::Size32,
+            VectorSize::Size8x8 | VectorSize::Size8x16 => ScalarSize::Size8,
+            VectorSize::Size16x4 | VectorSize::Size16x8 => ScalarSize::Size16,
+            VectorSize::Size32x2 | VectorSize::Size32x4 => ScalarSize::Size32,
             VectorSize::Size64x2 => ScalarSize::Size64,
         }
     }
 
+    /// Returns true if the VectorSize is 128-bits.
     pub fn is_128bits(&self) -> bool {
         match self {
             VectorSize::Size8x8 => false,
@@ -710,31 +655,6 @@ impl VectorSize {
             VectorSize::Size32x2 => false,
             VectorSize::Size32x4 => true,
             VectorSize::Size64x2 => true,
-        }
-    }
-
-    /// Produces a `VectorSize` with lanes twice as wide.  Note that if the resulting
-    /// size would exceed 128 bits, then the number of lanes is also halved, so as to
-    /// ensure that the result size is at most 128 bits.
-    pub fn widen(&self) -> VectorSize {
-        match self {
-            VectorSize::Size8x8 => VectorSize::Size16x8,
-            VectorSize::Size8x16 => VectorSize::Size16x8,
-            VectorSize::Size16x4 => VectorSize::Size32x4,
-            VectorSize::Size16x8 => VectorSize::Size32x4,
-            VectorSize::Size32x2 => VectorSize::Size64x2,
-            VectorSize::Size32x4 => VectorSize::Size64x2,
-            VectorSize::Size64x2 => unreachable!(),
-        }
-    }
-
-    /// Produces a `VectorSize` that has the same lane width, but half as many lanes.
-    pub fn halve(&self) -> VectorSize {
-        match self {
-            VectorSize::Size8x16 => VectorSize::Size8x8,
-            VectorSize::Size16x8 => VectorSize::Size16x4,
-            VectorSize::Size32x4 => VectorSize::Size32x2,
-            _ => *self,
         }
     }
 
@@ -751,5 +671,41 @@ impl VectorSize {
         };
 
         (q, size)
+    }
+
+    /// Return the encoding bit that is used by some floating-point SIMD
+    /// instructions for a particular operand size.
+    pub fn enc_float_size(&self) -> u32 {
+        match self.lane_size() {
+            ScalarSize::Size32 => 0b0,
+            ScalarSize::Size64 => 0b1,
+            size => panic!("Unsupported floating-point size for vector op: {size:?}"),
+        }
+    }
+}
+
+impl APIKey {
+    /// Returns the encoding of the `auti{key}` instruction used to decrypt the
+    /// `lr` register.
+    pub fn enc_auti_hint(&self) -> u32 {
+        let (crm, op2) = match self {
+            APIKey::AZ => (0b0011, 0b100),
+            APIKey::ASP => (0b0011, 0b101),
+            APIKey::BZ => (0b0011, 0b110),
+            APIKey::BSP => (0b0011, 0b111),
+        };
+        0xd503201f | (crm << 8) | (op2 << 5)
+    }
+}
+
+pub use crate::isa::aarch64::lower::isle::generated_code::TestBitAndBranchKind;
+
+impl TestBitAndBranchKind {
+    /// Complements this branch condition to act on the opposite result.
+    pub fn complement(&self) -> TestBitAndBranchKind {
+        match self {
+            TestBitAndBranchKind::Z => TestBitAndBranchKind::NZ,
+            TestBitAndBranchKind::NZ => TestBitAndBranchKind::Z,
+        }
     }
 }

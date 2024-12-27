@@ -1,35 +1,44 @@
-use crate::utils::parse_sets_and_triple;
+use crate::utils::{iterate_files, read_to_string};
 use anyhow::{Context as _, Result};
+use clap::Parser;
+use cranelift_codegen::control::ControlPlane;
+use cranelift_codegen::ir::Function;
 use cranelift_codegen::Context;
-use cranelift_wasm::{DummyEnvironment, ReturnMode};
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
-use std::path::{Path, PathBuf};
+use cranelift_reader::parse_sets_and_triple;
+use rayon::iter::{IntoParallelIterator, ParallelBridge, ParallelIterator};
+use std::collections::HashSet;
+use std::hash::{BuildHasher, BuildHasherDefault};
+use std::io::Write;
+use std::path::PathBuf;
 use std::{fs, io};
-use structopt::StructOpt;
-
-static WASM_MAGIC: &[u8] = &[0x00, 0x61, 0x73, 0x6D];
 
 /// Harvest candidates for superoptimization from a Wasm or Clif file.
 ///
 /// Candidates are emitted in Souper's text format:
 /// <https://github.com/google/souper>
-#[derive(StructOpt)]
+#[derive(Parser)]
 pub struct Options {
     /// Specify an input file to be used. Use '-' for stdin.
-    #[structopt(parse(from_os_str))]
-    input: PathBuf,
+    input: Vec<PathBuf>,
 
-    /// Specify the output file to be used. Use '-' for stdout.
-    #[structopt(short("o"), long("output"), default_value("-"), parse(from_os_str))]
-    output: PathBuf,
+    /// Specify the directory where harvested left-hand side files should be
+    /// written to.
+    #[arg(short, long)]
+    output_dir: PathBuf,
 
     /// Configure Cranelift settings
-    #[structopt(long("set"))]
+    #[arg(long = "set")]
     settings: Vec<String>,
 
     /// Specify the Cranelift target
-    #[structopt(long("target"))]
+    #[arg(long = "target")]
     target: String,
+
+    /// Add a comment from which CLIF variable and function each left-hand side
+    /// was harvested from. This prevents deduplicating harvested left-hand
+    /// sides.
+    #[arg(long)]
+    add_harvest_source: bool,
 }
 
 pub fn run(options: &Options) -> Result<()> {
@@ -39,73 +48,82 @@ pub fn run(options: &Options) -> Result<()> {
         anyhow::bail!("`souper-harvest` requires a target isa");
     }
 
-    let stdin = io::stdin();
-    let mut input: Box<dyn io::BufRead> = if options.input == Path::new("-") {
-        Box::new(stdin.lock())
-    } else {
-        Box::new(io::BufReader::new(
-            fs::File::open(&options.input).context("failed to open input file")?,
-        ))
-    };
-
-    let mut output: Box<dyn io::Write + Send> = if options.output == Path::new("-") {
-        Box::new(io::stdout())
-    } else {
-        Box::new(io::BufWriter::new(
-            fs::File::create(&options.output).context("failed to create output file")?,
-        ))
-    };
-
-    let mut contents = vec![];
-    input
-        .read_to_end(&mut contents)
-        .context("failed to read input file")?;
-
-    let funcs = if &contents[..WASM_MAGIC.len()] == WASM_MAGIC {
-        let mut dummy_environ = DummyEnvironment::new(
-            fisa.isa.unwrap().frontend_config(),
-            ReturnMode::NormalReturns,
-            false,
-        );
-        cranelift_wasm::translate_module(&contents, &mut dummy_environ)
-            .context("failed to translate Wasm module to clif")?;
-        dummy_environ
-            .info
-            .function_bodies
-            .iter()
-            .map(|(_, f)| f.clone())
-            .collect()
-    } else {
-        let contents = String::from_utf8(contents)?;
-        cranelift_reader::parse_functions(&contents)?
-    };
+    match fs::create_dir_all(&options.output_dir) {
+        Ok(_) => {}
+        Err(e)
+            if e.kind() == io::ErrorKind::AlreadyExists
+                && fs::metadata(&options.output_dir)
+                    .with_context(|| {
+                        format!(
+                            "failed to read file metadata: {}",
+                            options.output_dir.display(),
+                        )
+                    })?
+                    .is_dir() => {}
+        Err(e) => {
+            return Err(e).context(format!(
+                "failed to create output directory: {}",
+                options.output_dir.display()
+            ))
+        }
+    }
 
     let (send, recv) = std::sync::mpsc::channel::<String>();
 
-    let writing_thread = std::thread::spawn(move || -> Result<()> {
-        for lhs in recv {
-            output
-                .write_all(lhs.as_bytes())
-                .context("failed to write to output file")?;
+    let writing_thread = std::thread::spawn({
+        let output_dir = options.output_dir.clone();
+        let keep_harvest_source = options.add_harvest_source;
+        move || -> Result<()> {
+            let mut already_harvested = HashSet::new();
+            for lhs in recv {
+                let lhs = if keep_harvest_source {
+                    &lhs
+                } else {
+                    // Remove the first `;; Harvested from v12 in u:34` line.
+                    let i = lhs.find('\n').unwrap();
+                    &lhs[i + 1..]
+                };
+                let hash = hash(lhs.as_bytes());
+                if already_harvested.insert(hash) {
+                    let output_path = output_dir.join(hash.to_string());
+                    let mut output =
+                        io::BufWriter::new(fs::File::create(&output_path).with_context(|| {
+                            format!("failed to create file: {}", output_path.display())
+                        })?);
+                    output.write_all(lhs.as_bytes()).with_context(|| {
+                        format!("failed to write to output file: {}", output_path.display())
+                    })?;
+                }
+            }
+            Ok(())
         }
-        Ok(())
     });
 
-    funcs
-        .into_par_iter()
-        .map_with(send, move |send, func| {
-            let mut ctx = Context::new();
-            ctx.func = func;
-
-            ctx.compute_cfg();
-            ctx.preopt(fisa.isa.unwrap())
-                .context("failed to run preopt")?;
-
-            ctx.souper_harvest(send)
-                .context("failed to run souper harvester")?;
-
-            Ok(())
+    iterate_files(&options.input)
+        .par_bridge()
+        .flat_map(|path| {
+            parse_input(path)
+                .unwrap_or_else(|e| {
+                    println!("{e:?}");
+                    Vec::new()
+                })
+                .into_par_iter()
         })
+        .map_init(
+            move || (send.clone(), Context::new()),
+            move |(send, ctx), func| {
+                ctx.clear();
+                ctx.func = func;
+
+                ctx.optimize(fisa.isa.unwrap(), &mut ControlPlane::default())
+                    .context("failed to run optimizations")?;
+
+                ctx.souper_harvest(send)
+                    .context("failed to run souper harvester")?;
+
+                Ok(())
+            },
+        )
         .collect::<Result<()>>()?;
 
     match writing_thread.join() {
@@ -114,4 +132,17 @@ pub fn run(options: &Options) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn parse_input(path: PathBuf) -> Result<Vec<Function>> {
+    let contents = read_to_string(&path)?;
+    let funcs = cranelift_reader::parse_functions(&contents)
+        .with_context(|| format!("parse error in {}", path.display()))?;
+    Ok(funcs)
+}
+
+/// A convenience function for a quick usize hash
+#[inline]
+pub fn hash<T: std::hash::Hash + ?Sized>(v: &T) -> usize {
+    BuildHasherDefault::<rustc_hash::FxHasher>::default().hash_one(v) as usize
 }

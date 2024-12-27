@@ -38,6 +38,8 @@ pub(crate) struct InstructionFormat {
 
     pub imm_fields: Vec<FormatField>,
 
+    pub num_block_operands: usize,
+
     /// Index of the value input operand that is used to infer the controlling type variable. By
     /// default, this is `0`, the first `value` operand. The index is relative to the values only,
     /// ignoring immediate operands.
@@ -49,6 +51,7 @@ pub(crate) struct InstructionFormat {
 pub(crate) struct FormatStructure {
     pub num_value_operands: usize,
     pub has_value_list: bool,
+    pub num_block_operands: usize,
     /// Tuples of (Rust field name / Rust type) for each immediate field.
     pub imm_field_names: Vec<(&'static str, &'static str)>,
 }
@@ -62,8 +65,8 @@ impl fmt::Display for InstructionFormat {
             .collect::<Vec<_>>()
             .join(", ");
         fmt.write_fmt(format_args!(
-            "{}(imms=({}), vals={})",
-            self.name, imm_args, self.num_value_operands
+            "{}(imms=({}), vals={}, blocks={})",
+            self.name, imm_args, self.num_value_operands, self.num_block_operands,
         ))?;
         Ok(())
     }
@@ -75,6 +78,7 @@ impl InstructionFormat {
         FormatStructure {
             num_value_operands: self.num_value_operands,
             has_value_list: self.has_value_list,
+            num_block_operands: self.num_block_operands,
             imm_field_names: self
                 .imm_fields
                 .iter()
@@ -84,32 +88,32 @@ impl InstructionFormat {
     }
 }
 
-pub(crate) struct InstructionFormatBuilder {
-    name: &'static str,
-    num_value_operands: usize,
-    has_value_list: bool,
-    imm_fields: Vec<FormatField>,
-    typevar_operand: Option<usize>,
-}
+pub(crate) struct InstructionFormatBuilder(InstructionFormat);
 
 impl InstructionFormatBuilder {
     pub fn new(name: &'static str) -> Self {
-        Self {
+        Self(InstructionFormat {
             name,
             num_value_operands: 0,
             has_value_list: false,
+            num_block_operands: 0,
             imm_fields: Vec::new(),
             typevar_operand: None,
-        }
+        })
     }
 
     pub fn value(mut self) -> Self {
-        self.num_value_operands += 1;
+        self.0.num_value_operands += 1;
         self
     }
 
     pub fn varargs(mut self) -> Self {
-        self.has_value_list = true;
+        self.0.has_value_list = true;
+        self
+    }
+
+    pub fn block(mut self) -> Self {
+        self.0.num_block_operands += 1;
         self
     }
 
@@ -118,42 +122,23 @@ impl InstructionFormatBuilder {
             kind: operand_kind.clone(),
             member: operand_kind.rust_field_name,
         };
-        self.imm_fields.push(field);
-        self
-    }
-
-    pub fn imm_with_name(mut self, member: &'static str, operand_kind: &OperandKind) -> Self {
-        let field = FormatField {
-            kind: operand_kind.clone(),
-            member,
-        };
-        self.imm_fields.push(field);
+        self.0.imm_fields.push(field);
         self
     }
 
     pub fn typevar_operand(mut self, operand_index: usize) -> Self {
-        assert!(self.typevar_operand.is_none());
-        assert!(self.has_value_list || operand_index < self.num_value_operands);
-        self.typevar_operand = Some(operand_index);
+        assert!(self.0.typevar_operand.is_none());
+        assert!(operand_index < self.0.num_value_operands);
+        self.0.typevar_operand = Some(operand_index);
         self
     }
 
-    pub fn build(self) -> Rc<InstructionFormat> {
-        let typevar_operand = if self.typevar_operand.is_some() {
-            self.typevar_operand
-        } else if self.has_value_list || self.num_value_operands > 0 {
+    pub fn build(mut self) -> Rc<InstructionFormat> {
+        if self.0.typevar_operand.is_none() && self.0.num_value_operands > 0 {
             // Default to the first value operand, if there's one.
-            Some(0)
-        } else {
-            None
+            self.0.typevar_operand = Some(0);
         };
 
-        Rc::new(InstructionFormat {
-            name: self.name,
-            num_value_operands: self.num_value_operands,
-            has_value_list: self.has_value_list,
-            imm_fields: self.imm_fields,
-            typevar_operand,
-        })
+        Rc::new(self.0)
     }
 }

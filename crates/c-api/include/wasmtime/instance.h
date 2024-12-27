@@ -16,39 +16,19 @@
 extern "C" {
 #endif
 
-/**
- * \brief An opaque object representing the type of an instance.
- */
-typedef struct wasmtime_instancetype wasmtime_instancetype_t;
-
-/// \brief Deletes an instance type
-WASM_API_EXTERN void wasmtime_instancetype_delete(wasmtime_instancetype_t *ty);
-
-/**
- * \brief Returns the list of exports that this instance type provides.
- *
- * This function does not take ownership of the provided instance type but
- * ownership of `out` is passed to the caller. Note that `out` is treated as
- * uninitialized when passed to this function.
- */
-WASM_API_EXTERN void wasmtime_instancetype_exports(const wasmtime_instancetype_t*, wasm_exporttype_vec_t* out);
-
-/**
- * \brief Converts a #wasmtime_instancetype_t to a #wasm_externtype_t
- *
- * The returned value is owned by the #wasmtime_instancetype_t argument and should not
- * be deleted.
- */
-WASM_API_EXTERN wasm_externtype_t* wasmtime_instancetype_as_externtype(wasmtime_instancetype_t*);
-
-/**
- * \brief Attempts to convert a #wasm_externtype_t to a #wasmtime_instancetype_t
- *
- * The returned value is owned by the #wasmtime_instancetype_t argument and should not
- * be deleted. Returns `NULL` if the provided argument is not a
- * #wasmtime_instancetype_t.
- */
-WASM_API_EXTERN wasmtime_instancetype_t* wasmtime_externtype_as_instancetype(wasm_externtype_t*);
+/// \brief Representation of a instance in Wasmtime.
+///
+/// Instances are represented with a 64-bit identifying integer in Wasmtime.
+/// They do not have any destructor associated with them. Instances cannot
+/// interoperate between #wasmtime_store_t instances and if the wrong instance
+/// is passed to the wrong store then it may trigger an assertion to abort the
+/// process.
+typedef struct wasmtime_instance {
+  /// Internal identifier of what store this belongs to, never zero.
+  uint64_t store_id;
+  /// Internal index within the store.
+  size_t index;
+} wasmtime_instance_t;
 
 /**
  * \brief Instantiate a wasm module.
@@ -82,24 +62,11 @@ WASM_API_EXTERN wasmtime_instancetype_t* wasmtime_externtype_as_instancetype(was
  * This function does not take ownership of any of its arguments, but all return
  * values are owned by the caller.
  */
-WASM_API_EXTERN wasmtime_error_t *wasmtime_instance_new(
-    wasmtime_context_t *store,
-    const wasmtime_module_t *module,
-    const wasmtime_extern_t* imports,
-    size_t nimports,
-    wasmtime_instance_t *instance,
-    wasm_trap_t **trap
-);
-
-/**
- * \brief Returns the type of the specified instance.
- *
- * The returned type is owned by the caller.
- */
-WASM_API_EXTERN wasmtime_instancetype_t *wasmtime_instance_type(
-    const wasmtime_context_t *store,
-    const wasmtime_instance_t *instance
-);
+WASM_API_EXTERN wasmtime_error_t *
+wasmtime_instance_new(wasmtime_context_t *store,
+                      const wasmtime_module_t *module,
+                      const wasmtime_extern_t *imports, size_t nimports,
+                      wasmtime_instance_t *instance, wasm_trap_t **trap);
 
 /**
  * \brief Get an export by name from an instance.
@@ -117,12 +84,8 @@ WASM_API_EXTERN wasmtime_instancetype_t *wasmtime_instance_type(
  * #wasmtime_extern_t.
  */
 WASM_API_EXTERN bool wasmtime_instance_export_get(
-    wasmtime_context_t *store,
-    const wasmtime_instance_t *instance,
-    const char *name,
-    size_t name_len,
-    wasmtime_extern_t *item
-);
+    wasmtime_context_t *store, const wasmtime_instance_t *instance,
+    const char *name, size_t name_len, wasmtime_extern_t *item);
 
 /**
  * \brief Get an export by index from an instance.
@@ -143,16 +106,64 @@ WASM_API_EXTERN bool wasmtime_instance_export_get(
  * #wasmtime_context_t.
  */
 WASM_API_EXTERN bool wasmtime_instance_export_nth(
-    wasmtime_context_t *store,
-    const wasmtime_instance_t *instance,
-    size_t index,
-    char **name,
-    size_t *name_len,
-    wasmtime_extern_t *item
-);
+    wasmtime_context_t *store, const wasmtime_instance_t *instance,
+    size_t index, char **name, size_t *name_len, wasmtime_extern_t *item);
+
+/**
+ * \brief A #wasmtime_instance_t, pre-instantiation, that is ready to be
+ * instantiated.
+ *
+ * Must be deleted using #wasmtime_instance_pre_delete.
+ *
+ * For more information see the Rust documentation:
+ * https://docs.wasmtime.dev/api/wasmtime/struct.InstancePre.html
+ */
+typedef struct wasmtime_instance_pre wasmtime_instance_pre_t;
+
+/**
+ * \brief Delete a previously created wasmtime_instance_pre_t.
+ */
+WASM_API_EXTERN void
+wasmtime_instance_pre_delete(wasmtime_instance_pre_t *instance_pre);
+
+/**
+ * \brief Instantiates instance within the given store.
+ *
+ * This will also run the function's startup function, if there is one.
+ *
+ * For more information on instantiation see #wasmtime_instance_new.
+ *
+ * \param instance_pre the pre-initialized instance
+ * \param store the store in which to create the instance
+ * \param instance where to store the returned instance
+ * \param trap_ptr where to store the returned trap
+ *
+ * \return One of three things can happen as a result of this function. First
+ * the module could be successfully instantiated and returned through
+ * `instance`, meaning the return value and `trap` are both set to `NULL`.
+ * Second the start function may trap, meaning the return value and `instance`
+ * are set to `NULL` and `trap` describes the trap that happens. Finally
+ * instantiation may fail for another reason, in which case an error is returned
+ * and `trap` and `instance` are set to `NULL`.
+ *
+ * This function does not take ownership of any of its arguments, and all return
+ * values are owned by the caller.
+ */
+WASM_API_EXTERN wasmtime_error_t *wasmtime_instance_pre_instantiate(
+    const wasmtime_instance_pre_t *instance_pre, wasmtime_context_t *store,
+    wasmtime_instance_t *instance, wasm_trap_t **trap_ptr);
+
+/**
+ * \brief Get the module (as a shallow clone) for a instance_pre.
+ *
+ * The returned module is owned by the caller and the caller **must**
+ * delete it via `wasmtime_module_delete`.
+ */
+WASM_API_EXTERN wasmtime_module_t *
+wasmtime_instance_pre_module(wasmtime_instance_pre_t *instance_pre);
 
 #ifdef __cplusplus
-}  // extern "C"
+} // extern "C"
 #endif
 
 #endif // WASMTIME_INSTANCE_H

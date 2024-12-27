@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use wasmtime::*;
 
 fn measure_execution_time(c: &mut Criterion) {
-    // Baseline performance: a single measurment covers both initializing
+    // Baseline performance: a single measurement covers both initializing
     // thread local resources and executing the first call.
     //
     // The other two bench functions should sum to this duration.
@@ -55,7 +55,7 @@ fn duration_of_call(engine: &Engine, module: &Module) -> Duration {
     let mut store = Store::new(engine, ());
     let inst = Instance::new(&mut store, module, &[]).expect("instantiate");
     let f = inst.get_func(&mut store, "f").expect("get f");
-    let f = f.typed::<(), (), _>(&store).expect("type f");
+    let f = f.typed::<(), ()>(&store).expect("type f");
 
     let call = Instant::now();
     f.call(&mut store, ()).expect("call f");
@@ -78,7 +78,7 @@ fn lazy_thread_instantiate(engine: Engine, module: Module) -> Duration {
 fn eager_thread_instantiate(engine: Engine, module: Module) -> (Duration, Duration) {
     thread::spawn(move || {
         let init_start = Instant::now();
-        Engine::tls_eager_initialize().expect("eager init");
+        Engine::tls_eager_initialize();
         let init_duration = init_start.elapsed();
 
         (init_duration, duration_of_call(&engine, &module))
@@ -91,15 +91,12 @@ fn test_setup() -> (Engine, Module) {
     // We only expect to create one Instance at a time, with a single memory.
     let pool_count = 10;
 
+    let mut pool = PoolingAllocationConfig::default();
+    pool.total_memories(pool_count)
+        .total_stacks(pool_count)
+        .total_tables(pool_count);
     let mut config = Config::new();
-    config.allocation_strategy(InstanceAllocationStrategy::Pooling {
-        strategy: PoolingAllocationStrategy::NextAvailable,
-        module_limits: ModuleLimits {
-            memory_pages: 1,
-            ..Default::default()
-        },
-        instance_limits: InstanceLimits { count: pool_count },
-    });
+    config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
     let engine = Engine::new(&config).unwrap();
 
     // The module has a memory (shouldn't matter) and a single function which is a no-op.

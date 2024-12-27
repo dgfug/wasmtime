@@ -33,14 +33,14 @@ fn main() -> Result<()> {
 
     // Extract exports.
     println!("Extracting export...");
-    let g = instance.get_typed_func::<(i32, i64), (i64, i32), _>(&mut store, "g")?;
+    let g = instance.get_typed_func::<(i32, i64), (i64, i32)>(&mut store, "g")?;
 
     // Call `$g`.
     println!("Calling export \"g\"...");
     let (a, b) = g.call(&mut store, (1, 3))?;
 
     println!("Printing result...");
-    println!("> {} {}", a, b);
+    println!("> {a} {b}");
 
     assert_eq!(a, 4);
     assert_eq!(b, 2);
@@ -51,13 +51,12 @@ fn main() -> Result<()> {
         .get_typed_func::<
         (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64),
         (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64),
-        _,
         >
         (&mut store, "round_trip_many")?;
     let results = round_trip_many.call(&mut store, (0, 1, 2, 3, 4, 5, 6, 7, 8, 9))?;
 
     println!("Printing result...");
-    println!("> {:?}", results);
+    println!("> {results:?}");
     assert_eq!(results, (0, 1, 2, 3, 4, 5, 6, 7, 8, 9));
 
     Ok(())

@@ -1,29 +1,74 @@
 [package]
 name = "wasmtime-environ"
-version = "0.30.0"
-authors = ["The Wasmtime Project Developers"]
-description = "Standalone environment support for WebAsssembly code in Cranelift"
+version.workspace = true
+authors.workspace = true
+description = "Standalone environment support for WebAssembly code in Cranelift"
 license = "Apache-2.0 WITH LLVM-exception"
 repository = "https://github.com/bytecodealliance/wasmtime"
 documentation = "https://docs.rs/wasmtime-environ/"
 categories = ["wasm"]
 keywords = ["webassembly", "wasm"]
-edition = "2018"
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
-anyhow = "1.0"
-cranelift-entity = { path = "../../cranelift/entity", version = "0.77.0" }
-wasmtime-types = { path = "../types", version = "0.30.0" }
-wasmparser = "0.80"
-indexmap = { version = "1.0.2", features = ["serde-1"] }
-thiserror = "1.0.4"
-serde = { version = "1.0.94", features = ["derive"] }
-log = { version = "0.4.8", default-features = false }
-more-asserts = "0.2.1"
-cfg-if = "1.0"
-gimli = { version = "0.25.0", default-features = false, features = ['read'] }
-object = { version = "0.26.0", default-features = false, features = ['read_core', 'write_core', 'elf'] }
-target-lexicon = "0.12"
+anyhow = { workspace = true }
+postcard = { workspace = true }
+cpp_demangle = { version = "0.4.3", optional = true }
+cranelift-entity = { workspace = true, features = ['enable-serde'] }
+cranelift-bitset = { workspace = true, features = ['enable-serde'] }
+wasmparser = { workspace = true, features = ['validate', 'serde', 'features'] }
+indexmap = { workspace = true, features = ["serde"] }
+serde = { workspace = true }
+serde_derive = { workspace = true }
+log = { workspace = true }
+gimli = { workspace = true }
+object = { workspace = true }
+rustc-demangle = { version = "0.1.16", optional = true }
+target-lexicon = { workspace = true }
+wasm-encoder = { workspace = true, optional = true }
+wasmprinter = { workspace = true, optional = true }
+wasmtime-component-util = { workspace = true, optional = true }
+semver = { workspace = true, optional = true, features = ['serde'] }
+smallvec = { workspace = true, features = ['serde'] }
 
-[badges]
-maintenance = { status = "actively-developed" }
+[dev-dependencies]
+clap = { workspace = true, features = ['default'] }
+env_logger = { workspace = true }
+wat = { workspace = true }
+
+[[example]]
+name = "factc"
+required-features = ['component-model', 'compile']
+
+[features]
+component-model = [
+  "dep:wasmtime-component-util",
+  "dep:semver",
+  "wasmparser/component-model",
+]
+demangle = ['std', 'dep:rustc-demangle', 'dep:cpp_demangle']
+gc = []
+gc-drc = ["gc"]
+gc-null = ["gc"]
+compile = [
+  'gimli/write',
+  'object/write_core',
+  'std',
+  "dep:wasm-encoder",
+  "dep:wasmprinter",
+]
+threads = ['std']
+wmemcheck = ['std']
+std = [
+  'anyhow/std',
+  'object/std',
+  'wasmparser/std',
+  'indexmap/std',
+]
